@@ -986,31 +986,10 @@ def plot_delta_coordinate_check(
     output_dir: str,
     base_width: int = 128,
 ):
-    """Plot the 2x3 grid showing std(x_t - x_0) vs width for SP and MuP.
+    """Plot 1x3 grid showing std(x_t - x_0) vs width with SP and MuP overlaid.
 
-    This reproduces the classic MuP paper Figure 8 style plot with actual
-    standard deviation bands from multiple seeds.
-
-    Also generates a normalized plot (std / width_mult) where MuP should
-    show roughly horizontal lines.
-    """
-    _plot_delta_coordinate_check_impl(results_std, results_mup, output_dir,
-                                       base_width, normalize=False)
-    _plot_delta_coordinate_check_impl(results_std, results_mup, output_dir,
-                                       base_width, normalize=True)
-
-
-def _plot_delta_coordinate_check_impl(
-    results_std: Dict[int, Dict[str, Dict[str, List[float]]]],
-    results_mup: Dict[int, Dict[str, Dict[str, List[float]]]],
-    output_dir: str,
-    base_width: int = 128,
-    normalize: bool = False,
-):
-    """Implementation of delta coordinate check plotting.
-
-    Args:
-        normalize: If True, divide values by width_mult for normalized plot.
+    SP uses red/orange color scheme, MuP uses blue/purple color scheme.
+    This allows direct visual comparison on the same axes.
     """
     widths = sorted(results_std.keys())
     metrics = ['logits', 'attn_logits', 'word_embedding']
@@ -1019,97 +998,92 @@ def _plot_delta_coordinate_check_impl(
     # Get number of time steps from data
     num_steps = len(results_std[widths[0]]['logits']['mean'])
 
-    # Color palette matching MuP paper: light peach/pink → dark purple
-    # Custom gradient from ~#f5d0c5 (light peach) to #2d1e3e (dark purple)
-    color_list = [
-        '#f5d0c5',  # t=0: very light peach/pink
-        '#d4a5a5',  # t=1: dusty rose
-        '#a67c94',  # t=2: mauve
-        '#6b4c7a',  # t=3: purple
-        '#2d1e3e',  # t=4: dark purple
+    # SP color palette: light orange → dark red
+    sp_colors = [
+        '#ffd4a3',  # light peach
+        '#ffb366',  # orange
+        '#e67300',  # dark orange
+        '#cc4400',  # red-orange
+        '#992200',  # dark red
     ]
+    # MuP color palette: light blue → dark purple
+    mup_colors = [
+        '#a3d4ff',  # light blue
+        '#66a3ff',  # blue
+        '#3366cc',  # medium blue
+        '#6633cc',  # purple
+        '#330099',  # dark purple
+    ]
+
     # Extend or truncate to match num_steps
-    if num_steps <= len(color_list):
-        colors = color_list[:num_steps]
+    if num_steps <= len(sp_colors):
+        sp_colors = sp_colors[:num_steps]
+        mup_colors = mup_colors[:num_steps]
     else:
         # Interpolate if more steps needed
-        cmap = plt.cm.colors.LinearSegmentedColormap.from_list('mup', color_list)
-        colors = [cmap(i / (num_steps - 1)) for i in range(num_steps)]
+        sp_cmap = plt.cm.colors.LinearSegmentedColormap.from_list('sp', sp_colors)
+        mup_cmap = plt.cm.colors.LinearSegmentedColormap.from_list('mup', mup_colors)
+        sp_colors = [sp_cmap(i / (num_steps - 1)) for i in range(num_steps)]
+        mup_colors = [mup_cmap(i / (num_steps - 1)) for i in range(num_steps)]
 
-    fig, axes = plt.subplots(2, 3, figsize=(12, 7))
-
-    # Row labels
-    row_labels = ['SP', 'μP']
-
-    # Compute width multipliers for normalization
-    width_mults = {w: w / base_width for w in widths}
+    fig, axes = plt.subplots(1, 3, figsize=(14, 5))
 
     for col, (metric, label) in enumerate(zip(metrics, metric_labels)):
-        for row, (results, row_label) in enumerate([(results_std, 'SP'), (results_mup, 'μP')]):
-            ax = axes[row, col]
+        ax = axes[col]
 
-            # Plot each time step
-            for t in range(num_steps):
-                # Get mean and std across seeds for each width
-                y_mean = [results[w][metric]['mean'][t] for w in widths]
-                y_std = [results[w][metric]['std'][t] for w in widths]
+        # Plot SP (solid lines, red/orange)
+        for t in range(num_steps):
+            y_mean = [results_std[w][metric]['mean'][t] for w in widths]
+            y_std = [results_std[w][metric]['std'][t] for w in widths]
+            color = sp_colors[t]
 
-                # Normalize by width_mult if requested (should give horizontal lines for MuP)
-                if normalize:
-                    y_mean = [y / width_mults[w] for y, w in zip(y_mean, widths)]
-                    y_std = [y / width_mults[w] for y, w in zip(y_std, widths)]
+            ax.plot(widths, y_mean, '-', color=color, linewidth=2.0,
+                   label=f'SP t={t}' if col == 0 else None)
+            y_upper = [m + s for m, s in zip(y_mean, y_std)]
+            y_lower = [m - s for m, s in zip(y_mean, y_std)]
+            ax.fill_between(widths, y_lower, y_upper, color=color, alpha=0.2)
 
-                color = colors[t] if isinstance(colors[t], str) else colors[t]
+        # Plot MuP (dashed lines, blue/purple)
+        for t in range(num_steps):
+            y_mean = [results_mup[w][metric]['mean'][t] for w in widths]
+            y_std = [results_mup[w][metric]['std'][t] for w in widths]
+            color = mup_colors[t]
 
-                # Plot line with actual std shaded band
-                ax.plot(widths, y_mean, '-', color=color, linewidth=1.8,
-                       label=f'{t}' if col == 0 and row == 0 else None)
-                # Shaded region = actual standard deviation across seeds
-                y_upper = [m + s for m, s in zip(y_mean, y_std)]
-                y_lower = [m - s for m, s in zip(y_mean, y_std)]
-                ax.fill_between(widths, y_lower, y_upper, color=color, alpha=0.25)
+            ax.plot(widths, y_mean, '--', color=color, linewidth=2.0,
+                   label=f'MuP t={t}' if col == 0 else None)
+            y_upper = [m + s for m, s in zip(y_mean, y_std)]
+            y_lower = [m - s for m, s in zip(y_mean, y_std)]
+            ax.fill_between(widths, y_lower, y_upper, color=color, alpha=0.2)
 
-            # Formatting to match MuP paper style
-            ax.set_facecolor('#e8e8f0')  # Light blue-grey background
-            ax.grid(True, alpha=0.5, color='white', linewidth=0.8)
-            ax.tick_params(labelsize=9)
+        # Formatting
+        ax.set_facecolor('#f5f5f5')
+        ax.grid(True, alpha=0.5, color='white', linewidth=0.8)
+        ax.tick_params(labelsize=10)
+        ax.set_xlabel('width', fontsize=11)
+        ax.set_title(label, fontsize=12, fontweight='bold')
+        if col == 0:
+            ax.set_ylabel('std(x$_t$ − x$_0$)', fontsize=11)
 
-            if row == 1:
-                ax.set_xlabel('width', fontsize=11)
-            if col == 0:
-                ylabel = 'std / width_mult' if normalize else 'std(x$_t$ − x$_0$)'
-                ax.set_ylabel(f'{row_label}\n{ylabel}', fontsize=11)
-            if row == 0:
-                ax.set_title(label, fontsize=12, fontweight='bold')
-
-    # Add legend to first subplot matching paper style
-    leg = axes[0, 0].legend(loc='upper left', fontsize=9, title='t',
-                            framealpha=0.9, edgecolor='lightgray')
-    leg.get_title().set_fontsize(9)
-
-    # Add note about normalization
-    if normalize:
-        fig.suptitle('Normalized Coordinate Check (MuP should show horizontal lines)',
-                    fontsize=11, y=1.02)
+    # Add legend to first subplot
+    axes[0].legend(loc='upper left', fontsize=8, ncol=2,
+                   framealpha=0.9, edgecolor='lightgray')
 
     plt.tight_layout()
-    suffix = '_normalized' if normalize else ''
-    plt.savefig(os.path.join(output_dir, f'mup_coord_check_delta{suffix}.png'), dpi=150, bbox_inches='tight')
-    plt.savefig(os.path.join(output_dir, f'mup_coord_check_delta{suffix}.pdf'), bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, 'mup_coord_check_delta.png'), dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, 'mup_coord_check_delta.pdf'), bbox_inches='tight')
     plt.close()
 
-    print(f"\nDelta coordinate check plot saved to {output_dir}/mup_coord_check_delta{suffix}.png")
+    print(f"\nDelta coordinate check plot saved to {output_dir}/mup_coord_check_delta.png")
 
-    # Print summary (only for non-normalized)
-    if not normalize:
-        print("\nSummary (std(x_t - x_0) at final step):")
-        print(f"{'Width':<10} {'SP logits':<12} {'MuP logits':<12} {'Ratio':<10}")
-        print("-" * 44)
-        for w in widths:
-            sp_val = results_std[w]['logits']['mean'][-1]
-            mup_val = results_mup[w]['logits']['mean'][-1]
-            ratio = sp_val / mup_val if mup_val > 0 else float('inf')
-            print(f"{w:<10} {sp_val:<12.4f} {mup_val:<12.4f} {ratio:<10.2f}")
+    # Print summary
+    print("\nSummary (std(x_t - x_0) at final step):")
+    print(f"{'Width':<10} {'SP logits':<12} {'MuP logits':<12} {'Ratio':<10}")
+    print("-" * 44)
+    for w in widths:
+        sp_val = results_std[w]['logits']['mean'][-1]
+        mup_val = results_mup[w]['logits']['mean'][-1]
+        ratio = sp_val / mup_val if mup_val > 0 else float('inf')
+        print(f"{w:<10} {sp_val:<12.4f} {mup_val:<12.4f} {ratio:<10.2f}")
 
 
 def run_coordinate_check(
