@@ -152,6 +152,12 @@ class BertModel(LanguageModule):
                 self.binary_head = get_linear_layer(
                     config.hidden_size, 2, config.init_method, config.perform_initialization
                 )
+                # Keep optimizer grouping consistent for classification heads.
+                self.binary_head.weight.is_embedding_or_output_parameter = True
+                self.binary_head.bias.is_embedding_or_output_parameter = True
+                if self.config.use_mup:
+                    self.binary_head.weight.is_embedding_parameter = True
+                    self.binary_head.bias.is_embedding_parameter = True
 
                 self.pooler = Pooler(
                     config.hidden_size, config.init_method, config, config.sequence_parallel

@@ -2136,6 +2136,13 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-scale-mode', type=str, default='spectral',
                        choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
                        help='Scale mode for Muon optimizer')
+    group.add_argument('--muon-mup-scale-policy', type=str, default='auto',
+                       choices=['auto', 'warn', 'error'],
+                       help='Behavior when --use-mup is enabled with Muon and '
+                       '--muon-scale-mode is not unit_rms_norm: '
+                       'auto=override to unit_rms_norm with warning, '
+                       'warn=keep configured mode with warning, '
+                       'error=raise and require explicit unit_rms_norm')
     group.add_argument('--muon-fp32-matmul-prec', type=str, default='medium',
                        choices=['low', 'medium', 'high'],
                        help='FP32 matmul precision for Newton-Schulz iteration')
@@ -2146,6 +2153,12 @@ def _add_regularization_args(parser):
                        help='How to perform NS calculation for tensor model parallel weights')
     group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
                        help='Additional scale factor for the muon update')
+    group.add_argument('--muon-spectral-fan-scale', action='store_true', default=True,
+                       dest='muon_spectral_fan_scale',
+                       help='Apply Muon scale factor shaping in spectral mode')
+    group.add_argument('--no-muon-spectral-fan-scale', action='store_false',
+                       dest='muon_spectral_fan_scale',
+                       help='Disable Muon scale factor shaping in spectral mode')
 
     group.add_argument('--no-weight-decay-cond-type', type=str, choices=['apply_wd_to_qk_layernorm'],
                        help='Type of no weight decay condition. Choices: '

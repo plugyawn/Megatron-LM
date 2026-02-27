@@ -1532,6 +1532,7 @@ def setup_model_and_optimizer(
                 config_overrides=config_overrides,
                 use_gloo_process_groups=args.enable_gloo_process_groups,
                 layer_wise_distributed_optimizer='dist' in config.optimizer,
+                use_mup=getattr(args, "use_mup", False),
             )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 

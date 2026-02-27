@@ -269,6 +269,14 @@ class OptimizerConfig:
     muon_scale_mode: str = "spectral"
     """The mode to use for the scale factor. Defaults to "spectral"."""
 
+    muon_mup_scale_policy: str = "auto"
+    """Policy for Muon scale mode when MuP is enabled.
+
+    - "auto": force unit_rms_norm for MuP and warn once.
+    - "warn": keep configured mode and warn if non-MuP-compatible.
+    - "error": raise if MuP is enabled with a non-unit_rms_norm mode.
+    """
+
     muon_fp32_matmul_prec: str = "medium"
     """The precision to use for the fp32 matmul. Defaults to "medium"."""
 
@@ -280,6 +288,9 @@ class OptimizerConfig:
 
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
+
+    muon_spectral_fan_scale: bool = True
+    """If true, apply Muon scale factor shaping in spectral mode."""
 
     #######################
     # Distributed optimizer

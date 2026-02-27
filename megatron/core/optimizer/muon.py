@@ -2,6 +2,7 @@
 
 """Megatron muon optimizer wrapper to handle tensor-parallel."""
 
+from dataclasses import replace
 import logging
 from typing import Any, Callable, Dict, List, Literal, Optional
 
@@ -39,6 +40,92 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _resolve_muon_scale_mode_for_mup(
+    configured_scale_mode: str, use_mup: bool, mup_scale_policy: str
+) -> str:
+    """Resolve effective Muon scale mode under MuP.
+
+    MuP-principled Muon scaling uses ratio scaling (unit_rms_norm mode in
+    emerging_optimizers). The default policy auto-corrects and warns.
+    """
+    policy = mup_scale_policy.lower()
+    valid_policies = {"auto", "warn", "error"}
+    if policy not in valid_policies:
+        raise ValueError(
+            f"Invalid Muon MuP scale policy: {mup_scale_policy}. "
+            f"Expected one of {sorted(valid_policies)}."
+        )
+
+    if not use_mup or configured_scale_mode == "unit_rms_norm":
+        return configured_scale_mode
+
+    message = (
+        "Muon + MuP is configured with muon_scale_mode="
+        f"{configured_scale_mode}, which is not MuP-principled. "
+        "For MuP-compatible scaling, use muon_scale_mode=unit_rms_norm."
+    )
+
+    if policy == "error":
+        raise ValueError(
+            message
+            + " Set --muon-scale-mode unit_rms_norm, or use "
+            "--muon-mup-scale-policy warn to keep the configured mode."
+        )
+
+    if policy == "warn":
+        log_single_rank(logger, logging.WARNING, message + " Keeping configured mode (warn policy).")
+        return configured_scale_mode
+
+    log_single_rank(
+        logger,
+        logging.WARNING,
+        message + " Overriding to unit_rms_norm (auto policy).",
+    )
+    return "unit_rms_norm"
+
+
+def _get_parameter_partition_dim(
+    param: torch.Tensor, mode: Literal["blockwise", "duplicated", "distributed"]
+) -> int | None:
+    """Return the tensor-parallel partition dimension used by Muon.
+
+    Supports both new (`_tp_partition_dim`) and legacy (`partition_dim`) metadata.
+    """
+    if mode == "blockwise":
+        return None
+
+    partition_dim = getattr(param, "_tp_partition_dim", getattr(param, "partition_dim", None))
+    if partition_dim == -1:
+        # emerging-optimizers use None instead of -1 to indicate no tensor parallel
+        return None
+    return partition_dim
+
+
+def _get_fan_out_and_fan_in(
+    matrix: torch.Tensor,
+    tp_group: torch.distributed.ProcessGroup | None,
+    partition_dim: int | None,
+) -> tuple[int, int]:
+    """Compute effective fan-out/fan-in for a (possibly TP-sharded) matrix."""
+    fan_out = matrix.size(-2)
+    fan_in = matrix.size(-1)
+    if partition_dim is None or tp_group is None:
+        return fan_out, fan_in
+
+    tp_size = get_pg_size(tp_group)
+    if partition_dim in (0, -2):
+        fan_out *= tp_size
+    elif partition_dim in (1, -1):
+        fan_in *= tp_size
+    else:
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            f"Unexpected partition_dim={partition_dim}; proceeding without TP fan scaling.",
+        )
+    return fan_out, fan_in
+
+
 class TensorParallelMuon(OrthogonalizedOptimizer):
     """Tensor Parallel Muon optimizer."""
 
@@ -58,6 +145,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         num_ns_steps: int = 5,
         scale_mode: str = "spectral",
         extra_scale_factor: float = 1.0,
+        spectral_fan_scale: bool = True,
         pg_collection: Optional[ProcessGroupCollection] = None,
         mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
     ) -> None:
@@ -75,10 +163,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 f'Orthogonalizing grad with {num_ns_steps} steps, {coefficient_type} coefficient, '
                 f'{scale_mode} scale mode, extra_scale_factor={extra_scale_factor}',
             )
-            size = [grad.size(-2), grad.size(-1)]
-            if partition_dim is not None:
-                size[partition_dim] *= get_pg_size(tp_group)
-            orth_grad = newton_schulz_tp(
+            return newton_schulz_tp(
                 grad,
                 steps=num_ns_steps,
                 coefficient_type=coefficient_type,
@@ -86,14 +171,16 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 partition_dim=partition_dim,
                 mode="duplicated" if mode == "blockwise" else mode,
             )
-            scale_factor = get_muon_scale_factor(size[0], size[1], mode=scale_mode)
-            return orth_grad * scale_factor * extra_scale_factor
 
         self.pg_collection = pg_collection
         self.mode = mode
         self.split_qkv = split_qkv
         self.is_qkv_fn = is_qkv_fn
         self.qkv_split_shapes = qkv_split_shapes
+        self.scale_mode = scale_mode
+        self.extra_scale_factor = extra_scale_factor
+        self.spectral_fan_scale = spectral_fan_scale
+        self._spectral_scale_warning_emitted = False
 
         weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
         super().__init__(
@@ -128,10 +215,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             )
         else:
             tp_group = None
-        partition_dim = None if self.mode == "blockwise" else getattr(p, "partition_dim", None)
-        if partition_dim == -1:
-            # emerging-optimizers use None instead of -1 to indicate no tensor parallel
-            partition_dim = None
+        partition_dim = _get_parameter_partition_dim(p, self.mode)
 
         if self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
             # split grouped attention parameters (e.g., QKV, GQA, etc.)
@@ -150,16 +234,41 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             qkv_grads = [g.reshape(-1, grad_shape[-1]) for g in qkv_grads]
 
             # Apply Newton-Schulz and scales to each component, concat back
-            qkv_grads = [
-                self.scaled_orthogonalize_fn(g, tp_group, partition_dim).view(
-                    num_query_groups, -1, grad_shape[-1]
+            qkv_grads_scaled = []
+            for qkv_grad in qkv_grads:
+                orth_qkv_grad = self.scaled_orthogonalize_fn(qkv_grad, tp_group, partition_dim)
+                scale_factor = self._get_scale_factor(p, qkv_grad, tp_group, partition_dim)
+                qkv_grads_scaled.append(
+                    (orth_qkv_grad * scale_factor).view(num_query_groups, -1, grad_shape[-1])
                 )
-                for g in qkv_grads
-            ]
-            grad = torch.cat(qkv_grads, dim=1).view(grad_shape)
+            grad = torch.cat(qkv_grads_scaled, dim=1).view(grad_shape)
         else:
-            grad = self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
+            orth_grad = self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
+            grad = orth_grad * self._get_scale_factor(p, grad, tp_group, partition_dim)
         return grad
+
+    def _get_scale_factor(
+        self,
+        param: torch.Tensor,
+        matrix: torch.Tensor,
+        tp_group: torch.distributed.ProcessGroup | None,
+        partition_dim: int | None,
+    ) -> float:
+        if getattr(param, "is_embedding_or_output_parameter", False):
+            return self.extra_scale_factor
+
+        if self.scale_mode == "spectral" and not self.spectral_fan_scale:
+            if not self._spectral_scale_warning_emitted:
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "Muon spectral fan scaling disabled via --no-muon-spectral-fan-scale.",
+                )
+                self._spectral_scale_warning_emitted = True
+            return self.extra_scale_factor
+
+        fan_out, fan_in = _get_fan_out_and_fan_in(matrix, tp_group, partition_dim)
+        return get_muon_scale_factor(fan_out, fan_in, mode=self.scale_mode) * self.extra_scale_factor
 
 
 def get_megatron_muon_optimizer(
@@ -169,6 +278,7 @@ def get_megatron_muon_optimizer(
     use_gloo_process_groups: bool = True,
     layer_wise_distributed_optimizer: bool = False,
     pg_collection: Optional[ProcessGroupCollection] = None,
+    use_mup: bool = False,
 ) -> MegatronOptimizer:
     """This function is used to get the muon optimizer for the model chunks.
     It is used to get the muon optimizer for the model chunks.
@@ -180,10 +290,13 @@ def get_megatron_muon_optimizer(
             in underlying Megatron optimizers.
         layer_wise_distributed_optimizer (bool): if true, use layer-wise distributed optimizer.
             Defaults to False.
+        use_mup (bool): whether MuP is enabled for this training run.
     """
-    # Muon currently use adam config. setting str here to call regular get for adam creation
-    # side effect is muon optimizer will have wrong name, i.e. config.optimizer == 'adam'
-    config.optimizer = 'adam'
+    # Muon internally needs Adam for nonlinear parameter groups, but keep the
+    # external optimizer identity unchanged for logging/scheduler semantics.
+    adam_config = replace(config, optimizer='adam')
+    if layer_wise_distributed_optimizer and adam_config.bf16:
+        adam_config.bf16 = False
 
     assert HAVE_EMERGING_OPTIMIZERS, "Emerging Optimizers is not installed."
 
@@ -257,6 +370,12 @@ def get_megatron_muon_optimizer(
             else:
                 nonlinear_params.append(param)
 
+    effective_muon_scale_mode = _resolve_muon_scale_mode_for_mup(
+        configured_scale_mode=config.muon_scale_mode,
+        use_mup=use_mup,
+        mup_scale_policy=getattr(config, "muon_mup_scale_policy", "auto"),
+    )
+
     muon_kwargs = {
         "lr": config.lr,
         "momentum_beta": config.muon_momentum,
@@ -264,11 +383,12 @@ def get_megatron_muon_optimizer(
         "weight_decay": config.weight_decay,
         "fp32_matmul_prec": config.muon_fp32_matmul_prec,
         "num_ns_steps": config.muon_num_ns_steps,
-        "scale_mode": config.muon_scale_mode,
+        "scale_mode": effective_muon_scale_mode,
         "split_qkv": config.muon_split_qkv,
         "is_qkv_fn": lambda p: getattr(p, "is_qkv", False),
         "qkv_split_shapes": qkv_split_shapes,
         "extra_scale_factor": config.muon_extra_scale_factor,
+        "spectral_fan_scale": config.muon_spectral_fan_scale,
         "pg_collection": pg_collection,
         "mode": config.muon_tp_mode,
     }
@@ -288,19 +408,10 @@ def get_megatron_muon_optimizer(
 
     optimizer = TensorParallelMuon(linear_param_groups, **muon_kwargs)
 
-    reset_config_bf16 = False
-    if config.bf16:
-        if layer_wise_distributed_optimizer:
-            # creating master weight before layerwise sharding will lead to unnecessary master
-            # weight so here we delay master weight creation into layer_wise unset config.bf16
-            # will also result in all optimizers below(adam) to also not be wrapped
-            config.bf16 = False
-            reset_config_bf16 = True
-        else:
-            # if not using layer_wise wrapper, just create master weight here is fine
-            optimizer = Float16OptimizerWithFloat16Params(
-                optimizer, config, None, muon_init_state_fn
-            )
+    muon_bf16_wrapping = config.bf16 and not layer_wise_distributed_optimizer
+    if muon_bf16_wrapping:
+        # if not using layer_wise wrapper, just create master weight here is fine
+        optimizer = Float16OptimizerWithFloat16Params(optimizer, config, None, muon_init_state_fn)
     else:
         optimizer = FP32Optimizer(optimizer, config, muon_init_state_fn)
 
@@ -309,7 +420,7 @@ def get_megatron_muon_optimizer(
     # expert optimizer exists meaning layerwise distributed optimizer is not used
     if len(expert_param_groups) > 0:
         expert_optimizer = TensorParallelMuon(expert_param_groups, **muon_kwargs)
-        if config.bf16:
+        if muon_bf16_wrapping:
             expert_optimizer = Float16OptimizerWithFloat16Params(
                 expert_optimizer, config, None, muon_init_state_fn
             )
@@ -326,7 +437,7 @@ def get_megatron_muon_optimizer(
 
     # call original get. linear params will be skipped since they're freezed
     chained_adam = get_megatron_optimizer(
-        config,
+        adam_config,
         model_chunks,
         config_overrides=config_overrides,
         use_gloo_process_groups=use_gloo_process_groups,
@@ -342,8 +453,6 @@ def get_megatron_muon_optimizer(
 
     if layer_wise_distributed_optimizer:
         log_single_rank(logger, logging.INFO, 'Using LayerWiseDistributedOptimizer for Muon')
-        if reset_config_bf16:
-            config.bf16 = True
         return LayerWiseDistributedOptimizer(
             optimizers, config, pg_collection, init_state_fn_list=init_fns
         )
