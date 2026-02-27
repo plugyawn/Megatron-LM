@@ -11,7 +11,11 @@ from packaging.version import Version
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
-from megatron.core.optimizer.muon import TensorParallelMuon, get_megatron_muon_optimizer
+from megatron.core.optimizer.muon import (
+    TensorParallelMuon,
+    _partition_expert_param_groups,
+    get_megatron_muon_optimizer,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -620,6 +624,55 @@ def test_muon_optimizer_skips_embedding_or_output_scaling():
         "to no-scaling reference updates."
     )
 
+def test_muon_optimizer_partition_expert_groups_no_skip():
+    """Expert-group partitioning should keep all expert groups without in-place skipping."""
+    param_groups = [
+        {'name': 'g0', 'is_expert_parallel': True},
+        {'name': 'g1', 'is_expert_parallel': False},
+        {'name': 'g2', 'is_expert_parallel': True},
+        {'name': 'g3', 'is_expert_parallel': False},
+        {'name': 'g4', 'is_expert_parallel': True},
+    ]
+    non_expert_groups, expert_groups = _partition_expert_param_groups(param_groups)
+
+    assert [g['name'] for g in expert_groups] == ['g0', 'g2', 'g4']
+    assert [g['name'] for g in non_expert_groups] == ['g1', 'g3']
+    assert [g['name'] for g in param_groups] == ['g0', 'g1', 'g2', 'g3', 'g4']
+
+
+def test_muon_optimizer_qkv_split_uses_global_fan_scale():
+    """QKV split path should use full-matrix fan scaling (not per-split fan scaling)."""
+    shape = (12, 8)  # fan_out=12, fan_in=8; non-square for deterministic spectral scaling.
+    param = torch.nn.Parameter(torch.ones(*shape, dtype=torch.float32, device='cuda'))
+    param.is_qkv = True
+    grad = torch.randn(*shape, dtype=torch.float32, device='cuda')
+
+    optimizer = TensorParallelMuon(
+        params=[param],
+        lr=0.01,
+        momentum_beta=0.0,
+        use_nesterov=False,
+        weight_decay=0.0,
+        split_qkv=True,
+        is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
+        qkv_split_shapes=(2, 1, 1),
+        scale_mode="spectral",
+        spectral_fan_scale=True,
+        num_ns_steps=1,
+        pg_collection=None,
+        mode="duplicated",
+    )
+    # Isolate fan-scaling behavior from orthogonalization math.
+    optimizer.scaled_orthogonalize_fn = lambda g, tp_group, partition_dim=None: g
+
+    global_scale = optimizer._get_scale_factor(param, grad, None, None)
+    orth_grad = optimizer.orthogonalize(param, grad.clone())
+
+    assert torch.allclose(
+        orth_grad, grad * global_scale
+    ), "QKV split path must apply the same global fan scale as the unsplit matrix."
+
+
 def test_muon_mup_scale_policy_auto_overrides_non_principled_mode(caplog):
     from megatron.core.optimizer.muon import _resolve_muon_scale_mode_for_mup
 
@@ -661,6 +714,8 @@ def test_muon_mup_scale_policy_invalid_value_raises():
 
     with pytest.raises(ValueError, match="Invalid Muon MuP scale policy"):
         _resolve_muon_scale_mode_for_mup("spectral", use_mup=True, mup_scale_policy="invalid")
+
+
 @pytest.mark.parametrize("use_nesterov", [True, False])
 def test_muon_optimizer_nesterov(use_nesterov):
     """Test TensorParallelMuon optimizer with and without Nesterov momentum."""
