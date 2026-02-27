@@ -141,7 +141,7 @@ class TestMuonOptimizerMultiRank:
 
         # Create optimizer config for Muon
         optimizer_config = OptimizerConfig(
-            optimizer='muon',  # This will be changed internally to 'adam' for non-linear params
+            optimizer='muon',
             lr=0.01,
             weight_decay=0.01,
             bf16=True,
@@ -161,6 +161,9 @@ class TestMuonOptimizerMultiRank:
             use_gloo_process_groups=True,
             layer_wise_distributed_optimizer=False,
         )
+        assert (
+            optimizer_config.optimizer == 'muon'
+        ), "get_megatron_muon_optimizer should not mutate config.optimizer"
 
         # Test basic properties
         assert optimizer is not None, "Optimizer should not be None"
@@ -478,6 +481,107 @@ def test_muon_optimizer_scale_modes(scale_mode):
     assert not torch.equal(
         model.weight.data, original_weight
     ), f"Weight should be updated with scale_mode={scale_mode}"
+
+
+def test_muon_optimizer_spectral_fan_scale_toggle():
+    """Disable flag should remove spectral fan scaling in spectral mode."""
+    shape = (30, 60)  # non-square so spectral factor != 1
+    grad = torch.randn(*shape, dtype=torch.float32, device='cuda')
+
+    param_scaled = torch.nn.Parameter(torch.ones(*shape, dtype=torch.float32, device='cuda'))
+    param_unscaled = torch.nn.Parameter(torch.ones(*shape, dtype=torch.float32, device='cuda'))
+    original = param_scaled.data.clone()
+
+    opt_scaled = TensorParallelMuon(
+        params=[param_scaled],
+        lr=0.01,
+        momentum_beta=0.0,
+        use_nesterov=False,
+        weight_decay=0.0,
+        scale_mode="spectral",
+        spectral_fan_scale=True,
+        num_ns_steps=5,
+        pg_collection=None,
+        mode="duplicated",
+    )
+    opt_unscaled = TensorParallelMuon(
+        params=[param_unscaled],
+        lr=0.01,
+        momentum_beta=0.0,
+        use_nesterov=False,
+        weight_decay=0.0,
+        scale_mode="spectral",
+        spectral_fan_scale=False,
+        num_ns_steps=5,
+        pg_collection=None,
+        mode="duplicated",
+    )
+
+    param_scaled.grad = grad.clone()
+    param_unscaled.grad = grad.clone()
+
+    opt_scaled.step()
+    opt_unscaled.step()
+
+    scaled_update_norm = (original - param_scaled.data).norm()
+    unscaled_update_norm = (original - param_unscaled.data).norm()
+
+    assert not torch.isclose(
+        scaled_update_norm, unscaled_update_norm
+    ), "Spectral fan scaling toggle should change update magnitude"
+    assert (
+        scaled_update_norm < unscaled_update_norm
+    ), "With fan_out < fan_in, spectral fan scaling should reduce update magnitude"
+
+
+def test_muon_optimizer_skips_embedding_or_output_scaling():
+    """Embedding/output-tagged parameters should bypass Muon scale-factor shaping."""
+    shape = (30, 60)  # non-square so spectral factor != 1
+    grad = torch.randn(*shape, dtype=torch.float32, device='cuda')
+
+    param_hidden = torch.nn.Parameter(torch.ones(*shape, dtype=torch.float32, device='cuda'))
+    param_embedding = torch.nn.Parameter(torch.ones(*shape, dtype=torch.float32, device='cuda'))
+    param_embedding.is_embedding_or_output_parameter = True
+    original = param_hidden.data.clone()
+
+    opt_hidden = TensorParallelMuon(
+        params=[param_hidden],
+        lr=0.01,
+        momentum_beta=0.0,
+        use_nesterov=False,
+        weight_decay=0.0,
+        scale_mode="spectral",
+        spectral_fan_scale=True,
+        num_ns_steps=5,
+        pg_collection=None,
+        mode="duplicated",
+    )
+    opt_embedding = TensorParallelMuon(
+        params=[param_embedding],
+        lr=0.01,
+        momentum_beta=0.0,
+        use_nesterov=False,
+        weight_decay=0.0,
+        scale_mode="spectral",
+        spectral_fan_scale=True,
+        num_ns_steps=5,
+        pg_collection=None,
+        mode="duplicated",
+    )
+
+    param_hidden.grad = grad.clone()
+    param_embedding.grad = grad.clone()
+
+    opt_hidden.step()
+    opt_embedding.step()
+
+    hidden_update_norm = (original - param_hidden.data).norm()
+    embedding_update_norm = (original - param_embedding.data).norm()
+
+    assert embedding_update_norm > hidden_update_norm, (
+        "Embedding/output-tagged parameters should bypass fan scaling and thus differ "
+        "from hidden-parameter updates."
+    )
 
 
 @pytest.mark.parametrize("use_nesterov", [True, False])
