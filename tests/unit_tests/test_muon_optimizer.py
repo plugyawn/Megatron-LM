@@ -141,7 +141,7 @@ class TestMuonOptimizerMultiRank:
 
         # Create optimizer config for Muon
         optimizer_config = OptimizerConfig(
-            optimizer='muon',  # This will be changed internally to 'adam' for non-linear params
+            optimizer='muon',
             lr=0.01,
             weight_decay=0.01,
             bf16=True,
@@ -161,6 +161,9 @@ class TestMuonOptimizerMultiRank:
             use_gloo_process_groups=True,
             layer_wise_distributed_optimizer=False,
         )
+        assert (
+            optimizer_config.optimizer == 'muon'
+        ), "get_megatron_muon_optimizer should not mutate config.optimizer"
 
         # Test basic properties
         assert optimizer is not None, "Optimizer should not be None"
@@ -480,6 +483,184 @@ def test_muon_optimizer_scale_modes(scale_mode):
     ), f"Weight should be updated with scale_mode={scale_mode}"
 
 
+def test_muon_optimizer_spectral_fan_scale_toggle():
+    """Disable flag should remove spectral fan scaling in spectral mode."""
+    shape = (30, 60)  # non-square so spectral factor != 1
+    grad = torch.randn(*shape, dtype=torch.float32, device='cuda')
+
+    param_scaled = torch.nn.Parameter(torch.ones(*shape, dtype=torch.float32, device='cuda'))
+    param_unscaled = torch.nn.Parameter(torch.ones(*shape, dtype=torch.float32, device='cuda'))
+    original = param_scaled.data.clone()
+
+    opt_scaled = TensorParallelMuon(
+        params=[param_scaled],
+        lr=0.01,
+        momentum_beta=0.0,
+        use_nesterov=False,
+        weight_decay=0.0,
+        scale_mode="spectral",
+        spectral_fan_scale=True,
+        num_ns_steps=5,
+        pg_collection=None,
+        mode="duplicated",
+    )
+    opt_unscaled = TensorParallelMuon(
+        params=[param_unscaled],
+        lr=0.01,
+        momentum_beta=0.0,
+        use_nesterov=False,
+        weight_decay=0.0,
+        scale_mode="spectral",
+        spectral_fan_scale=False,
+        num_ns_steps=5,
+        pg_collection=None,
+        mode="duplicated",
+    )
+
+    param_scaled.grad = grad.clone()
+    param_unscaled.grad = grad.clone()
+
+    opt_scaled.step()
+    opt_unscaled.step()
+
+    scaled_update_norm = (original - param_scaled.data).norm()
+    unscaled_update_norm = (original - param_unscaled.data).norm()
+    expected_scale = opt_scaled._get_scale_factor(param_scaled, grad, None, None)
+    update_ratio = scaled_update_norm / unscaled_update_norm
+
+    assert not torch.isclose(
+        scaled_update_norm, unscaled_update_norm
+    ), "Spectral fan scaling toggle should change update magnitude"
+    assert torch.isclose(
+        update_ratio,
+        torch.tensor(expected_scale, dtype=update_ratio.dtype, device=update_ratio.device),
+        rtol=5e-2,
+        atol=1e-6,
+    ), "Scaled/unscaled update ratio should match the configured Muon scale factor."
+
+
+def test_muon_optimizer_skips_embedding_or_output_scaling():
+    """Embedding/output-tagged parameters should bypass Muon scale-factor shaping."""
+    shape = (30, 60)  # non-square so spectral factor != 1
+    grad = torch.randn(*shape, dtype=torch.float32, device='cuda')
+
+    param_hidden = torch.nn.Parameter(torch.ones(*shape, dtype=torch.float32, device='cuda'))
+    param_embedding = torch.nn.Parameter(torch.ones(*shape, dtype=torch.float32, device='cuda'))
+    param_reference = torch.nn.Parameter(torch.ones(*shape, dtype=torch.float32, device='cuda'))
+    param_embedding.is_embedding_or_output_parameter = True
+    original = param_hidden.data.clone()
+
+    opt_hidden = TensorParallelMuon(
+        params=[param_hidden],
+        lr=0.01,
+        momentum_beta=0.0,
+        use_nesterov=False,
+        weight_decay=0.0,
+        scale_mode="spectral",
+        spectral_fan_scale=True,
+        num_ns_steps=5,
+        pg_collection=None,
+        mode="duplicated",
+    )
+    opt_embedding = TensorParallelMuon(
+        params=[param_embedding],
+        lr=0.01,
+        momentum_beta=0.0,
+        use_nesterov=False,
+        weight_decay=0.0,
+        scale_mode="spectral",
+        spectral_fan_scale=True,
+        num_ns_steps=5,
+        pg_collection=None,
+        mode="duplicated",
+    )
+    opt_reference = TensorParallelMuon(
+        params=[param_reference],
+        lr=0.01,
+        momentum_beta=0.0,
+        use_nesterov=False,
+        weight_decay=0.0,
+        scale_mode="spectral",
+        spectral_fan_scale=False,
+        num_ns_steps=5,
+        pg_collection=None,
+        mode="duplicated",
+    )
+
+    param_hidden.grad = grad.clone()
+    param_embedding.grad = grad.clone()
+    param_reference.grad = grad.clone()
+
+    opt_hidden.step()
+    opt_embedding.step()
+    opt_reference.step()
+
+    hidden_update_norm = (original - param_hidden.data).norm()
+    embedding_update_norm = (original - param_embedding.data).norm()
+    reference_update_norm = (original - param_reference.data).norm()
+    expected_hidden_scale = opt_hidden._get_scale_factor(param_hidden, grad, None, None)
+
+    assert torch.isclose(
+        embedding_update_norm, reference_update_norm, rtol=5e-2, atol=1e-6
+    ), "Embedding/output-tagged parameters should match no-scaling reference updates."
+    assert not torch.isclose(
+        hidden_update_norm, embedding_update_norm
+    ), "Hidden and embedding/output updates should differ when fan scaling is active."
+    assert torch.isclose(
+        hidden_update_norm / reference_update_norm,
+        torch.tensor(
+            expected_hidden_scale,
+            dtype=hidden_update_norm.dtype,
+            device=hidden_update_norm.device,
+        ),
+        rtol=5e-2,
+        atol=1e-6,
+    ), (
+        "Hidden update scale should match the configured Muon scale factor relative "
+        "to no-scaling reference updates."
+    )
+
+def test_muon_mup_scale_policy_auto_overrides_non_principled_mode(caplog):
+    from megatron.core.optimizer.muon import _resolve_muon_scale_mode_for_mup
+
+    caplog.set_level('WARNING')
+    resolved = _resolve_muon_scale_mode_for_mup("spectral", use_mup=True, mup_scale_policy="auto")
+    assert resolved == "unit_rms_norm"
+    assert any("Overriding to unit_rms_norm" in rec.message for rec in caplog.records)
+
+
+def test_muon_mup_scale_policy_warn_keeps_mode(caplog):
+    from megatron.core.optimizer.muon import _resolve_muon_scale_mode_for_mup
+
+    caplog.set_level('WARNING')
+    resolved = _resolve_muon_scale_mode_for_mup(
+        "shape_scaling", use_mup=True, mup_scale_policy="warn"
+    )
+    assert resolved == "shape_scaling"
+    assert any("Keeping configured mode (warn policy)" in rec.message for rec in caplog.records)
+
+
+def test_muon_mup_scale_policy_error_raises():
+    from megatron.core.optimizer.muon import _resolve_muon_scale_mode_for_mup
+
+    with pytest.raises(ValueError, match="unit_rms_norm"):
+        _resolve_muon_scale_mode_for_mup("spectral", use_mup=True, mup_scale_policy="error")
+
+
+def test_muon_mup_scale_policy_noop_without_mup():
+    from megatron.core.optimizer.muon import _resolve_muon_scale_mode_for_mup
+
+    resolved = _resolve_muon_scale_mode_for_mup(
+        "spectral", use_mup=False, mup_scale_policy="auto"
+    )
+    assert resolved == "spectral"
+
+
+def test_muon_mup_scale_policy_invalid_value_raises():
+    from megatron.core.optimizer.muon import _resolve_muon_scale_mode_for_mup
+
+    with pytest.raises(ValueError, match="Invalid Muon MuP scale policy"):
+        _resolve_muon_scale_mode_for_mup("spectral", use_mup=True, mup_scale_policy="invalid")
 @pytest.mark.parametrize("use_nesterov", [True, False])
 def test_muon_optimizer_nesterov(use_nesterov):
     """Test TensorParallelMuon optimizer with and without Nesterov momentum."""
