@@ -281,6 +281,9 @@ class OptimizerConfig:
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
 
+    muon_spectral_fan_scale: bool = True
+    """If true, apply MuP spectral fan scaling in Muon spectral mode."""
+
     #######################
     # Distributed optimizer
     #######################

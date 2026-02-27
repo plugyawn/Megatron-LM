@@ -2146,6 +2146,12 @@ def _add_regularization_args(parser):
                        help='How to perform NS calculation for tensor model parallel weights')
     group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
                        help='Additional scale factor for the muon update')
+    group.add_argument('--muon-spectral-fan-scale', action='store_true', default=True,
+                       dest='muon_spectral_fan_scale',
+                       help='Apply spectral sqrt(fan_out/fan_in) scaling in Muon spectral mode')
+    group.add_argument('--no-muon-spectral-fan-scale', action='store_false',
+                       dest='muon_spectral_fan_scale',
+                       help='Disable Muon spectral sqrt(fan_out/fan_in) scaling')
 
     group.add_argument('--no-weight-decay-cond-type', type=str, choices=['apply_wd_to_qk_layernorm'],
                        help='Type of no weight decay condition. Choices: '
