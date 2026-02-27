@@ -82,6 +82,20 @@ def _get_fan_out_and_fan_in(
     return fan_out, fan_in
 
 
+def _partition_expert_param_groups(
+    param_groups: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split parameter groups into non-expert and expert subsets without mutation."""
+    non_expert_param_groups = []
+    expert_param_groups = []
+    for group in param_groups:
+        if group.get('is_expert_parallel', False):
+            expert_param_groups.append(group)
+        else:
+            non_expert_param_groups.append(group)
+    return non_expert_param_groups, expert_param_groups
+
+
 class TensorParallelMuon(OrthogonalizedOptimizer):
     """Tensor Parallel Muon optimizer."""
 
@@ -175,6 +189,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 
         if self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
             # split grouped attention parameters (e.g., QKV, GQA, etc.)
+            scale_factor = self._get_scale_factor(p, grad, tp_group, partition_dim)
             grad_shape = grad.shape
             log_single_rank(
                 logger,
@@ -193,7 +208,6 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             qkv_grads_scaled = []
             for qkv_grad in qkv_grads:
                 orth_qkv_grad = self.scaled_orthogonalize_fn(qkv_grad, tp_group, partition_dim)
-                scale_factor = self._get_scale_factor(p, qkv_grad, tp_group, partition_dim)
                 qkv_grads_scaled.append(
                     (orth_qkv_grad * scale_factor).view(num_query_groups, -1, grad_shape[-1])
                 )
@@ -349,10 +363,7 @@ def get_megatron_muon_optimizer(
     # if layerwise distributed optimizer is not used, need to handle ep params separately
     expert_param_groups = []
     if not layer_wise_distributed_optimizer:
-        for group in linear_param_groups:
-            if group['is_expert_parallel']:
-                expert_param_groups.append(group)
-                linear_param_groups.remove(group)
+        linear_param_groups, expert_param_groups = _partition_expert_param_groups(linear_param_groups)
 
     optimizer = TensorParallelMuon(linear_param_groups, **muon_kwargs)
 
