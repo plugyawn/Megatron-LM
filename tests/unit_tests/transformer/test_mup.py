@@ -9,7 +9,9 @@ These tests verify that MuP is correctly implemented in Megatron-LM:
 4. LR override computation
 """
 
+import logging
 import math
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -532,6 +534,7 @@ class TestMuPOptimizerTypeHandling:
         muon_managed_param.is_embedding_or_output_parameter = False
         output_param = torch.nn.Parameter(torch.zeros(10, 10))
         output_param.is_embedding_or_output_parameter = True
+        output_param.is_embedding_parameter = True
         bias_param = torch.nn.Parameter(torch.zeros(10))
 
         muon_managed_matches = [
@@ -561,9 +564,10 @@ class TestMuPOptimizerTypeHandling:
         assert 'min_lr' not in muon_managed_override
         assert 'eps' not in muon_managed_override
 
-        # Output params remain in the MuP override path (handled by chained Adam optimizer).
-        assert output_override['max_lr'] == pytest.approx(1e-3 / width_mult)
-        assert output_override['min_lr'] == pytest.approx(1e-5 / width_mult)
+        # Real MuP output weights are embedding-class params, so MuP should not
+        # add hidden-matrix LR scaling on top of the chained Adam/Muon path.
+        assert 'max_lr' not in output_override
+        assert 'min_lr' not in output_override
         assert 'eps' not in output_override
 
         # Vector-like params stay unscaled.
@@ -572,53 +576,53 @@ class TestMuPOptimizerTypeHandling:
         assert 'eps' not in bias_override
 
     @pytest.mark.parametrize('optimizer_type', ['muon', 'dist_muon'])
-    def test_muon_warns_for_spectral_scale_mode(self, caplog, optimizer_type):
+    def test_muon_warns_for_spectral_scale_mode(self, optimizer_type):
         """Muon+MuP should warn when scale mode is spectral."""
         optimizer_config = OptimizerConfig(lr=1e-3, min_lr=1e-5, muon_scale_mode='spectral')
         width_mult = 4.0
 
-        caplog.set_level('WARNING')
-        overrides = get_mup_config_overrides(
-            optimizer_config, width_mult, optimizer_type=optimizer_type
-        )
+        with patch('megatron.core.optimizer.log_single_rank') as mock_warn:
+            overrides = get_mup_config_overrides(
+                optimizer_config, width_mult, optimizer_type=optimizer_type
+            )
 
         assert len(overrides) == 1
-        assert any(
-            "Both MuP and muon_scale_mode=spectral are enabled." in rec.message
-            and "--muon-scale-mode unit_rms_norm" in rec.message
-            for rec in caplog.records
-        )
+        mock_warn.assert_called_once()
+        _, level, message = mock_warn.call_args[0]
+        assert level == logging.WARNING
+        assert "Both MuP and muon_scale_mode=spectral are enabled." in message
+        assert "--muon-scale-mode unit_rms_norm" in message
 
     @pytest.mark.parametrize('optimizer_type', ['muon', 'dist_muon'])
-    def test_muon_unit_rms_norm_mode_has_no_warning(self, caplog, optimizer_type):
+    def test_muon_unit_rms_norm_mode_has_no_warning(self, optimizer_type):
         """Muon+MuP should not warn when scale mode is unit_rms_norm."""
         optimizer_config = OptimizerConfig(lr=1e-3, min_lr=1e-5, muon_scale_mode='unit_rms_norm')
         width_mult = 4.0
 
-        caplog.set_level('WARNING')
-        overrides = get_mup_config_overrides(
-            optimizer_config, width_mult, optimizer_type=optimizer_type
-        )
+        with patch('megatron.core.optimizer.log_single_rank') as mock_warn:
+            overrides = get_mup_config_overrides(
+                optimizer_config, width_mult, optimizer_type=optimizer_type
+            )
 
         assert len(overrides) == 1
-        assert not any("muon_scale_mode=spectral" in rec.message for rec in caplog.records)
+        mock_warn.assert_not_called()
 
     @pytest.mark.parametrize('optimizer_type', ['muon', 'dist_muon'])
-    def test_muon_warns_for_spectral_mode_at_unity_width_mult(self, caplog, optimizer_type):
+    def test_muon_warns_for_spectral_mode_at_unity_width_mult(self, optimizer_type):
         """Muon+MuP warning should still fire when width_mult==1.0."""
         optimizer_config = OptimizerConfig(lr=1e-3, min_lr=1e-5, muon_scale_mode='spectral')
         width_mult = 1.0
 
-        caplog.set_level('WARNING')
-        overrides = get_mup_config_overrides(
-            optimizer_config, width_mult, optimizer_type=optimizer_type
-        )
+        with patch('megatron.core.optimizer.log_single_rank') as mock_warn:
+            overrides = get_mup_config_overrides(
+                optimizer_config, width_mult, optimizer_type=optimizer_type
+            )
 
         assert len(overrides) == 0
-        assert any(
-            "Both MuP and muon_scale_mode=spectral are enabled." in rec.message
-            for rec in caplog.records
-        )
+        mock_warn.assert_called_once()
+        _, level, message = mock_warn.call_args[0]
+        assert level == logging.WARNING
+        assert "Both MuP and muon_scale_mode=spectral are enabled." in message
 
 
 class TestMuPMTPLossScaling:
