@@ -21,7 +21,16 @@ from .roles import (
     is_vector_like_parameter,
     set_parameterization_metadata,
 )
-from .spec import ResolvedScalingContext, build_resolved_scaling_context
+from .spec import (
+    SCALING_RECIPE_MUP,
+    SCALING_RECIPE_NONE,
+    SCALING_RECIPE_VALUES,
+    ResolvedScalingContext,
+    ScalingUserConfig,
+    build_resolved_scaling_context,
+    build_scaling_user_config,
+    sync_legacy_mup_fields,
+)
 from .training_policy import ResolvedTrainingPolicy, build_legacy_mup_training_policy
 
 __all__ = [
@@ -38,9 +47,14 @@ __all__ = [
     'ResolvedModelPolicy',
     'ResolvedScalingContext',
     'ResolvedTrainingPolicy',
+    'SCALING_RECIPE_MUP',
+    'SCALING_RECIPE_NONE',
+    'SCALING_RECIPE_VALUES',
+    'ScalingUserConfig',
     'build_legacy_mup_training_policy',
     'build_resolved_model_policy',
     'build_resolved_scaling_context',
+    'build_scaling_user_config',
     'get_parameterization_role',
     'is_embedding_class_parameter',
     'is_embedding_or_output_parameter',
@@ -49,4 +63,5 @@ __all__ = [
     'is_output_parameter',
     'is_vector_like_parameter',
     'set_parameterization_metadata',
+    'sync_legacy_mup_fields',
 ]
