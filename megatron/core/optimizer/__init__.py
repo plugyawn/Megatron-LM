@@ -60,8 +60,10 @@ from megatron.core.parameterization import (
     is_embedding_class_parameter,
     is_embedding_or_output_parameter,
     is_hidden_matrix_parameter,
+    is_hidden_vector_parameter,
     is_muon_managed_matrix_parameter,
     is_vector_like_parameter,
+    should_skip_depth_mup_vector_weight_decay,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
@@ -97,33 +99,43 @@ from .optimizer_config import (
 logger = logging.getLogger(__name__)
 
 
-def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, ParamGroupOverride]:
-    """Get standard config overrides for the optimizer, handling decoupled LR and common wd skips.
-
-    Args:
-        config (OptimizerConfig): optimizer configuration object.
-
-    Returns:
-        Dict[ParamKey, ParamGroupOverride]: standard config overrides.
-    """
+def get_standard_config_overrides(
+    config: OptimizerConfig, scaling_policy: Optional[ResolvedTrainingPolicy] = None
+) -> Dict[ParamKey, ParamGroupOverride]:
+    """Get standard config overrides for optimizer LR and weight-decay skips."""
     config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = {}
-    # First, figure out how we are going to do wd skipping. The two main approaches are:
-    #  1. The classic megatron approach of skipping all len 1 and bias parameters.
-    #  2. The Qwen3-Next approach of doing 1, other than qk layernorm parameters.
-    if config.apply_wd_to_qk_layernorm:
-        shape_1_not_qkln_param = ParamWithNamePredicate(
-            name="s1_not_qkln",
-            fn=lambda param, name: (len(param.shape) == 1 or name.endswith(".bias"))
-            and not ("q_layernorm." in name or "k_layernorm." in name),
-        )
-        param_wd_mult_key = ParamKey(with_name_predicate=shape_1_not_qkln_param)
-    else:
-        param_length_1_match = ParamPredicate(
-            name="param_len_1", fn=lambda param: len(param.shape) == 1
-        )
-        param_wd_mult_key = ParamKey(name="*.bias", predicate=param_length_1_match)
 
-    config_overrides[param_wd_mult_key] = ParamGroupOverride(wd_mult=0.0)
+    use_depth_mup_adamw_table = bool(
+        scaling_policy and scaling_policy.context.is_depth_mup and scaling_policy.is_adam_optimizer
+    )
+    if use_depth_mup_adamw_table:
+        depth_mup_vector_wd_skip = ParamWithNamePredicate(
+            name="depth_mup_norm_and_unknown_vector_wd_skip",
+            fn=lambda param, name: should_skip_depth_mup_vector_weight_decay(
+                param, name, apply_wd_to_qk_layernorm=config.apply_wd_to_qk_layernorm
+            ),
+        )
+        config_overrides[ParamKey(with_name_predicate=depth_mup_vector_wd_skip)] = (
+            ParamGroupOverride(wd_mult=0.0)
+        )
+    else:
+        # First, figure out how we are going to do wd skipping. The two main approaches are:
+        #  1. The classic megatron approach of skipping all len 1 and bias parameters.
+        #  2. The Qwen3-Next approach of doing 1, other than qk layernorm parameters.
+        if config.apply_wd_to_qk_layernorm:
+            shape_1_not_qkln_param = ParamWithNamePredicate(
+                name="s1_not_qkln",
+                fn=lambda param, name: (len(param.shape) == 1 or name.endswith(".bias"))
+                and not ("q_layernorm." in name or "k_layernorm." in name),
+            )
+            param_wd_mult_key = ParamKey(with_name_predicate=shape_1_not_qkln_param)
+        else:
+            param_length_1_match = ParamPredicate(
+                name="param_len_1", fn=lambda param: len(param.shape) == 1
+            )
+            param_wd_mult_key = ParamKey(name="*.bias", predicate=param_length_1_match)
+
+        config_overrides[param_wd_mult_key] = ParamGroupOverride(wd_mult=0.0)
 
     if config.decoupled_lr is not None:
         decoupled_lr_config: ParamGroupOverride = {"max_lr": config.decoupled_lr}
