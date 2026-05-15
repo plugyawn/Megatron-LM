@@ -19,7 +19,11 @@ import torch.nn.functional as F
 from megatron.core.parameterization import build_resolved_scaling_context, sync_legacy_mup_fields
 from megatron.core.transformer import TransformerConfig, MLATransformerConfig
 from megatron.core.utils import get_torch_version, is_torch_min_version
-from megatron.training.arguments import validate_depth_mup_optimizer_support, warn_deprecated_mup_aliases
+from megatron.training.arguments import (
+    validate_depth_mup_optimizer_support,
+    validate_muon_scalar_optimizer_support,
+    warn_deprecated_mup_aliases,
+)
 
 # Taken from https://stackoverflow.com/questions/65414773/parse-environment-variable-from-yaml-with-pyyaml
 # Allows for yaml to use environment variables
@@ -370,6 +374,7 @@ def validate_yaml(args, defaults={}):
     if not hasattr(args, 'allow_depth_mup_eval'):
         args.allow_depth_mup_eval = False
     validate_depth_mup_optimizer_support(args)
+    validate_muon_scalar_optimizer_support(args)
     warn_deprecated_mup_aliases(args)
     sync_legacy_mup_fields(args, build_resolved_scaling_context(args))
     # For GPT Layer spec in pretrain_gpt
