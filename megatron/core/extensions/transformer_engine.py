@@ -38,6 +38,7 @@ from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     set_tensor_model_parallel_attributes,
 )
+from megatron.core.matrix_update import set_linear_weight_info
 from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     get_data_parallel_rng_tracker_name,
@@ -770,6 +771,8 @@ class TELinear(te.pytorch.Linear):
                 "Transformer Engine is not installed. "
                 "Please install it with `pip install transformer-engine`."
             )
+        logical_input_size = input_size
+        logical_output_size = output_size
 
         self.config = config
 
@@ -928,6 +931,24 @@ class TELinear(te.pytorch.Linear):
 
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self._tp_group = tp_group
+        if parallel_mode == "column":
+            tp_layout = "column_parallel"
+        elif parallel_mode == "row":
+            tp_layout = "row_parallel"
+        elif parallel_mode == "duplicated":
+            tp_layout = "duplicated"
+        else:
+            tp_layout = "none"
+        set_linear_weight_info(
+            self.weight,
+            logical_shape=(logical_output_size, logical_input_size),
+            tp_layout=tp_layout,
+            sequence_parallel=self.config.sequence_parallel,
+            expert_parallel=explicit_expert_comm,
+            has_bias=bias,
+            role=tp_comm_buffer_name,
+        )
+        self.weight._feature_gram_collector = "transformer_engine"
 
     def finish_init(self, quantization_config: QuantizationConfig):
         """Post-init of quantization override"""
@@ -1137,6 +1158,17 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         setattr(self.weight, 'partition_stride', stride)
         if bias and hasattr(self, 'bias') and self.bias is not None:
             setattr(self.bias, 'partition_stride', stride)
+
+        set_linear_weight_info(
+            self.weight,
+            logical_shape=(output_size, input_size),
+            tp_layout="column_parallel",
+            sequence_parallel=self.config.sequence_parallel,
+            expert_parallel=False,
+            has_bias=bias,
+            role=tp_comm_buffer_name,
+        )
+        self.weight._feature_gram_collector = "transformer_engine"
 
         if config.use_cpu_initialization:
             output_size_per_partition = divide(output_size, self.tp_size)
