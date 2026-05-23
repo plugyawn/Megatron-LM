@@ -201,6 +201,7 @@ from megatron.core.enums import ModelType
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.unified_memory import create_unified_mempool
 from megatron.core.optimizer import OptimizerConfig, ParamKey, get_megatron_optimizer
+from megatron.core.optimizer.matrix_optimizer import get_megatron_matrix_optimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.parallel_state import (
     create_all_gather_groups,
@@ -1971,13 +1972,21 @@ def setup_model_and_optimizer(
             if scaling_overrides:
                 config_overrides = {**(config_overrides or {}), **scaling_overrides}
 
-        optimizer = get_megatron_optimizer(
-            config,
-            model,
-            config_overrides=config_overrides,
-            use_gloo_process_groups=args.use_gloo_process_groups,
-            dump_param_to_param_group_map=args.dump_param_to_param_group_map,
-        )
+        if config.matrix_optimizer != 'none':
+            optimizer = get_megatron_matrix_optimizer(
+                config,
+                model,
+                config_overrides=config_overrides,
+                use_gloo_process_groups=args.use_gloo_process_groups,
+            )
+        else:
+            optimizer = get_megatron_optimizer(
+                config,
+                model,
+                config_overrides=config_overrides,
+                use_gloo_process_groups=args.use_gloo_process_groups,
+                dump_param_to_param_group_map=args.dump_param_to_param_group_map,
+            )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
