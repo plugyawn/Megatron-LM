@@ -337,20 +337,31 @@ def allocate_feature_gram_buffers(param: torch.nn.Parameter, recipe: FeatureGram
             )
     param._feature_gram_recipe = recipe
     param._feature_gram_scope = recipe.scope
+    if not hasattr(param, "_feature_gram_generation"):
+        param._feature_gram_generation = 0
     _mark_feature_gram_unfinalized(param)
 
 
-def reset_feature_gram_buffers(param: torch.nn.Parameter, *, active: bool = True) -> None:
-    """Reset transient factor buffers for a new collection window."""
+def reset_feature_gram_buffers(
+    param: torch.nn.Parameter, *, active: bool = True, zero: bool = True
+) -> None:
+    """Prepare transient factor buffers for a collection window.
 
-    if hasattr(param, "main_grad_feature_gram"):
+    ``active=False, zero=False`` preserves the previous FEATURE_GRAM for
+    refresh-cadence reuse. This is what allows matrix optimizers to cache
+    Cholesky/diagonal solve factors across steps when refresh_interval > 1.
+    """
+
+    if zero and hasattr(param, "main_grad_feature_gram"):
         param.main_grad_feature_gram.zero_()
-    if hasattr(param, "main_grad_feature_count"):
+    if zero and hasattr(param, "main_grad_feature_count"):
         param.main_grad_feature_count.zero_()
-    if hasattr(param, "main_grad_feature_sum"):
+    if zero and hasattr(param, "main_grad_feature_sum"):
         param.main_grad_feature_sum.zero_()
+    if zero:
+        param._feature_gram_generation = getattr(param, "_feature_gram_generation", 0) + 1
+        _mark_feature_gram_unfinalized(param)
     param._feature_gram_active = active
-    _mark_feature_gram_unfinalized(param)
 
 
 def iter_matrix_update_params(modules: Iterable[torch.nn.Module]):

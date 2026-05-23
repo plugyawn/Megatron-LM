@@ -39,14 +39,18 @@ def _param_with_info(tp_layout="column_parallel"):
     return param
 
 
-def _recipe(approximation=FeatureGramApproximation.FULL, normalization=FeatureGramNormalization.SUM):
+def _recipe(
+    approximation=FeatureGramApproximation.FULL,
+    normalization=FeatureGramNormalization.SUM,
+    refresh_interval=1,
+):
     return FeatureGramRecipe(
         approximation=approximation,
         scope=FeatureGramScope.GLOBAL_EXACT,
         normalization=normalization,
         source_dtype="fp32_cast",
         accumulation_dtype=torch.float32,
-        refresh_interval=1,
+        refresh_interval=refresh_interval,
         token_sample_size=None,
         ridge=0.0,
         ema_beta=None,
@@ -170,7 +174,7 @@ def test_fp8_dequant_source_fails_closed_in_native_collector():
         maybe_accumulate_feature_gram(param, torch.ones(2, 3))
 
 
-def test_matrix_function_optimizer_consumes_feature_gram_and_resets_buffer():
+def test_matrix_function_optimizer_consumes_feature_gram_and_preserves_buffer_for_cache_reuse():
     param = _param_with_info()
     param.data = torch.zeros_like(param.data)
     param.main_grad = torch.ones_like(param.data)
@@ -192,8 +196,85 @@ def test_matrix_function_optimizer_consumes_feature_gram_and_resets_buffer():
     torch.testing.assert_close(param, torch.full_like(param, -0.1))
     torch.testing.assert_close(seen["feature_gram"], x.t().matmul(x) / x.shape[0])
     assert seen["model_param"] is param
-    torch.testing.assert_close(param.main_grad_feature_gram, torch.zeros_like(param.main_grad_feature_gram))
-    torch.testing.assert_close(param.main_grad_feature_count, torch.tensor(0.0, dtype=torch.float64))
+    torch.testing.assert_close(param.main_grad_feature_gram, x.t().matmul(x))
+    torch.testing.assert_close(param.main_grad_feature_count, torch.tensor(2.0, dtype=torch.float64))
+
+
+def test_matrix_function_optimizer_respects_feature_gram_refresh_interval():
+    param = _param_with_info()
+    param.data = torch.zeros_like(param.data)
+    param.main_grad = torch.ones_like(param.data)
+    recipe = _recipe(normalization=FeatureGramNormalization.MEAN, refresh_interval=2)
+    configure_matrix_update_param(param, recipe=recipe)
+    seen = []
+
+    def update_rule(grad, feature_gram, model_param):
+        seen.append(feature_gram.clone())
+        return -grad
+
+    opt = MatrixFunctionOptimizer([param], lr=0.1, update_rule=update_rule)
+    x0 = torch.tensor([[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]])
+    x1 = torch.tensor([[3.0, 0.0, 0.0]])
+    x2 = torch.tensor([[0.0, 0.0, 4.0]])
+
+    opt.zero_grad()
+    maybe_accumulate_feature_gram(param, x0)
+    opt.step()
+    first_generation = param._feature_gram_generation
+
+    opt.zero_grad()
+    assert not param._feature_gram_active
+    maybe_accumulate_feature_gram(param, x1)
+    opt.step()
+
+    opt.zero_grad()
+    assert param._feature_gram_active
+    maybe_accumulate_feature_gram(param, x2)
+    opt.step()
+
+    torch.testing.assert_close(seen[0], x0.t().matmul(x0) / x0.shape[0])
+    torch.testing.assert_close(seen[1], seen[0])
+    torch.testing.assert_close(seen[2], x2.t().matmul(x2) / x2.shape[0])
+    assert param._feature_gram_generation == first_generation + 1
+
+
+def test_matrix_update_rule_caches_factorization_by_feature_gram_generation(monkeypatch):
+    from types import SimpleNamespace
+
+    import megatron.core.optimizer.matrix_optimizer as matrix_optimizer_module
+
+    if not matrix_optimizer_module.HAVE_EMERGING_MATRIX_OPTIMIZERS:
+        pytest.skip("emerging_optimizers is not installed")
+
+    param = _param_with_info()
+    param._feature_gram_generation = 7
+    grad = torch.ones_like(param.data)
+    feature_gram = torch.tensor([2.0, 3.0, 4.0])
+    config = OptimizerConfig(
+        matrix_optimizer="locoprop_s",
+        matrix_feature_gram="diag",
+        matrix_feature_gram_refresh_interval=2,
+        matrix_feature_gram_ridge=1.0,
+    )
+    calls = []
+    original_factorize = matrix_optimizer_module.factorize_feature_gram
+
+    def counted_factorize(*args, **kwargs):
+        calls.append(1)
+        return original_factorize(*args, **kwargs)
+
+    monkeypatch.setattr(matrix_optimizer_module, "factorize_feature_gram", counted_factorize)
+    rule = matrix_optimizer_module._make_matrix_update_rule(config, SimpleNamespace(tp=None))
+
+    first = rule(grad, feature_gram, param)
+    second = rule(grad, feature_gram, param)
+    param._feature_gram_generation += 1
+    third = rule(grad, feature_gram, param)
+
+    assert len(calls) == 2
+    torch.testing.assert_close(first, -grad / (feature_gram + 1.0))
+    torch.testing.assert_close(second, first)
+    torch.testing.assert_close(third, first)
 
 
 def test_matrix_function_optimizer_state_dict_does_not_serialize_update_rule():
@@ -290,10 +371,7 @@ def test_optimizer_config_rejects_unimplemented_active_matrix_options():
     OptimizerConfig(matrix_optimizer="newton_muon", matrix_feature_gram_source_dtype="fp8_dequant")
     with pytest.raises(ValueError, match="augmented_feature_sum"):
         OptimizerConfig(matrix_optimizer="newton_muon", matrix_bias_mode="augmented_feature_sum")
-    with pytest.raises(ValueError, match="refresh_interval"):
-        OptimizerConfig(
-            matrix_optimizer="newton_muon", matrix_feature_gram_refresh_interval=2
-        )
+    OptimizerConfig(matrix_optimizer="newton_muon", matrix_feature_gram_refresh_interval=2)
     with pytest.raises(ValueError, match="ema_beta"):
         OptimizerConfig(matrix_optimizer="newton_muon", matrix_feature_gram_ema_beta=0.9)
 

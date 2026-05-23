@@ -486,11 +486,6 @@ class OptimizerConfig:
                 "matrix_feature_gram=sketch requires an explicit storage format and "
                 "collector implementation; use diag, block_diag, or full in this checkout."
             )
-        if self.matrix_optimizer != "none" and self.matrix_feature_gram_refresh_interval != 1:
-            raise ValueError(
-                "matrix_feature_gram_refresh_interval > 1 requires cadence-aware FEATURE_GRAM "
-                "buffer lifecycle support; use 1 in this checkout."
-            )
         if self.matrix_optimizer != "none" and self.matrix_feature_gram_ema_beta is not None:
             raise ValueError(
                 "matrix_feature_gram_ema_beta requires persistent EMA feature Gram state; "
