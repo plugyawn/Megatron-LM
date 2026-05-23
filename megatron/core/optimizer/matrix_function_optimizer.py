@@ -42,6 +42,8 @@ def default_matrix_apply_plan(
     approximation_labels: list[str] = []
     if feature_gram_scope == FeatureGramScope.TP_LOCAL_BLOCK_DIAG:
         approximation_labels.append("tp_local_block_diag_feature_gram")
+    elif feature_gram_scope == FeatureGramScope.BLOCK_DIAG_APPROX:
+        approximation_labels.append("block_diag_feature_gram")
     elif feature_gram_scope == FeatureGramScope.DIAG_APPROX:
         approximation_labels.append("diag_feature_gram")
     elif feature_gram_scope == FeatureGramScope.SKETCH_APPROX:

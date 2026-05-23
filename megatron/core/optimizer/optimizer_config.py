@@ -309,6 +309,9 @@ class OptimizerConfig:
     matrix_feature_gram_min_samples_per_feature: Optional[float] = None
     """Minimum samples per feature required when using a full sampled FEATURE_GRAM."""
 
+    matrix_feature_gram_block_size: int = 128
+    """Block size for block_diag FEATURE_GRAM storage."""
+
     matrix_feature_gram_ridge: float = 0.0
     """Default ridge used by matrix optimizer rules when consuming FEATURE_GRAM."""
 
@@ -410,6 +413,8 @@ class OptimizerConfig:
             )
         if self.matrix_feature_gram_normalization not in ("sum", "mean"):
             raise ValueError("matrix_feature_gram_normalization must be one of: sum, mean")
+        if self.matrix_feature_gram_block_size < 1:
+            raise ValueError("matrix_feature_gram_block_size must be >= 1")
         if self.matrix_tp_update_mode not in ("allgather", "small_gram_polar", "block_local"):
             raise ValueError(
                 "matrix_tp_update_mode must be one of: allgather, small_gram_polar, block_local"
@@ -433,10 +438,10 @@ class OptimizerConfig:
                 "Matrix optimizers do not support standard DistributedOptimizer yet; "
                 "use whole-parameter layer-wise ownership or disable --use-distributed-optimizer."
             )
-        if self.matrix_optimizer != "none" and self.matrix_feature_gram in ("block_diag", "sketch"):
+        if self.matrix_optimizer != "none" and self.matrix_feature_gram == "sketch":
             raise ValueError(
-                "matrix_feature_gram=block_diag/sketch requires an explicit storage format and "
-                "collector implementation; use diag or full in this checkout."
+                "matrix_feature_gram=sketch requires an explicit storage format and "
+                "collector implementation; use diag, block_diag, or full in this checkout."
             )
         if self.matrix_optimizer != "none" and self.matrix_feature_gram_refresh_interval != 1:
             raise ValueError(
