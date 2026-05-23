@@ -1131,6 +1131,10 @@ def drain_embedding_wgrad_compute(
             grad_output, all_gathered_input
         )
 
+        from megatron.core.matrix_update import maybe_accumulate_feature_gram
+
+        maybe_accumulate_feature_gram(weight, all_gathered_input)
+
         if hasattr(weight, "__fsdp_param__"):
             weight.main_grad = weight.get_main_grad()
 
