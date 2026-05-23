@@ -32,9 +32,9 @@ try:
         tp_small_gram_polar_allreduce,
     )
     from emerging_optimizers.matrix_update_rules import (
-        locoprop_s_update,
+        factorize_feature_gram,
         newton_schulz_orthogonalize,
-        right_precondition_with_feature_gram,
+        right_precondition_with_factorized_feature_gram,
     )
 
     HAVE_EMERGING_MATRIX_OPTIMIZERS = True
@@ -74,24 +74,40 @@ def _copy_matrix_model_refs_to_main_params(optimizer: MegatronOptimizer) -> None
 
 def _make_matrix_update_rule(config: OptimizerConfig, pg_collection: ProcessGroupCollection):
     tp_update_mode = _tp_mode_from_config(config)
+    factor_cache = {}
+
+    def get_cached_factorization(
+        param: torch.nn.Parameter, feature_gram: torch.Tensor
+    ):
+        generation = getattr(param, "_feature_gram_generation", None)
+        cache_key = (
+            generation,
+            tuple(feature_gram.shape),
+            feature_gram.dtype,
+            feature_gram.device,
+            config.matrix_feature_gram_ridge,
+        )
+        cached = factor_cache.get(id(param))
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+        factorization = factorize_feature_gram(
+            feature_gram, ridge=config.matrix_feature_gram_ridge
+        )
+        factor_cache[id(param)] = (cache_key, factorization)
+        return factorization
 
     def update_rule(grad: torch.Tensor, feature_gram: torch.Tensor, param: torch.nn.Parameter):
         info = getattr(param, "_mcore_linear_weight_info", None)
         if info is None:
             raise RuntimeError("Matrix optimizer parameter is missing LinearWeightInfo.")
+        factorization = get_cached_factorization(param, feature_gram)
         if config.matrix_optimizer == "locoprop_s":
-            return locoprop_s_update(
-                grad,
-                feature_gram,
-                gamma=1.0,
-                inner_steps=None,
-                ridge=config.matrix_feature_gram_ridge,
-            )
+            return -right_precondition_with_factorized_feature_gram(grad, factorization)
         if config.matrix_optimizer != "newton_muon":
             raise RuntimeError(f"Unsupported matrix optimizer: {config.matrix_optimizer}")
 
-        preconditioned = right_precondition_with_feature_gram(
-            grad, feature_gram, ridge=config.matrix_feature_gram_ridge
+        preconditioned = right_precondition_with_factorized_feature_gram(
+            grad, factorization
         ).to(torch.float32)
         tp_group = pg_collection.tp
         tp_layout = info.tp_layout

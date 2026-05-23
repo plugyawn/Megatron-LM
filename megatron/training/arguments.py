@@ -1443,11 +1443,6 @@ def validate_args(args, defaults={}):
                 "matrix-feature-gram=sketch requires an explicit storage format and "
                 "collector implementation; use diag, block_diag, or full in this checkout."
             )
-        if args.matrix_feature_gram_refresh_interval != 1:
-            raise ValueError(
-                "matrix-feature-gram-refresh-interval > 1 requires cadence-aware FEATURE_GRAM "
-                "buffer lifecycle support; use 1 in this checkout."
-            )
         if args.matrix_feature_gram_ema_beta is not None:
             raise ValueError(
                 "matrix-feature-gram-ema-beta requires persistent EMA feature Gram state; "

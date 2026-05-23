@@ -103,6 +103,7 @@ class MatrixFunctionOptimizer(torch.optim.Optimizer):
         self.update_rule = update_rule
         self.tp_update_mode = tp_update_mode
         self.feature_gram_process_groups = tuple(feature_gram_process_groups)
+        self._matrix_step = 0
 
     def _model_param_for_factor(self, param: torch.nn.Parameter) -> torch.nn.Parameter:
         return getattr(param, "_matrix_update_model_param", param)
@@ -121,7 +122,10 @@ class MatrixFunctionOptimizer(torch.optim.Optimizer):
     def zero_grad(self, set_to_none: bool = True) -> None:
         super().zero_grad(set_to_none=set_to_none)
         for param in self._factor_params():
-            reset_feature_gram_buffers(param, active=True)
+            recipe = getattr(param, "_feature_gram_recipe", None)
+            refresh_interval = getattr(recipe, "refresh_interval", 1)
+            refresh_active = self._matrix_step % refresh_interval == 0
+            reset_feature_gram_buffers(param, active=refresh_active, zero=refresh_active)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -165,6 +169,5 @@ class MatrixFunctionOptimizer(torch.optim.Optimizer):
                     )
                 param.add_(delta.to(dtype=param.dtype), alpha=lr)
 
-        for param in factor_params:
-            reset_feature_gram_buffers(param, active=True)
+        self._matrix_step += 1
         return loss
