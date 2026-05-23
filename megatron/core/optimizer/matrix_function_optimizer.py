@@ -26,6 +26,9 @@ from megatron.core.matrix_update import (
 )
 
 MatrixUpdateRuleFn = Callable[[torch.Tensor, torch.Tensor, torch.nn.Parameter], torch.Tensor]
+MatrixInplaceUpdateRuleFn = Callable[
+    [torch.nn.Parameter, torch.Tensor, torch.Tensor, torch.nn.Parameter, float, float, bool], bool
+]
 
 
 def default_matrix_apply_plan(
@@ -87,6 +90,7 @@ class MatrixFunctionOptimizer(torch.optim.Optimizer):
         *,
         lr: float,
         update_rule: MatrixUpdateRuleFn,
+        inplace_update_rule: Optional[MatrixInplaceUpdateRuleFn] = None,
         weight_decay: float = 0.0,
         decoupled_weight_decay: bool = True,
         tp_update_mode: TPUpdateMode = TPUpdateMode.TP_ALLGATHER_LOGICAL_MATRIX,
@@ -101,6 +105,7 @@ class MatrixFunctionOptimizer(torch.optim.Optimizer):
         )
         super().__init__(params, defaults)
         self.update_rule = update_rule
+        self.inplace_update_rule = inplace_update_rule
         self.tp_update_mode = tp_update_mode
         self.feature_gram_process_groups = tuple(feature_gram_process_groups)
         self._matrix_step = 0
@@ -151,16 +156,26 @@ class MatrixFunctionOptimizer(torch.optim.Optimizer):
                     grad = param.grad
                 if grad is None:
                     continue
+                model_param = self._model_param_for_factor(param)
+                plan = default_matrix_apply_plan(model_param, tp_update_mode=self.tp_update_mode)
+                validate_matrix_apply_plan(plan)
+                feature_gram = get_feature_gram_for_optimizer(model_param)
+                if self.inplace_update_rule is not None and self.inplace_update_rule(
+                    param,
+                    grad,
+                    feature_gram,
+                    model_param,
+                    lr,
+                    weight_decay,
+                    decoupled_weight_decay,
+                ):
+                    continue
                 grad_for_update = grad
                 if weight_decay != 0.0:
                     if decoupled_weight_decay:
                         param.mul_(1.0 - lr * weight_decay)
                     else:
                         grad_for_update = grad.add(param, alpha=weight_decay)
-                model_param = self._model_param_for_factor(param)
-                plan = default_matrix_apply_plan(model_param, tp_update_mode=self.tp_update_mode)
-                validate_matrix_apply_plan(plan)
-                feature_gram = get_feature_gram_for_optimizer(model_param)
                 delta = self.update_rule(grad_for_update, feature_gram, model_param)
                 if delta.shape != param.shape:
                     raise RuntimeError(

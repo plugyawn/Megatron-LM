@@ -32,6 +32,7 @@ try:
         tp_small_gram_polar_allreduce,
     )
     from emerging_optimizers.matrix_update_rules import (
+        apply_diag_right_preconditioned_update_,
         factorize_feature_gram,
         newton_schulz_orthogonalize,
         right_precondition_with_factorized_feature_gram,
@@ -140,6 +141,38 @@ def _make_matrix_update_rule(config: OptimizerConfig, pg_collection: ProcessGrou
     return update_rule
 
 
+def _make_matrix_inplace_update_rule(config: OptimizerConfig):
+    """Return an optional fused in-place update rule for cheap diagonal cases."""
+
+    if config.matrix_optimizer != "locoprop_s":
+        return None
+
+    def inplace_update_rule(
+        param: torch.nn.Parameter,
+        grad: torch.Tensor,
+        feature_gram: torch.Tensor,
+        model_param: torch.nn.Parameter,
+        lr: float,
+        weight_decay: float,
+        decoupled_weight_decay: bool,
+    ) -> bool:
+        if feature_gram.ndim != 1:
+            return False
+        apply_diag_right_preconditioned_update_(
+            param,
+            grad,
+            feature_gram,
+            lr=lr,
+            ridge=config.matrix_feature_gram_ridge,
+            update_scale=1.0,
+            weight_decay=weight_decay,
+            decoupled_weight_decay=decoupled_weight_decay,
+        )
+        return True
+
+    return inplace_update_rule
+
+
 def get_megatron_matrix_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
@@ -202,6 +235,7 @@ def get_megatron_matrix_optimizer(
         matrix_param_groups,
         lr=config.lr,
         update_rule=_make_matrix_update_rule(config, pg_collection),
+        inplace_update_rule=_make_matrix_inplace_update_rule(config),
         weight_decay=config.weight_decay,
         decoupled_weight_decay=config.decoupled_weight_decay,
         tp_update_mode=_tp_mode_from_config(config),
