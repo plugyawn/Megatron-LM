@@ -31,6 +31,7 @@ from megatron.core.utils import (
 )
 
 from ..dist_checkpointing.mapping import ShardedStateDict
+from ..matrix_update import maybe_accumulate_feature_gram, set_linear_weight_info
 from ..transformer.utils import make_sharded_tensors_for_checkpoint
 from .mappings import (
     copy_to_tensor_model_parallel_region,
@@ -528,6 +529,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             grad_output, total_input = prepare_input_tensors_for_wgrad_compute(
                 grad_output, total_input
             )
+            maybe_accumulate_feature_gram(weight, total_input)
 
         if ctx.allreduce_dgrad:
             # Asynchronous all-reduce
@@ -897,6 +899,16 @@ class ColumnParallelLinear(torch.nn.Module):
             )
             self.sequence_parallel = False
 
+        set_linear_weight_info(
+            self.weight,
+            logical_shape=(self.output_size, self.input_size),
+            tp_layout="column_parallel",
+            sequence_parallel=self.sequence_parallel,
+            expert_parallel=self.explicit_expert_comm,
+            has_bias=bias,
+            role=tp_comm_buffer_name,
+        )
+
         self.allreduce_dgrad = (
             world_size > 1 and not self.sequence_parallel and not self.disable_grad_reduce
         )
@@ -1212,6 +1224,16 @@ class RowParallelLinear(torch.nn.Module):
             setattr(self.bias, "sequence_parallel", self.sequence_parallel)
         else:
             self.register_parameter("bias", None)
+
+        set_linear_weight_info(
+            self.weight,
+            logical_shape=(self.output_size, self.input_size),
+            tp_layout="row_parallel",
+            sequence_parallel=self.sequence_parallel,
+            expert_parallel=self.explicit_expert_comm,
+            has_bias=bias,
+            role=tp_comm_buffer_name,
+        )
 
         # Hook adding a default empty _extra_state for state dict
         self._register_load_state_dict_pre_hook(

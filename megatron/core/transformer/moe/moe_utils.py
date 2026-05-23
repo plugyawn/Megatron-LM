@@ -37,6 +37,7 @@ try:
 
     HAVE_TE = True
 except ImportError:
+    te_general_gemm = None
     HAVE_TE = False
 
 
