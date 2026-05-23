@@ -1757,10 +1757,10 @@ def validate_args(args, defaults={}):
                 "Matrix optimizers do not support standard DistributedOptimizer until logical "
                 "matrix gather/apply/scatter views exist."
             )
-        if args.matrix_feature_gram in ('block_diag', 'sketch'):
+        if args.matrix_feature_gram == 'sketch':
             raise ValueError(
-                "matrix-feature-gram=block_diag/sketch requires an explicit storage format and "
-                "collector implementation; use diag or full in this checkout."
+                "matrix-feature-gram=sketch requires an explicit storage format and "
+                "collector implementation; use diag, block_diag, or full in this checkout."
             )
         if args.matrix_feature_gram_refresh_interval != 1:
             raise ValueError(
@@ -2504,6 +2504,8 @@ def _add_regularization_args(parser):
                        help='FEATURE_GRAM convention consumed by matrix optimizer rules.')
     group.add_argument('--matrix-feature-gram-min-samples-per-feature', type=float, default=None,
                        help='Minimum samples per feature required for sampled full FEATURE_GRAM.')
+    group.add_argument('--matrix-feature-gram-block-size', type=int, default=128,
+                       help='Block size for block_diag FEATURE_GRAM storage.')
     group.add_argument('--matrix-feature-gram-ridge', type=float, default=0.0,
                        help='Default ridge for matrix optimizer rules consuming FEATURE_GRAM.')
     group.add_argument('--matrix-feature-gram-ema-beta', type=float, default=None,

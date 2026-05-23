@@ -38,6 +38,7 @@ class FeatureGramScope(enum.Enum):
 
     GLOBAL_EXACT = "global_exact"
     TP_LOCAL_BLOCK_DIAG = "tp_local_block_diag"
+    BLOCK_DIAG_APPROX = "block_diag_approx"
     DIAG_APPROX = "diag_approx"
     SKETCH_APPROX = "sketch_approx"
 
@@ -88,6 +89,7 @@ class FeatureGramRecipe:
     ridge: float
     ema_beta: Optional[float]
     min_samples_per_feature: Optional[float]
+    block_size: int = 128
 
 
 @dataclass
@@ -125,6 +127,8 @@ def feature_gram_scope_for(
 
     if tp_layout == "row_parallel":
         return FeatureGramScope.TP_LOCAL_BLOCK_DIAG
+    if approximation == FeatureGramApproximation.BLOCK_DIAG:
+        return FeatureGramScope.BLOCK_DIAG_APPROX
     if approximation == FeatureGramApproximation.DIAG:
         return FeatureGramScope.DIAG_APPROX
     if approximation == FeatureGramApproximation.SKETCH:
@@ -211,15 +215,20 @@ def _feature_gram_shape(param: torch.nn.Parameter, recipe: FeatureGramRecipe) ->
         return (dim, dim)
     if recipe.approximation == FeatureGramApproximation.DIAG:
         return (dim,)
+    if recipe.approximation == FeatureGramApproximation.BLOCK_DIAG:
+        num_blocks = (dim + recipe.block_size - 1) // recipe.block_size
+        return (num_blocks, recipe.block_size, recipe.block_size)
     raise NotImplementedError(
         f"FEATURE_GRAM approximation {recipe.approximation.value!r} is not implemented yet. "
-        "Use 'full' or 'diag', or add an explicit storage format for this approximation."
+        "Use 'full', 'diag', or 'block_diag', or add an explicit storage format for this approximation."
     )
 
 
 def _validate_feature_gram_recipe(param: torch.nn.Parameter, recipe: FeatureGramRecipe) -> None:
     if recipe.refresh_interval < 1:
         raise ValueError("matrix-feature-gram-refresh-interval must be >= 1")
+    if recipe.block_size < 1:
+        raise ValueError("matrix-feature-gram-block-size must be >= 1")
     if recipe.token_sample_size is not None and recipe.token_sample_size < 1:
         raise ValueError("matrix-feature-gram-token-sample-size must be >= 1 when set")
     if recipe.min_samples_per_feature is not None and recipe.token_sample_size is not None:
@@ -385,6 +394,7 @@ def recipe_from_optimizer_config(config, info: LinearWeightInfo) -> FeatureGramR
         ridge=config.matrix_feature_gram_ridge,
         ema_beta=config.matrix_feature_gram_ema_beta,
         min_samples_per_feature=config.matrix_feature_gram_min_samples_per_feature,
+        block_size=getattr(config, "matrix_feature_gram_block_size", 128),
     )
 
 
@@ -470,6 +480,35 @@ def _cast_feature_input(inputmat: torch.Tensor, recipe: FeatureGramRecipe) -> to
     return inputmat.to(recipe.accumulation_dtype)
 
 
+def _accumulate_diag_feature_gram(gram: torch.Tensor, x: torch.Tensor) -> None:
+    gram.add_(torch.sum(x * x, dim=0))
+
+
+def _accumulate_block_diag_feature_gram(
+    gram: torch.Tensor,
+    x: torch.Tensor,
+    *,
+    feature_dim: int,
+    block_size: int,
+) -> None:
+    """Accumulate padded block-diagonal ``X.T @ X`` via batched GEMM."""
+
+    expected_blocks, expected_block, _ = gram.shape
+    if expected_block != block_size:
+        raise RuntimeError(
+            f"FEATURE_GRAM block buffer has block size {expected_block}, expected {block_size}."
+        )
+    padded_dim = expected_blocks * block_size
+    if x.shape[-1] != feature_dim:
+        raise RuntimeError(
+            f"FEATURE_GRAM block_diag expected {feature_dim} input features, got {x.shape[-1]}."
+        )
+    if padded_dim != feature_dim:
+        x = torch.nn.functional.pad(x, (0, padded_dim - feature_dim))
+    x_blocks = x.reshape(x.shape[0], expected_blocks, block_size).transpose(0, 1)
+    gram.add_(torch.bmm(x_blocks.transpose(1, 2), x_blocks))
+
+
 @torch.no_grad()
 def maybe_accumulate_feature_gram(weight: torch.Tensor, inputmat: torch.Tensor) -> None:
     """Accumulate ``X.T @ X`` for a linear weight when requested.
@@ -502,7 +541,14 @@ def maybe_accumulate_feature_gram(weight: torch.Tensor, inputmat: torch.Tensor) 
     if recipe.approximation == FeatureGramApproximation.FULL:
         gram.add_(x.t().matmul(x))
     elif recipe.approximation == FeatureGramApproximation.DIAG:
-        gram.add_((x * x).sum(dim=0))
+        _accumulate_diag_feature_gram(gram, x)
+    elif recipe.approximation == FeatureGramApproximation.BLOCK_DIAG:
+        _accumulate_block_diag_feature_gram(
+            gram,
+            x,
+            feature_dim=_feature_dim(weight),
+            block_size=recipe.block_size,
+        )
     else:
         raise NotImplementedError(
             f"FEATURE_GRAM approximation {recipe.approximation.value!r} is not implemented yet."

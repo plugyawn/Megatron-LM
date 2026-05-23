@@ -77,6 +77,22 @@ def test_diag_feature_gram_accumulates_diagonal_only():
     torch.testing.assert_close(param.main_grad_feature_gram, (x * x).sum(dim=0))
 
 
+def test_block_diag_feature_gram_accumulates_padded_blocks():
+    param = _param_with_info()
+    recipe = _recipe(approximation=FeatureGramApproximation.BLOCK_DIAG)
+    recipe.block_size = 2
+    configure_matrix_update_param(param, recipe=recipe)
+    x = torch.tensor([[1.0, 2.0, 3.0], [3.0, 5.0, 7.0]])
+
+    maybe_accumulate_feature_gram(param, x)
+
+    expected = torch.zeros(2, 2, 2)
+    expected[0] = x[:, :2].t().matmul(x[:, :2])
+    padded_last = torch.nn.functional.pad(x[:, 2:], (0, 1))
+    expected[1] = padded_last.t().matmul(padded_last)
+    torch.testing.assert_close(param.main_grad_feature_gram, expected)
+
+
 def test_feature_gram_mean_normalization_is_applied_on_consumption():
     param = _param_with_info()
     recipe = _recipe(normalization=FeatureGramNormalization.MEAN)
@@ -129,11 +145,11 @@ def test_full_feature_gram_rejects_undersampled_rank_deficient_recipe():
         configure_matrix_update_param(param, recipe=recipe)
 
 
-def test_unsupported_approximation_fails_closed():
+def test_sketch_approximation_fails_closed():
     param = _param_with_info()
-    recipe = _recipe(approximation=FeatureGramApproximation.BLOCK_DIAG)
+    recipe = _recipe(approximation=FeatureGramApproximation.SKETCH)
 
-    with pytest.raises(NotImplementedError, match="block_diag"):
+    with pytest.raises(NotImplementedError, match="sketch"):
         configure_matrix_update_param(param, recipe=recipe)
 
 
@@ -256,6 +272,16 @@ def test_feature_gram_finalization_requires_explicit_process_groups():
 def test_optimizer_config_rejects_standard_distopt_with_matrix_optimizer():
     with pytest.raises(ValueError, match="standard DistributedOptimizer"):
         OptimizerConfig(matrix_optimizer="newton_muon", use_distributed_optimizer=True)
+
+
+def test_optimizer_config_accepts_block_diag_feature_gram():
+    config = OptimizerConfig(
+        matrix_optimizer="locoprop_s",
+        matrix_feature_gram="block_diag",
+        matrix_feature_gram_block_size=2,
+    )
+
+    assert config.matrix_feature_gram == "block_diag"
 
 
 def test_optimizer_config_rejects_unimplemented_active_matrix_options():
