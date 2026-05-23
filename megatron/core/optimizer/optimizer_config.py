@@ -275,11 +275,54 @@ class OptimizerConfig:
     muon_num_ns_steps: int = 5
     """The number of iteration steps to use in the Newton-Schulz iteration."""
 
+    muon_ns_coefficients: str = "quintic"
+    """Coefficient set for the Newton-Schulz iteration."""
+
     muon_tp_mode: str = "blockwise"
     """How to perform NS calculation for tensor parallel weights. Defaults to "blockwise"."""
 
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
+
+    # Matrix optimizers.
+    matrix_optimizer: str = "none"
+    """Matrix optimizer for eligible affine 2D weights: none, newton_muon, or locoprop_s."""
+
+    matrix_min_dim: int = 2
+    """Minimum logical matrix dimension for matrix optimizer eligibility."""
+
+    matrix_feature_gram: str = "diag"
+    """FEATURE_GRAM approximation: diag, block_diag, full, or sketch."""
+
+    matrix_feature_gram_refresh_interval: int = 1
+    """Number of optimizer steps between FEATURE_GRAM refreshes."""
+
+    matrix_feature_gram_token_sample_size: Optional[int] = None
+    """Optional number of feature rows/tokens sampled for FEATURE_GRAM collection."""
+
+    matrix_feature_gram_source_dtype: str = "bf16_saved"
+    """Source dtype policy for FEATURE_GRAM: bf16_saved, fp32_cast, or fp8_dequant."""
+
+    matrix_feature_gram_normalization: str = "mean"
+    """FEATURE_GRAM consumption convention: sum or mean."""
+
+    matrix_feature_gram_min_samples_per_feature: Optional[float] = None
+    """Minimum samples per feature required when using a full sampled FEATURE_GRAM."""
+
+    matrix_feature_gram_ridge: float = 0.0
+    """Default ridge used by matrix optimizer rules when consuming FEATURE_GRAM."""
+
+    matrix_feature_gram_ema_beta: Optional[float] = None
+    """Optional EMA coefficient for persistent FEATURE_GRAM estimates."""
+
+    matrix_feature_gram_accumulation_dtype: torch.dtype = torch.float32
+    """Accumulation dtype for FEATURE_GRAM buffers."""
+
+    matrix_tp_update_mode: str = "allgather"
+    """TP apply mode: allgather, small_gram_polar, or block_local."""
+
+    matrix_bias_mode: str = "fallback"
+    """Bias handling for matrix optimizers: fallback or augmented_feature_sum."""
 
     #######################
     # Distributed optimizer
@@ -345,6 +388,71 @@ class OptimizerConfig:
 
     def __post_init__(self):
         """Check the validity of the config."""
+        if self.matrix_optimizer not in ("none", "newton_muon", "locoprop_s"):
+            raise ValueError("matrix_optimizer must be one of: none, newton_muon, locoprop_s")
+        if self.matrix_feature_gram not in ("diag", "block_diag", "full", "sketch"):
+            raise ValueError("matrix_feature_gram must be one of: diag, block_diag, full, sketch")
+        if self.matrix_feature_gram_refresh_interval < 1:
+            raise ValueError("matrix_feature_gram_refresh_interval must be >= 1")
+        if (
+            self.matrix_feature_gram_token_sample_size is not None
+            and self.matrix_feature_gram_token_sample_size < 1
+        ):
+            raise ValueError("matrix_feature_gram_token_sample_size must be >= 1 when set")
+        if self.matrix_feature_gram_source_dtype not in (
+            "bf16_saved",
+            "fp32_cast",
+            "fp8_dequant",
+        ):
+            raise ValueError(
+                "matrix_feature_gram_source_dtype must be one of: "
+                "bf16_saved, fp32_cast, fp8_dequant"
+            )
+        if self.matrix_feature_gram_normalization not in ("sum", "mean"):
+            raise ValueError("matrix_feature_gram_normalization must be one of: sum, mean")
+        if self.matrix_tp_update_mode not in ("allgather", "small_gram_polar", "block_local"):
+            raise ValueError(
+                "matrix_tp_update_mode must be one of: allgather, small_gram_polar, block_local"
+            )
+        if self.muon_ns_coefficients not in (
+            "simple",
+            "quintic",
+            "polar_express",
+            "cans",
+            "aol",
+        ):
+            raise ValueError(
+                "muon_ns_coefficients must be one of: simple, quintic, polar_express, cans, aol"
+            )
+        if self.matrix_bias_mode not in ("fallback", "augmented_feature_sum"):
+            raise ValueError("matrix_bias_mode must be one of: fallback, augmented_feature_sum")
+        if self.matrix_optimizer != "none" and "muon" in self.optimizer:
+            raise ValueError("matrix_optimizer cannot be combined with optimizer=muon/dist_muon.")
+        if self.matrix_optimizer != "none" and self.use_distributed_optimizer:
+            raise ValueError(
+                "Matrix optimizers do not support standard DistributedOptimizer yet; "
+                "use whole-parameter layer-wise ownership or disable --use-distributed-optimizer."
+            )
+        if self.matrix_optimizer != "none" and self.matrix_feature_gram in ("block_diag", "sketch"):
+            raise ValueError(
+                "matrix_feature_gram=block_diag/sketch requires an explicit storage format and "
+                "collector implementation; use diag or full in this checkout."
+            )
+        if self.matrix_optimizer != "none" and self.matrix_feature_gram_refresh_interval != 1:
+            raise ValueError(
+                "matrix_feature_gram_refresh_interval > 1 requires cadence-aware FEATURE_GRAM "
+                "buffer lifecycle support; use 1 in this checkout."
+            )
+        if self.matrix_optimizer != "none" and self.matrix_feature_gram_ema_beta is not None:
+            raise ValueError(
+                "matrix_feature_gram_ema_beta requires persistent EMA feature Gram state; "
+                "use None in this checkout."
+            )
+        if self.matrix_optimizer != "none" and self.matrix_bias_mode == "augmented_feature_sum":
+            raise ValueError(
+                "matrix_bias_mode=augmented_feature_sum requires FEATURE_SUM collection and "
+                "augmented affine solves; use fallback."
+            )
 
         # The following condition is used to avoid repetition in distrib_optimizer.py.
         # This is because in distrib_optimizer.py, the process to handle parameters are

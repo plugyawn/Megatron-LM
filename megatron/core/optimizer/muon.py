@@ -263,6 +263,7 @@ def get_megatron_muon_optimizer(
         "use_nesterov": config.muon_use_nesterov,
         "weight_decay": config.weight_decay,
         "fp32_matmul_prec": config.muon_fp32_matmul_prec,
+        "coefficient_type": config.muon_ns_coefficients,
         "num_ns_steps": config.muon_num_ns_steps,
         "scale_mode": config.muon_scale_mode,
         "split_qkv": config.muon_split_qkv,

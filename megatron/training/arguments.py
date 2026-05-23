@@ -1430,6 +1430,35 @@ def validate_args(args, defaults={}):
         assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Muon optimizer supports torch and torch_dist checkpoint format."
 
+    if args.matrix_optimizer != 'none':
+        if 'muon' in args.optimizer:
+            raise ValueError("--matrix-optimizer cannot be combined with --optimizer muon/dist_muon.")
+        if args.use_distributed_optimizer:
+            raise ValueError(
+                "Matrix optimizers do not support standard DistributedOptimizer until logical "
+                "matrix gather/apply/scatter views exist."
+            )
+        if args.matrix_feature_gram in ('block_diag', 'sketch'):
+            raise ValueError(
+                "matrix-feature-gram=block_diag/sketch requires an explicit storage format and "
+                "collector implementation; use diag or full in this checkout."
+            )
+        if args.matrix_feature_gram_refresh_interval != 1:
+            raise ValueError(
+                "matrix-feature-gram-refresh-interval > 1 requires cadence-aware FEATURE_GRAM "
+                "buffer lifecycle support; use 1 in this checkout."
+            )
+        if args.matrix_feature_gram_ema_beta is not None:
+            raise ValueError(
+                "matrix-feature-gram-ema-beta requires persistent EMA feature Gram state; "
+                "use None in this checkout."
+            )
+        if args.matrix_bias_mode == 'augmented_feature_sum':
+            raise ValueError(
+                "matrix-bias-mode=augmented_feature_sum requires FEATURE_SUM collection and "
+                "augmented affine solves; use fallback."
+            )
+
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
         assert args.use_precision_aware_optimizer, (
@@ -2167,11 +2196,44 @@ def _add_regularization_args(parser):
                        help='FP32 matmul precision for Newton-Schulz iteration')
     group.add_argument('--muon-num-ns-steps', type=int, default=5,
                        help='Number of Newton-Schulz steps for Muon optimizer')
+    group.add_argument('--muon-ns-coefficients', type=str, default='quintic',
+                       choices=['simple', 'quintic', 'polar_express', 'cans', 'aol'],
+                       help='Coefficient set for Newton-Schulz iteration.')
     group.add_argument('--muon-tp-mode', type=str, default='blockwise',
                        choices=['blockwise', 'duplicated', 'distributed'],
                        help='How to perform NS calculation for tensor model parallel weights')
     group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
                        help='Additional scale factor for the muon update')
+    group.add_argument('--matrix-optimizer', type=str, default='none',
+                       choices=['none', 'newton_muon', 'locoprop_s'],
+                       help='Matrix optimizer for eligible affine 2D weights.')
+    group.add_argument('--matrix-min-dim', type=int, default=2,
+                       help='Minimum logical matrix dimension for matrix optimizer eligibility.')
+    group.add_argument('--matrix-feature-gram', type=str, default='diag',
+                       choices=['diag', 'block_diag', 'full', 'sketch'],
+                       help='FEATURE_GRAM approximation to collect beside main_grad.')
+    group.add_argument('--matrix-feature-gram-refresh-interval', type=int, default=1,
+                       help='Number of optimizer steps between FEATURE_GRAM refreshes.')
+    group.add_argument('--matrix-feature-gram-token-sample-size', type=int, default=None,
+                       help='Optional number of feature rows/tokens sampled for FEATURE_GRAM.')
+    group.add_argument('--matrix-feature-gram-source-dtype', type=str, default='bf16_saved',
+                       choices=['bf16_saved', 'fp32_cast', 'fp8_dequant'],
+                       help='Source dtype policy for FEATURE_GRAM collection.')
+    group.add_argument('--matrix-feature-gram-normalization', type=str, default='mean',
+                       choices=['sum', 'mean'],
+                       help='FEATURE_GRAM convention consumed by matrix optimizer rules.')
+    group.add_argument('--matrix-feature-gram-min-samples-per-feature', type=float, default=None,
+                       help='Minimum samples per feature required for sampled full FEATURE_GRAM.')
+    group.add_argument('--matrix-feature-gram-ridge', type=float, default=0.0,
+                       help='Default ridge for matrix optimizer rules consuming FEATURE_GRAM.')
+    group.add_argument('--matrix-feature-gram-ema-beta', type=float, default=None,
+                       help='Optional EMA coefficient for persistent FEATURE_GRAM estimates.')
+    group.add_argument('--matrix-tp-update-mode', type=str, default='allgather',
+                       choices=['allgather', 'small_gram_polar', 'block_local'],
+                       help='Tensor-parallel matrix update apply mode.')
+    group.add_argument('--matrix-bias-mode', type=str, default='fallback',
+                       choices=['fallback', 'augmented_feature_sum'],
+                       help='Bias handling for matrix optimizers.')
 
     group.add_argument('--no-weight-decay-cond-type', type=str, choices=['apply_wd_to_qk_layernorm'],
                        help='Type of no weight decay condition. Choices: '
