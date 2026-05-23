@@ -312,6 +312,50 @@ def test_matrix_function_optimizer_applies_decoupled_weight_decay():
     torch.testing.assert_close(param, torch.full_like(param, 0.98))
 
 
+def test_matrix_function_optimizer_uses_inplace_update_rule_when_available():
+    param = _param_with_info()
+    param.data.fill_(1.0)
+    param.main_grad = torch.tensor(
+        [[2.0, 4.0, 6.0], [1.0, 2.0, 3.0], [0.5, 1.0, 1.5], [3.0, 6.0, 9.0]]
+    )
+    recipe = _recipe(approximation=FeatureGramApproximation.DIAG)
+    configure_matrix_update_param(param, recipe=recipe)
+    param.main_grad_feature_gram.copy_(torch.tensor([1.0, 3.0, 5.0]))
+    param.main_grad_feature_count.fill_(1.0)
+    calls = []
+
+    def update_rule(grad, feature_gram, model_param):
+        raise AssertionError("generic update_rule should not run")
+
+    def inplace_update_rule(
+        update_param,
+        grad,
+        feature_gram,
+        model_param,
+        lr,
+        weight_decay,
+        decoupled_weight_decay,
+    ):
+        calls.append(1)
+        update_param.mul_(1.0 - lr * weight_decay)
+        update_param.add_(grad / (feature_gram + 1.0), alpha=-lr)
+        return True
+
+    opt = MatrixFunctionOptimizer(
+        [param],
+        lr=0.1,
+        update_rule=update_rule,
+        inplace_update_rule=inplace_update_rule,
+        weight_decay=0.2,
+        decoupled_weight_decay=True,
+    )
+    opt.step()
+
+    expected = torch.ones_like(param) * 0.98 - 0.1 * param.main_grad / torch.tensor([2.0, 4.0, 6.0])
+    torch.testing.assert_close(param, expected)
+    assert calls == [1]
+
+
 def test_row_parallel_nonexact_feature_scope_gets_approximation_label():
     param = _param_with_info(tp_layout="row_parallel")
     recipe = _recipe(approximation=FeatureGramApproximation.DIAG)
