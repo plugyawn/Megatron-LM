@@ -410,8 +410,8 @@ def test_optimizer_config_accepts_block_diag_feature_gram():
 
 
 def test_optimizer_config_rejects_unimplemented_active_matrix_options():
-    with pytest.raises(ValueError, match="block_diag/sketch"):
-        OptimizerConfig(matrix_optimizer="newton_muon", matrix_feature_gram="block_diag")
+    with pytest.raises(ValueError, match="sketch"):
+        OptimizerConfig(matrix_optimizer="newton_muon", matrix_feature_gram="sketch")
     OptimizerConfig(matrix_optimizer="newton_muon", matrix_feature_gram_source_dtype="fp8_dequant")
     with pytest.raises(ValueError, match="augmented_feature_sum"):
         OptimizerConfig(matrix_optimizer="newton_muon", matrix_bias_mode="augmented_feature_sum")
