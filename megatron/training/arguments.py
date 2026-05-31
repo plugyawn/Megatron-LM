@@ -1438,6 +1438,11 @@ def validate_args(args, defaults={}):
                 "Matrix optimizers do not support standard DistributedOptimizer until logical "
                 "matrix gather/apply/scatter views exist."
             )
+        if args.matrix_optimizer == 'newton_muon' and args.matrix_feature_gram == 'block_diag':
+            raise ValueError(
+                "matrix-optimizer=newton_muon does not support block_diag/sketch feature "
+                "Gram storage yet; use diag or full in this checkout."
+            )
         if args.matrix_feature_gram == 'sketch':
             raise ValueError(
                 "matrix-feature-gram=sketch requires an explicit storage format and "

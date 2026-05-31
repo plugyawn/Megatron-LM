@@ -32,11 +32,13 @@ try:
         tp_small_gram_polar_allreduce,
     )
     from emerging_optimizers.matrix_update_rules import (
+        apply_diag_newton_muon_update_,
         apply_diag_right_preconditioned_update_,
         factorize_feature_gram,
         newton_schulz_orthogonalize,
         right_precondition_with_factorized_feature_gram,
     )
+    from emerging_optimizers.utils import fp32_matmul_precision
 
     HAVE_EMERGING_MATRIX_OPTIMIZERS = True
 except ImportError:
@@ -77,6 +79,14 @@ def _make_matrix_update_rule(config: OptimizerConfig, pg_collection: ProcessGrou
     tp_update_mode = _tp_mode_from_config(config)
     factor_cache = {}
 
+    def orthogonalize(matrix: torch.Tensor) -> torch.Tensor:
+        return newton_schulz_orthogonalize(
+            matrix,
+            steps=config.muon_num_ns_steps,
+            coefficient_type=config.muon_ns_coefficients,
+            use_syrk=False,
+        )
+
     def get_cached_factorization(
         param: torch.nn.Parameter, feature_gram: torch.Tensor
     ):
@@ -112,40 +122,50 @@ def _make_matrix_update_rule(config: OptimizerConfig, pg_collection: ProcessGrou
         ).to(torch.float32)
         tp_group = pg_collection.tp
         tp_layout = info.tp_layout
-        if tp_update_mode == TPUpdateMode.TP_ALLGATHER_LOGICAL_MATRIX:
-            update = tp_allgather_logical_matrix_update(
-                preconditioned,
-                lambda matrix: newton_schulz_orthogonalize(
-                    matrix, steps=config.muon_num_ns_steps, coefficient_type=config.muon_ns_coefficients
-                ),
-                tp_layout=tp_layout,
-                group=tp_group,
-            )
-        elif tp_update_mode == TPUpdateMode.TP_SMALL_GRAM_POLAR_ALLREDUCE:
-            update = tp_small_gram_polar_allreduce(
-                preconditioned, tp_layout=tp_layout, group=tp_group
-            )
-        elif tp_update_mode == TPUpdateMode.TP_BLOCK_LOCAL_APPROX:
-            update = tp_block_local_approx(
-                preconditioned,
-                lambda local: newton_schulz_orthogonalize(
-                    local, steps=config.muon_num_ns_steps, coefficient_type=config.muon_ns_coefficients
-                ),
-                approximation_label="tp_block_local_matrix_update",
-            )
-        else:
-            raise RuntimeError(f"Unsupported TP update mode: {tp_update_mode}")
+        with fp32_matmul_precision(config.muon_fp32_matmul_prec):
+            if tp_update_mode == TPUpdateMode.TP_ALLGATHER_LOGICAL_MATRIX:
+                update = tp_allgather_logical_matrix_update(
+                    preconditioned,
+                    orthogonalize,
+                    tp_layout=tp_layout,
+                    group=tp_group,
+                )
+            elif tp_update_mode == TPUpdateMode.TP_SMALL_GRAM_POLAR_ALLREDUCE:
+                update = tp_small_gram_polar_allreduce(
+                    preconditioned, tp_layout=tp_layout, group=tp_group
+                )
+            elif tp_update_mode == TPUpdateMode.TP_BLOCK_LOCAL_APPROX:
+                update = tp_block_local_approx(
+                    preconditioned,
+                    orthogonalize,
+                    approximation_label="tp_block_local_matrix_update",
+                )
+            else:
+                raise RuntimeError(f"Unsupported TP update mode: {tp_update_mode}")
         scale = _muon_scale_factor(grad.size(-2), grad.size(-1), config)
         return -update * scale * config.muon_extra_scale_factor
 
     return update_rule
 
 
-def _make_matrix_inplace_update_rule(config: OptimizerConfig):
+def _make_matrix_inplace_update_rule(
+    config: OptimizerConfig, pg_collection: ProcessGroupCollection
+):
     """Return an optional fused in-place update rule for cheap diagonal cases."""
 
-    if config.matrix_optimizer != "locoprop_s":
+    if config.matrix_optimizer not in ("locoprop_s", "newton_muon"):
         return None
+    tp_update_mode = _tp_mode_from_config(config)
+
+    def can_use_local_newton_muon(model_param: torch.nn.Parameter) -> bool:
+        if tp_update_mode == TPUpdateMode.TP_BLOCK_LOCAL_APPROX:
+            return True
+        info = getattr(model_param, "_mcore_linear_weight_info", None)
+        if info is None:
+            return False
+        if info.tp_layout in ("none", "duplicated"):
+            return True
+        return get_pg_size(pg_collection.tp) == 1
 
     def inplace_update_rule(
         param: torch.nn.Parameter,
@@ -158,15 +178,34 @@ def _make_matrix_inplace_update_rule(config: OptimizerConfig):
     ) -> bool:
         if feature_gram.ndim != 1:
             return False
-        apply_diag_right_preconditioned_update_(
+        if config.matrix_optimizer == "locoprop_s":
+            apply_diag_right_preconditioned_update_(
+                param,
+                grad,
+                feature_gram,
+                lr=lr,
+                ridge=config.matrix_feature_gram_ridge,
+                update_scale=1.0,
+                weight_decay=weight_decay,
+                decoupled_weight_decay=decoupled_weight_decay,
+            )
+            return True
+        if not can_use_local_newton_muon(model_param):
+            return False
+        apply_diag_newton_muon_update_(
             param,
             grad,
             feature_gram,
             lr=lr,
             ridge=config.matrix_feature_gram_ridge,
-            update_scale=1.0,
+            num_ns_steps=config.muon_num_ns_steps,
+            coefficient_type=config.muon_ns_coefficients,
+            scale_mode=config.muon_scale_mode,
+            extra_scale_factor=config.muon_extra_scale_factor,
             weight_decay=weight_decay,
             decoupled_weight_decay=decoupled_weight_decay,
+            fp32_matmul_prec=config.muon_fp32_matmul_prec,
+            use_syrk=False,
         )
         return True
 
@@ -235,7 +274,7 @@ def get_megatron_matrix_optimizer(
         matrix_param_groups,
         lr=config.lr,
         update_rule=_make_matrix_update_rule(config, pg_collection),
-        inplace_update_rule=_make_matrix_inplace_update_rule(config),
+        inplace_update_rule=_make_matrix_inplace_update_rule(config, pg_collection),
         weight_decay=config.weight_decay,
         decoupled_weight_decay=config.decoupled_weight_decay,
         tp_update_mode=_tp_mode_from_config(config),
