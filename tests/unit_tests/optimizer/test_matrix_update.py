@@ -356,6 +356,57 @@ def test_matrix_function_optimizer_uses_inplace_update_rule_when_available():
     assert calls == [1]
 
 
+def test_matrix_inplace_update_rule_uses_diag_newton_muon_for_local_matrix(monkeypatch):
+    from types import SimpleNamespace
+
+    import megatron.core.optimizer.matrix_optimizer as matrix_optimizer_module
+
+    if not matrix_optimizer_module.HAVE_EMERGING_MATRIX_OPTIMIZERS:
+        pytest.skip("emerging_optimizers is not installed")
+
+    param = _param_with_info()
+    grad = torch.ones_like(param.data)
+    feature_gram = torch.tensor([2.0, 3.0, 4.0])
+    config = OptimizerConfig(
+        matrix_optimizer="newton_muon",
+        matrix_feature_gram="diag",
+        matrix_feature_gram_ridge=1.0,
+        muon_num_ns_steps=2,
+        muon_ns_coefficients="simple",
+        muon_scale_mode="unit_rms_norm",
+        muon_extra_scale_factor=0.5,
+        muon_fp32_matmul_prec="highest",
+    )
+    calls = []
+
+    def fake_apply(param, grad, diag_feature_gram, **kwargs):
+        calls.append((param, grad, diag_feature_gram, kwargs))
+        return param
+
+    monkeypatch.setattr(
+        matrix_optimizer_module, "apply_diag_newton_muon_update_", fake_apply
+    )
+    rule = matrix_optimizer_module._make_matrix_inplace_update_rule(
+        config, SimpleNamespace(tp=None)
+    )
+
+    assert rule(param, grad, feature_gram, param, 0.1, 0.2, True)
+    assert len(calls) == 1
+    _, seen_grad, seen_feature_gram, kwargs = calls[0]
+    assert seen_grad is grad
+    assert seen_feature_gram is feature_gram
+    assert kwargs["lr"] == 0.1
+    assert kwargs["ridge"] == 1.0
+    assert kwargs["num_ns_steps"] == 2
+    assert kwargs["coefficient_type"] == "simple"
+    assert kwargs["scale_mode"] == "unit_rms_norm"
+    assert kwargs["extra_scale_factor"] == 0.5
+    assert kwargs["weight_decay"] == 0.2
+    assert kwargs["decoupled_weight_decay"]
+    assert kwargs["fp32_matmul_prec"] == "highest"
+    assert not kwargs["use_syrk"]
+
+
 def test_row_parallel_nonexact_feature_scope_gets_approximation_label():
     param = _param_with_info(tp_layout="row_parallel")
     recipe = _recipe(approximation=FeatureGramApproximation.DIAG)

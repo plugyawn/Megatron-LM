@@ -481,10 +481,15 @@ class OptimizerConfig:
                 "Matrix optimizers do not support standard DistributedOptimizer yet; "
                 "use whole-parameter layer-wise ownership or disable --use-distributed-optimizer."
             )
+        if self.matrix_optimizer == "newton_muon" and self.matrix_feature_gram == "block_diag":
+            raise ValueError(
+                "matrix_optimizer=newton_muon does not support block_diag/sketch feature "
+                "Gram storage yet; use diag or full in this checkout."
+            )
         if self.matrix_optimizer != "none" and self.matrix_feature_gram == "sketch":
             raise ValueError(
-                "matrix_feature_gram=sketch requires an explicit storage format and "
-                "collector implementation; use diag, block_diag, or full in this checkout."
+                "matrix_feature_gram=sketch requires an explicit storage format and collector "
+                "implementation; use diag, block_diag, or full in this checkout."
             )
         if self.matrix_optimizer != "none" and self.matrix_feature_gram_ema_beta is not None:
             raise ValueError(
