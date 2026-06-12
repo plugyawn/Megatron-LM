@@ -31,7 +31,7 @@ from megatron.core.utils import (
 )
 
 from ..dist_checkpointing.mapping import ShardedStateDict
-from ..matrix_update import maybe_accumulate_feature_gram, set_linear_weight_info
+from ..matrix_update import maybe_accumulate_feature_gram, maybe_accumulate_grad_gram, set_linear_weight_info
 from ..transformer.utils import make_sharded_tensors_for_checkpoint
 from .mappings import (
     copy_to_tensor_model_parallel_region,
@@ -553,6 +553,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 grad_output, total_input
             )
             maybe_accumulate_feature_gram(weight, total_input)
+            maybe_accumulate_grad_gram(weight, grad_output)
 
         if ctx.allreduce_dgrad:
             # Asynchronous all-reduce

@@ -6,9 +6,10 @@ This module intentionally keeps collection method-free: affine matrix optimizers
 may request extra factors beside ``main_grad``, but optimizers do not receive raw
 activations or method-specific targets.
 
-The current ``FEATURE_GRAM`` factor is the input-side/right preconditioner
-statistic ``X.T @ X``. Output-side/left factors such as ``dY.T @ dY`` are not
-collected here yet.
+The current concrete factors are:
+
+* ``FEATURE_GRAM = X.T @ X`` for input-side/right preconditioning.
+* ``GRAD_GRAM = dY.T @ dY`` for output-side/left preconditioning.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ class ExtraWgradFactor(enum.IntFlag):
     NONE = 0
     FEATURE_GRAM = 1
     FEATURE_SUM = 2
+    GRAD_GRAM = 4
 
 
 class MatrixPreconditionerKind(enum.Enum):
@@ -33,10 +35,11 @@ class MatrixPreconditionerKind(enum.Enum):
 
     NONE = "none"
     FEATURE_GRAM = "feature_gram"
+    GRAD_GRAM = "grad_gram"
 
 
 class MatrixPreconditionerApproximation(enum.Enum):
-    """Stored representation of ``X.T @ X``."""
+    """Stored representation of a matrix preconditioner Gram."""
 
     FULL = "full"
     DIAG = "diag"
@@ -44,7 +47,7 @@ class MatrixPreconditionerApproximation(enum.Enum):
 
 
 class MatrixPreconditionerScope(enum.Enum):
-    """Semantic scope of a collected input-side/right feature Gram."""
+    """Semantic scope of a collected matrix preconditioner."""
 
     GLOBAL_EXACT = "global_exact"
     TP_LOCAL_BLOCK_DIAG = "tp_local_block_diag"
@@ -53,7 +56,7 @@ class MatrixPreconditionerScope(enum.Enum):
 
 
 class MatrixPreconditionerNormalization(enum.Enum):
-    """Convention used when an optimizer consumes a feature Gram."""
+    """Convention used when an optimizer consumes a collected Gram."""
 
     SUM = "sum"
     MEAN = "mean"
@@ -103,6 +106,24 @@ class MatrixInputPreconditionerRecipe:
 
 
 @dataclass
+class MatrixOutputPreconditionerRecipe:
+    """Collection and consumption policy for output-side ``GRAD_GRAM = dY.T @ dY``."""
+
+    kind: MatrixPreconditionerKind
+    approximation: MatrixPreconditionerApproximation
+    scope: MatrixPreconditionerScope
+    normalization: MatrixPreconditionerNormalization
+    gradient_dtype: Literal["bf16_saved", "fp32_cast"]
+    accumulation_dtype: torch.dtype
+    refresh_interval: int
+    token_sample_size: Optional[int]
+    ridge: float
+    ema_beta: Optional[float]
+    min_samples_per_feature: Optional[float]
+    block_size: int = 128
+
+
+@dataclass
 class MatrixApplyPlan:
     """How a matrix-shaped update is applied under DP/TP sharding."""
 
@@ -113,6 +134,7 @@ class MatrixApplyPlan:
     ]
     tp_update_mode: TPUpdateMode
     feature_gram_scope: Optional[MatrixPreconditionerScope]
+    grad_gram_scope: Optional[MatrixPreconditionerScope]
     requires_full_logical_gradient: bool
     requires_full_logical_weight_for_direction: bool = False
     approximation_label: Optional[str] = None
@@ -136,6 +158,27 @@ def input_preconditioner_scope_for(
     """
 
     if tp_layout == "row_parallel":
+        return MatrixPreconditionerScope.TP_LOCAL_BLOCK_DIAG
+    if approximation == MatrixPreconditionerApproximation.BLOCK_DIAG:
+        return MatrixPreconditionerScope.BLOCK_DIAG_APPROX
+    if approximation == MatrixPreconditionerApproximation.DIAG:
+        return MatrixPreconditionerScope.DIAG_APPROX
+    return MatrixPreconditionerScope.GLOBAL_EXACT
+
+
+def output_preconditioner_scope_for(
+    approximation: MatrixPreconditionerApproximation,
+    tp_layout: str,
+) -> MatrixPreconditionerScope:
+    """Infer output-side factor scope implied by approximation and TP layout.
+
+    Column-parallel linears own only an output-axis shard, so their local
+    ``dY.T @ dY`` is a TP-local block of the logical output Gram. Row-parallel
+    linears own the full output axis on every rank and can consume the same
+    output-side factor for each input shard.
+    """
+
+    if tp_layout == "column_parallel":
         return MatrixPreconditionerScope.TP_LOCAL_BLOCK_DIAG
     if approximation == MatrixPreconditionerApproximation.BLOCK_DIAG:
         return MatrixPreconditionerScope.BLOCK_DIAG_APPROX
@@ -217,6 +260,15 @@ def _feature_dim(param: torch.nn.Parameter) -> int:
     return info.local_shape[1]
 
 
+def _output_dim(param: torch.nn.Parameter) -> int:
+    info = getattr(param, "_mcore_linear_weight_info", None)
+    if info is None:
+        if param.ndim != 2:
+            raise ValueError("GRAD_GRAM requires a 2D affine weight or LinearWeightInfo.")
+        return param.shape[0]
+    return info.local_shape[0]
+
+
 def _feature_gram_shape(param: torch.nn.Parameter, recipe: MatrixInputPreconditionerRecipe) -> tuple[int, ...]:
     dim = _feature_dim(param)
     if recipe.approximation == MatrixPreconditionerApproximation.FULL:
@@ -228,6 +280,21 @@ def _feature_gram_shape(param: torch.nn.Parameter, recipe: MatrixInputPreconditi
         return (num_blocks, recipe.block_size, recipe.block_size)
     raise NotImplementedError(
         f"FEATURE_GRAM approximation {recipe.approximation.value!r} is not implemented yet. "
+        "Use 'full', 'diag', or 'block_diag', or add an explicit storage format for this approximation."
+    )
+
+
+def _grad_gram_shape(param: torch.nn.Parameter, recipe: MatrixOutputPreconditionerRecipe) -> tuple[int, ...]:
+    dim = _output_dim(param)
+    if recipe.approximation == MatrixPreconditionerApproximation.FULL:
+        return (dim, dim)
+    if recipe.approximation == MatrixPreconditionerApproximation.DIAG:
+        return (dim,)
+    if recipe.approximation == MatrixPreconditionerApproximation.BLOCK_DIAG:
+        num_blocks = (dim + recipe.block_size - 1) // recipe.block_size
+        return (num_blocks, recipe.block_size, recipe.block_size)
+    raise NotImplementedError(
+        f"GRAD_GRAM approximation {recipe.approximation.value!r} is not implemented yet. "
         "Use 'full', 'diag', or 'block_diag', or add an explicit storage format for this approximation."
     )
 
@@ -249,6 +316,26 @@ def _validate_feature_gram_recipe(param: torch.nn.Parameter, recipe: MatrixInput
             raise ValueError(
                 "Full FEATURE_GRAM is rank-deficient under this token sample size; "
                 "use diag/block_diag or increase matrix-input-preconditioner-token-sample-size."
+            )
+
+
+def _validate_grad_gram_recipe(param: torch.nn.Parameter, recipe: MatrixOutputPreconditionerRecipe) -> None:
+    if recipe.refresh_interval < 1:
+        raise ValueError("matrix-output-preconditioner-refresh-interval must be >= 1")
+    if recipe.block_size < 1:
+        raise ValueError("matrix-output-preconditioner-block-size must be >= 1")
+    if recipe.token_sample_size is not None and recipe.token_sample_size < 1:
+        raise ValueError("matrix-output-preconditioner-token-sample-size must be >= 1 when set")
+    if recipe.min_samples_per_feature is not None and recipe.token_sample_size is not None:
+        output_dim = _output_dim(param)
+        min_samples = recipe.min_samples_per_feature * output_dim
+        if (
+            recipe.approximation == MatrixPreconditionerApproximation.FULL
+            and recipe.token_sample_size < min_samples
+        ):
+            raise ValueError(
+                "Full GRAD_GRAM is rank-deficient under this token sample size; "
+                "use diag/block_diag or increase matrix-output-preconditioner-token-sample-size."
             )
 
 
@@ -274,12 +361,24 @@ def _mark_feature_gram_unfinalized(param: torch.nn.Parameter) -> None:
     param._feature_gram_finalized = not getattr(param, "_feature_gram_finalization_required", False)
 
 
+def _mark_grad_gram_unfinalized(param: torch.nn.Parameter) -> None:
+    param._grad_gram_finalized = not getattr(param, "_grad_gram_finalization_required", False)
+
+
 def set_feature_gram_finalization_required(
     params: Iterable[torch.nn.Parameter], *, required: bool
 ) -> None:
     for param in params:
         param._feature_gram_finalization_required = required
         _mark_feature_gram_unfinalized(param)
+
+
+def set_grad_gram_finalization_required(
+    params: Iterable[torch.nn.Parameter], *, required: bool
+) -> None:
+    for param in params:
+        param._grad_gram_finalization_required = required
+        _mark_grad_gram_unfinalized(param)
 
 
 def finalize_feature_gram_buffers(
@@ -319,6 +418,33 @@ def finalize_feature_gram_buffers(
         param._feature_gram_finalized = True
 
 
+def finalize_grad_gram_buffers(
+    params: Iterable[torch.nn.Parameter],
+    *,
+    process_groups: Iterable[torch.distributed.ProcessGroup] = (),
+) -> None:
+    """Reduce output-side GRAD_GRAM buffers across caller-specified groups."""
+
+    groups = tuple(process_groups)
+    params = list(params)
+    if any(getattr(param, "_grad_gram_finalization_required", False) for param in params) and not groups:
+        raise RuntimeError(
+            "GRAD_GRAM finalization requires explicit process_groups for these parameters."
+        )
+
+    for param in params:
+        if not hasattr(param, "main_grad_grad_gram"):
+            continue
+        for group in groups:
+            torch.distributed.all_reduce(
+                param.main_grad_grad_gram, op=torch.distributed.ReduceOp.SUM, group=group
+            )
+            torch.distributed.all_reduce(
+                param.main_grad_grad_count, op=torch.distributed.ReduceOp.SUM, group=group
+            )
+        param._grad_gram_finalized = True
+
+
 def allocate_feature_gram_buffers(param: torch.nn.Parameter, recipe: MatrixInputPreconditionerRecipe) -> None:
     """Allocate per-parameter extra wgrad buffers for a requested recipe."""
 
@@ -350,6 +476,32 @@ def allocate_feature_gram_buffers(param: torch.nn.Parameter, recipe: MatrixInput
     _mark_feature_gram_unfinalized(param)
 
 
+def allocate_grad_gram_buffers(param: torch.nn.Parameter, recipe: MatrixOutputPreconditionerRecipe) -> None:
+    """Allocate per-parameter output-side GRAD_GRAM buffers for a requested recipe."""
+
+    _validate_grad_gram_recipe(param, recipe)
+    gram_shape = _grad_gram_shape(param, recipe)
+    gram = getattr(param, "main_grad_grad_gram", None)
+    if (
+        gram is None
+        or tuple(gram.shape) != gram_shape
+        or gram.dtype != recipe.accumulation_dtype
+        or gram.device != param.device
+    ):
+        param.main_grad_grad_gram = torch.zeros(
+            gram_shape,
+            device=param.device,
+            dtype=recipe.accumulation_dtype,
+        )
+    if not hasattr(param, "main_grad_grad_count"):
+        param.main_grad_grad_count = torch.zeros((), device=param.device, dtype=torch.float64)
+    param._grad_gram_recipe = recipe
+    param._grad_gram_scope = recipe.scope
+    if not hasattr(param, "_grad_gram_generation"):
+        param._grad_gram_generation = 0
+    _mark_grad_gram_unfinalized(param)
+
+
 def reset_feature_gram_buffers(
     param: torch.nn.Parameter, *, active: bool = True, zero: bool = True
 ) -> None:
@@ -372,6 +524,21 @@ def reset_feature_gram_buffers(
     param._feature_gram_active = active
 
 
+def reset_grad_gram_buffers(
+    param: torch.nn.Parameter, *, active: bool = True, zero: bool = True
+) -> None:
+    """Prepare transient output-side factor buffers for a collection window."""
+
+    if zero and hasattr(param, "main_grad_grad_gram"):
+        param.main_grad_grad_gram.zero_()
+    if zero and hasattr(param, "main_grad_grad_count"):
+        param.main_grad_grad_count.zero_()
+    if zero:
+        param._grad_gram_generation = getattr(param, "_grad_gram_generation", 0) + 1
+        _mark_grad_gram_unfinalized(param)
+    param._grad_gram_active = active
+
+
 def iter_matrix_update_params(modules: Iterable[torch.nn.Module]):
     """Yield parameters that carry matrix-update metadata."""
 
@@ -384,14 +551,24 @@ def iter_matrix_update_params(modules: Iterable[torch.nn.Module]):
 def configure_matrix_update_param(
     param: torch.nn.Parameter,
     *,
-    recipe: MatrixInputPreconditionerRecipe,
+    recipe: Optional[MatrixInputPreconditionerRecipe] = None,
+    output_recipe: Optional[MatrixOutputPreconditionerRecipe] = None,
     factors: ExtraWgradFactor = ExtraWgradFactor.FEATURE_GRAM,
 ) -> None:
     """Enable requested extra wgrad factors on an eligible parameter."""
 
-    param._extra_wgrad_factors = factors
-    allocate_feature_gram_buffers(param, recipe)
-    reset_feature_gram_buffers(param, active=True)
+    enabled_factors = factors
+    if recipe is None:
+        enabled_factors &= ~ExtraWgradFactor.FEATURE_GRAM
+    if output_recipe is not None:
+        enabled_factors |= ExtraWgradFactor.GRAD_GRAM
+    param._extra_wgrad_factors = enabled_factors
+    if recipe is not None:
+        allocate_feature_gram_buffers(param, recipe)
+        reset_feature_gram_buffers(param, active=True)
+    if output_recipe is not None:
+        allocate_grad_gram_buffers(param, output_recipe)
+        reset_grad_gram_buffers(param, active=True)
 
 
 def recipe_from_optimizer_config(config, info: LinearWeightInfo) -> MatrixInputPreconditionerRecipe:
@@ -418,8 +595,32 @@ def recipe_from_optimizer_config(config, info: LinearWeightInfo) -> MatrixInputP
     )
 
 
+def output_recipe_from_optimizer_config(config, info: LinearWeightInfo) -> MatrixOutputPreconditionerRecipe:
+    """Build a grad Gram recipe from an ``OptimizerConfig``-like object."""
+
+    approximation = _enum_from_string(MatrixPreconditionerApproximation, config.matrix_output_preconditioner_approximation)
+    scope = output_preconditioner_scope_for(approximation, info.tp_layout)
+    normalization = _enum_from_string(
+        MatrixPreconditionerNormalization, config.matrix_output_preconditioner_normalization
+    )
+    return MatrixOutputPreconditionerRecipe(
+        kind=MatrixPreconditionerKind.GRAD_GRAM,
+        approximation=approximation,
+        scope=scope,
+        normalization=normalization,
+        gradient_dtype=config.matrix_output_preconditioner_gradient_dtype,
+        accumulation_dtype=getattr(config, "matrix_output_preconditioner_accumulation_dtype", torch.float32),
+        refresh_interval=config.matrix_output_preconditioner_refresh_interval,
+        token_sample_size=config.matrix_output_preconditioner_token_sample_size,
+        ridge=config.matrix_output_preconditioner_ridge,
+        ema_beta=config.matrix_output_preconditioner_ema_beta,
+        min_samples_per_feature=config.matrix_output_preconditioner_min_samples_per_feature,
+        block_size=getattr(config, "matrix_output_preconditioner_block_size", 128),
+    )
+
+
 def configure_model_matrix_updates(modules: Iterable[torch.nn.Module], config) -> list[torch.nn.Parameter]:
-    """Enable FEATURE_GRAM collection for eligible parameters.
+    """Enable requested extra wgrad factor collection for eligible parameters.
 
     This function is intentionally fail-closed for backends that do not collect
     the factor in this checkout.
@@ -453,6 +654,9 @@ def configure_model_matrix_updates(modules: Iterable[torch.nn.Module], config) -
             )
         if not is_matrix_update_eligible(param, min_matrix_dim=config.matrix_min_dim):
             continue
+        input_recipe = None
+        output_recipe = None
+        factors = ExtraWgradFactor.NONE
         if config.matrix_input_preconditioner == "feature_gram":
             collector = getattr(param, "_feature_gram_collector", "unknown")
             if collector == "transformer_engine":
@@ -483,8 +687,32 @@ def configure_model_matrix_updates(modules: Iterable[torch.nn.Module], config) -
                     "FEATURE_GRAM activation_dtype=fp8_dequant requires Transformer Engine "
                     "collection at the wgrad site; native linears cannot dequantize FP8 sources."
                 )
-            factors = ExtraWgradFactor.FEATURE_GRAM
-            configure_matrix_update_param(param, recipe=recipe, factors=factors)
+            input_recipe = recipe
+            factors |= ExtraWgradFactor.FEATURE_GRAM
+        if config.matrix_output_preconditioner == "grad_gram":
+            collector = getattr(param, "_feature_gram_collector", "unknown")
+            if collector != "native":
+                raise RuntimeError(
+                    f"GRAD_GRAM collection for {collector!r} linears is not available in this "
+                    f"checkout (role={info.role!r}, tp_layout={info.tp_layout!r})."
+                )
+            recipe = output_recipe_from_optimizer_config(config, info)
+            if (
+                info.tp_layout == "column_parallel"
+                and recipe.approximation == MatrixPreconditionerApproximation.FULL
+            ):
+                raise RuntimeError(
+                    "matrix-output-preconditioner-approximation=full is not supported for "
+                    "column-parallel weights without cross-TP GRAD_GRAM collection; use "
+                    "diag/block_diag or disable the matrix optimizer for this parameter "
+                    f"(role={info.role!r})."
+                )
+            output_recipe = recipe
+            factors |= ExtraWgradFactor.GRAD_GRAM
+        if factors != ExtraWgradFactor.NONE:
+            configure_matrix_update_param(
+                param, recipe=input_recipe, output_recipe=output_recipe, factors=factors
+            )
         configured.append(param)
     return configured
 
@@ -500,6 +728,14 @@ def _cast_feature_input(inputmat: torch.Tensor, recipe: MatrixInputPreconditione
     if recipe.activation_dtype == "fp32_cast":
         return inputmat.to(torch.float32)
     return inputmat.to(recipe.accumulation_dtype)
+
+
+def _cast_grad_output(grad_output: torch.Tensor, recipe: MatrixOutputPreconditionerRecipe) -> torch.Tensor:
+    if recipe.gradient_dtype not in ("bf16_saved", "fp32_cast"):
+        raise ValueError(f"Unsupported grad Gram gradient dtype: {recipe.gradient_dtype}")
+    if recipe.gradient_dtype == "fp32_cast":
+        return grad_output.to(torch.float32)
+    return grad_output.to(recipe.accumulation_dtype)
 
 
 def _accumulate_diag_feature_gram(gram: torch.Tensor, x: torch.Tensor) -> None:
@@ -521,7 +757,7 @@ def _accumulate_block_diag_feature_gram(
     feature_dim: int,
     block_size: int,
 ) -> None:
-    """Accumulate padded block-diagonal ``X.T @ X`` via batched GEMM."""
+    """Accumulate padded block-diagonal Gram storage via batched GEMM."""
 
     expected_blocks, expected_block, _ = gram.shape
     if expected_block != block_size:
@@ -591,6 +827,48 @@ def maybe_accumulate_feature_gram(weight: torch.Tensor, inputmat: torch.Tensor) 
         weight.main_grad_feature_sum.add_(x.sum(dim=0))
 
 
+@torch.no_grad()
+def maybe_accumulate_grad_gram(weight: torch.Tensor, grad_output: torch.Tensor) -> None:
+    """Accumulate ``dY.T @ dY`` for a linear weight when requested."""
+
+    flags = getattr(weight, "_extra_wgrad_factors", ExtraWgradFactor.NONE)
+    if not (flags & ExtraWgradFactor.GRAD_GRAM):
+        return
+    if not getattr(weight, "_grad_gram_active", True):
+        return
+    recipe = getattr(weight, "_grad_gram_recipe", None)
+    if recipe is None:
+        raise RuntimeError("GRAD_GRAM requested without a MatrixOutputPreconditionerRecipe.")
+    if grad_output.dim() != 2:
+        grad_output = grad_output.reshape(-1, grad_output.shape[-1])
+    dy = _cast_grad_output(grad_output, recipe)
+    if recipe.token_sample_size is not None:
+        remaining = recipe.token_sample_size - int(weight.main_grad_grad_count.item())
+        if remaining <= 0:
+            return
+        if dy.shape[0] > remaining:
+            dy = dy[:remaining]
+
+    gram = weight.main_grad_grad_gram
+    if recipe.approximation == MatrixPreconditionerApproximation.FULL:
+        gram.add_(dy.t().matmul(dy))
+    elif recipe.approximation == MatrixPreconditionerApproximation.DIAG:
+        _accumulate_diag_feature_gram(gram, dy)
+    elif recipe.approximation == MatrixPreconditionerApproximation.BLOCK_DIAG:
+        _accumulate_block_diag_feature_gram(
+            gram,
+            dy,
+            feature_dim=_output_dim(weight),
+            block_size=recipe.block_size,
+        )
+    else:
+        raise NotImplementedError(
+            f"GRAD_GRAM approximation {recipe.approximation.value!r} is not implemented yet."
+        )
+    weight.main_grad_grad_count.add_(float(dy.shape[0]))
+    _mark_grad_gram_unfinalized(weight)
+
+
 def get_feature_gram_for_optimizer(param: torch.nn.Parameter) -> torch.Tensor:
     """Return the feature Gram using the recipe's consumption normalization."""
 
@@ -610,5 +888,28 @@ def get_feature_gram_for_optimizer(param: torch.nn.Parameter) -> torch.Tensor:
         )
     if recipe.normalization == MatrixPreconditionerNormalization.MEAN:
         count = param.main_grad_feature_count.clamp_min(1.0).to(gram.dtype)
+        return gram / count
+    return gram
+
+
+def get_grad_gram_for_optimizer(param: torch.nn.Parameter) -> torch.Tensor:
+    """Return the grad Gram using the recipe's consumption normalization."""
+
+    recipe = getattr(param, "_grad_gram_recipe", None)
+    if recipe is None:
+        raise RuntimeError("Parameter has no MatrixOutputPreconditionerRecipe.")
+    if _needs_distributed_finalization() and not getattr(param, "_grad_gram_finalized", False):
+        raise RuntimeError(
+            "GRAD_GRAM has not been finalized across distributed groups; call "
+            "finalize_grad_gram_buffers before optimizer consumption."
+        )
+    gram = param.main_grad_grad_gram
+    if param.main_grad_grad_count.item() <= 0.0:
+        raise RuntimeError(
+            "GRAD_GRAM has zero collected grad-output rows; ensure the wgrad path collected "
+            "main_grad_grad_gram before optimizer consumption."
+        )
+    if recipe.normalization == MatrixPreconditionerNormalization.MEAN:
+        count = param.main_grad_grad_count.clamp_min(1.0).to(gram.dtype)
         return gram / count
     return gram

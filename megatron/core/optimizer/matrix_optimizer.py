@@ -4,8 +4,8 @@
 
 ``matrix_optimizer`` selects the matrix update rule for eligible affine weights.
 ``matrix_input_preconditioner=feature_gram`` optionally right-preconditions that
-rule with ``C = X.T @ X``. Left/output-side preconditioners are intentionally not
-part of this integration yet.
+rule with ``C_in = X.T @ X``. ``matrix_output_preconditioner=grad_gram``
+optionally left-preconditions it with ``C_out = dY.T @ dY``.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from megatron.core.matrix_update import (
     TPUpdateMode,
     configure_model_matrix_updates,
     set_feature_gram_finalization_required,
+    set_grad_gram_finalization_required,
 )
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -92,37 +93,60 @@ def _make_matrix_update_rule(config: OptimizerConfig, pg_collection: ProcessGrou
             use_syrk=False,
         )
 
-    def get_cached_factorization(param: torch.nn.Parameter, feature_gram: torch.Tensor):
-        generation = getattr(param, "_feature_gram_generation", None)
+    def get_cached_factorization(
+        param: torch.nn.Parameter, gram: torch.Tensor, *, side: str, ridge: float
+    ):
+        generation_attr = "_feature_gram_generation" if side == "input" else "_grad_gram_generation"
+        generation = getattr(param, generation_attr, None)
         cache_key = (
+            side,
             generation,
-            tuple(feature_gram.shape),
-            feature_gram.dtype,
-            feature_gram.device,
-            config.matrix_input_preconditioner_ridge,
+            tuple(gram.shape),
+            gram.dtype,
+            gram.device,
+            ridge,
         )
-        cached = factor_cache.get(id(param))
+        cached = factor_cache.get((id(param), side))
         if cached is not None and cached[0] == cache_key:
             return cached[1]
         factorization = factorize_feature_gram(
-            feature_gram, ridge=config.matrix_input_preconditioner_ridge
+            gram, ridge=ridge
         )
-        factor_cache[id(param)] = (cache_key, factorization)
+        factor_cache[(id(param), side)] = (cache_key, factorization)
         return factorization
 
     def update_rule(
-        grad: torch.Tensor, feature_gram: Optional[torch.Tensor], param: torch.nn.Parameter
+        grad: torch.Tensor,
+        feature_gram: Optional[torch.Tensor],
+        grad_gram: Optional[torch.Tensor],
+        param: torch.nn.Parameter,
     ):
         info = getattr(param, "_mcore_linear_weight_info", None)
         if info is None:
             raise RuntimeError("Matrix optimizer parameter is missing LinearWeightInfo.")
 
         direction = grad
+        if config.matrix_output_preconditioner == "grad_gram":
+            if grad_gram is None:
+                raise RuntimeError("grad_gram output preconditioner requested but not collected.")
+            factorization = get_cached_factorization(
+                param,
+                grad_gram,
+                side="output",
+                ridge=config.matrix_output_preconditioner_ridge,
+            )
+            direction = factorization.right_solve(direction.mT).mT
+
         if config.matrix_input_preconditioner == "feature_gram":
             if feature_gram is None:
                 raise RuntimeError("feature_gram input preconditioner requested but not collected.")
-            factorization = get_cached_factorization(param, feature_gram)
-            direction = right_precondition_with_factorized_feature_gram(grad, factorization)
+            factorization = get_cached_factorization(
+                param,
+                feature_gram,
+                side="input",
+                ridge=config.matrix_input_preconditioner_ridge,
+            )
+            direction = right_precondition_with_factorized_feature_gram(direction, factorization)
 
         if config.matrix_optimizer == "sgd":
             return -direction
@@ -167,6 +191,8 @@ def _make_matrix_inplace_update_rule(
         return None
     if config.matrix_input_preconditioner != "feature_gram":
         return None
+    if config.matrix_output_preconditioner != "none":
+        return None
     tp_update_mode = _tp_mode_from_config(config)
 
     def can_use_local_newton_muon(model_param: torch.nn.Parameter) -> bool:
@@ -183,12 +209,15 @@ def _make_matrix_inplace_update_rule(
         param: torch.nn.Parameter,
         grad: torch.Tensor,
         feature_gram: Optional[torch.Tensor],
+        grad_gram: Optional[torch.Tensor],
         model_param: torch.nn.Parameter,
         lr: float,
         weight_decay: float,
         decoupled_weight_decay: bool,
     ) -> bool:
         if feature_gram is None or feature_gram.ndim != 1:
+            return False
+        if grad_gram is not None:
             return False
         if config.matrix_optimizer == "sgd":
             apply_diag_right_preconditioned_update_(
@@ -252,11 +281,17 @@ def get_megatron_matrix_optimizer(
     feature_gram_params = [
         param for param in configured_matrix_params if hasattr(param, "_feature_gram_recipe")
     ]
+    grad_gram_params = [
+        param for param in configured_matrix_params if hasattr(param, "_grad_gram_recipe")
+    ]
     feature_gram_groups = []
-    if feature_gram_params and get_pg_size(pg_collection.dp_cp) > 1:
+    if (feature_gram_params or grad_gram_params) and get_pg_size(pg_collection.dp_cp) > 1:
         feature_gram_groups.append(pg_collection.dp_cp)
     set_feature_gram_finalization_required(
         feature_gram_params, required=bool(feature_gram_groups)
+    )
+    set_grad_gram_finalization_required(
+        grad_gram_params, required=bool(feature_gram_groups)
     )
 
     log_single_rank(

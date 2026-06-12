@@ -14,15 +14,21 @@ from megatron.core.optimizer.matrix_update import (
     MatrixPreconditionerNormalization,
     MatrixPreconditionerScope,
     MatrixInputPreconditionerRecipe,
+    MatrixOutputPreconditionerRecipe,
     TPUpdateMode,
     configure_model_matrix_updates,
     configure_matrix_update_param,
     input_preconditioner_scope_for,
     finalize_feature_gram_buffers,
+    finalize_grad_gram_buffers,
     get_feature_gram_for_optimizer,
+    get_grad_gram_for_optimizer,
     is_matrix_update_eligible,
     maybe_accumulate_feature_gram,
+    maybe_accumulate_grad_gram,
+    output_preconditioner_scope_for,
     set_feature_gram_finalization_required,
+    set_grad_gram_finalization_required,
     set_linear_weight_info,
 )
 
@@ -51,6 +57,26 @@ def _recipe(
         scope=MatrixPreconditionerScope.GLOBAL_EXACT,
         normalization=normalization,
         activation_dtype="fp32_cast",
+        accumulation_dtype=torch.float32,
+        refresh_interval=refresh_interval,
+        token_sample_size=None,
+        ridge=0.0,
+        ema_beta=None,
+        min_samples_per_feature=None,
+    )
+
+
+def _output_recipe(
+    approximation=MatrixPreconditionerApproximation.FULL,
+    normalization=MatrixPreconditionerNormalization.SUM,
+    refresh_interval=1,
+):
+    return MatrixOutputPreconditionerRecipe(
+        kind=MatrixPreconditionerKind.GRAD_GRAM,
+        approximation=approximation,
+        scope=MatrixPreconditionerScope.GLOBAL_EXACT,
+        normalization=normalization,
+        gradient_dtype="fp32_cast",
         accumulation_dtype=torch.float32,
         refresh_interval=refresh_interval,
         token_sample_size=None,
@@ -99,6 +125,45 @@ def test_block_diag_feature_gram_accumulates_padded_blocks():
     torch.testing.assert_close(param.main_grad_feature_gram, expected)
 
 
+def test_full_grad_gram_accumulates_raw_sum():
+    param = _param_with_info()
+    recipe = _output_recipe()
+    configure_matrix_update_param(param, output_recipe=recipe)
+    dy = torch.tensor([[1.0, 2.0, 3.0, 4.0], [3.0, 5.0, 7.0, 11.0]])
+
+    maybe_accumulate_grad_gram(param, dy)
+
+    torch.testing.assert_close(param.main_grad_grad_gram, dy.t().matmul(dy))
+    torch.testing.assert_close(param.main_grad_grad_count, torch.tensor(2.0, dtype=torch.float64))
+
+
+def test_diag_grad_gram_accumulates_diagonal_only():
+    param = _param_with_info()
+    recipe = _output_recipe(approximation=MatrixPreconditionerApproximation.DIAG)
+    configure_matrix_update_param(param, output_recipe=recipe)
+    dy = torch.tensor([[1.0, 2.0, 3.0, 4.0], [3.0, 5.0, 7.0, 11.0]])
+
+    maybe_accumulate_grad_gram(param, dy)
+
+    torch.testing.assert_close(param.main_grad_grad_gram, (dy * dy).sum(dim=0))
+
+
+def test_block_diag_grad_gram_accumulates_padded_blocks():
+    param = _param_with_info()
+    recipe = _output_recipe(approximation=MatrixPreconditionerApproximation.BLOCK_DIAG)
+    recipe.block_size = 3
+    configure_matrix_update_param(param, output_recipe=recipe)
+    dy = torch.tensor([[1.0, 2.0, 3.0, 4.0], [3.0, 5.0, 7.0, 11.0]])
+
+    maybe_accumulate_grad_gram(param, dy)
+
+    expected = torch.zeros(2, 3, 3)
+    expected[0] = dy[:, :3].t().matmul(dy[:, :3])
+    padded_last = torch.nn.functional.pad(dy[:, 3:], (0, 2))
+    expected[1] = padded_last.t().matmul(padded_last)
+    torch.testing.assert_close(param.main_grad_grad_gram, expected)
+
+
 def test_feature_gram_mean_normalization_is_applied_on_consumption():
     param = _param_with_info()
     recipe = _recipe(normalization=MatrixPreconditionerNormalization.MEAN)
@@ -110,12 +175,31 @@ def test_feature_gram_mean_normalization_is_applied_on_consumption():
     torch.testing.assert_close(get_feature_gram_for_optimizer(param), x.t().matmul(x) / 2.0)
 
 
+def test_grad_gram_mean_normalization_is_applied_on_consumption():
+    param = _param_with_info()
+    recipe = _output_recipe(normalization=MatrixPreconditionerNormalization.MEAN)
+    configure_matrix_update_param(param, output_recipe=recipe)
+    dy = torch.tensor([[1.0, 2.0, 3.0, 4.0], [3.0, 5.0, 7.0, 11.0]])
+
+    maybe_accumulate_grad_gram(param, dy)
+
+    torch.testing.assert_close(get_grad_gram_for_optimizer(param), dy.t().matmul(dy) / 2.0)
+
+
 def test_feature_gram_consumption_requires_collected_rows():
     param = _param_with_info()
     configure_matrix_update_param(param, recipe=_recipe())
 
     with pytest.raises(RuntimeError, match="zero collected feature rows"):
         get_feature_gram_for_optimizer(param)
+
+
+def test_grad_gram_consumption_requires_collected_rows():
+    param = _param_with_info()
+    configure_matrix_update_param(param, output_recipe=_output_recipe())
+
+    with pytest.raises(RuntimeError, match="zero collected grad-output rows"):
+        get_grad_gram_for_optimizer(param)
 
 
 def test_token_sample_size_caps_total_collection_window():
@@ -137,6 +221,13 @@ def test_token_sample_size_caps_total_collection_window():
 def test_row_parallel_feature_gram_scope_is_tp_local_block_diag_even_for_diag():
     assert (
         input_preconditioner_scope_for(MatrixPreconditionerApproximation.DIAG, "row_parallel")
+        == MatrixPreconditionerScope.TP_LOCAL_BLOCK_DIAG
+    )
+
+
+def test_column_parallel_grad_gram_scope_is_tp_local_block_diag_even_for_diag():
+    assert (
+        output_preconditioner_scope_for(MatrixPreconditionerApproximation.DIAG, "column_parallel")
         == MatrixPreconditionerScope.TP_LOCAL_BLOCK_DIAG
     )
 
@@ -188,7 +279,7 @@ def test_matrix_function_optimizer_consumes_feature_gram_and_preserves_buffer_fo
 
     seen = {}
 
-    def update_rule(grad, feature_gram, model_param):
+    def update_rule(grad, feature_gram, grad_gram, model_param):
         seen["feature_gram"] = feature_gram.clone()
         seen["model_param"] = model_param
         return -grad
@@ -203,6 +294,34 @@ def test_matrix_function_optimizer_consumes_feature_gram_and_preserves_buffer_fo
     torch.testing.assert_close(param.main_grad_feature_count, torch.tensor(2.0, dtype=torch.float64))
 
 
+def test_matrix_function_optimizer_consumes_feature_and_grad_grams():
+    param = _param_with_info()
+    param.data = torch.zeros_like(param.data)
+    param.main_grad = torch.ones_like(param.data)
+    input_recipe = _recipe(normalization=MatrixPreconditionerNormalization.MEAN)
+    output_recipe = _output_recipe(normalization=MatrixPreconditionerNormalization.MEAN)
+    configure_matrix_update_param(param, recipe=input_recipe, output_recipe=output_recipe)
+    x = torch.tensor([[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]])
+    dy = torch.tensor([[1.0, 0.0, 0.0, 0.0], [0.0, 2.0, 0.0, 0.0]])
+    maybe_accumulate_feature_gram(param, x)
+    maybe_accumulate_grad_gram(param, dy)
+
+    seen = {}
+
+    def update_rule(grad, feature_gram, grad_gram, model_param):
+        seen["feature_gram"] = feature_gram.clone()
+        seen["grad_gram"] = grad_gram.clone()
+        seen["model_param"] = model_param
+        return -grad
+
+    opt = MatrixFunctionOptimizer([param], lr=0.1, update_rule=update_rule)
+    opt.step()
+
+    torch.testing.assert_close(seen["feature_gram"], x.t().matmul(x) / x.shape[0])
+    torch.testing.assert_close(seen["grad_gram"], dy.t().matmul(dy) / dy.shape[0])
+    assert seen["model_param"] is param
+
+
 def test_matrix_function_optimizer_respects_feature_gram_refresh_interval():
     param = _param_with_info()
     param.data = torch.zeros_like(param.data)
@@ -211,7 +330,7 @@ def test_matrix_function_optimizer_respects_feature_gram_refresh_interval():
     configure_matrix_update_param(param, recipe=recipe)
     seen = []
 
-    def update_rule(grad, feature_gram, model_param):
+    def update_rule(grad, feature_gram, grad_gram, model_param):
         seen.append(feature_gram.clone())
         return -grad
 
@@ -269,10 +388,10 @@ def test_matrix_update_rule_caches_factorization_by_feature_gram_generation(monk
     monkeypatch.setattr(matrix_optimizer_module, "factorize_feature_gram", counted_factorize)
     rule = matrix_optimizer_module._make_matrix_update_rule(config, SimpleNamespace(tp=None))
 
-    first = rule(grad, feature_gram, param)
-    second = rule(grad, feature_gram, param)
+    first = rule(grad, feature_gram, None, param)
+    second = rule(grad, feature_gram, None, param)
     param._feature_gram_generation += 1
-    third = rule(grad, feature_gram, param)
+    third = rule(grad, feature_gram, None, param)
 
     assert len(calls) == 2
     torch.testing.assert_close(first, -grad / (feature_gram + 1.0))
@@ -294,7 +413,59 @@ def test_matrix_update_rule_supports_plain_sgd_without_input_preconditioner():
 
     rule = matrix_optimizer_module._make_matrix_update_rule(config, SimpleNamespace(tp=None))
 
-    torch.testing.assert_close(rule(grad, None, param), -grad)
+    torch.testing.assert_close(rule(grad, None, None, param), -grad)
+
+
+def test_matrix_update_rule_supports_output_grad_gram_preconditioner():
+    from types import SimpleNamespace
+
+    import megatron.core.optimizer.matrix_optimizer as matrix_optimizer_module
+
+    if not matrix_optimizer_module.HAVE_EMERGING_MATRIX_OPTIMIZERS:
+        pytest.skip("emerging_optimizers is not installed")
+
+    param = _param_with_info(tp_layout="none")
+    grad = torch.arange(1, 13, dtype=torch.float32).reshape(4, 3)
+    grad_gram = torch.tensor([1.0, 3.0, 7.0, 15.0])
+    config = OptimizerConfig(
+        matrix_optimizer="sgd",
+        matrix_output_preconditioner="grad_gram",
+        matrix_output_preconditioner_approximation="diag",
+        matrix_output_preconditioner_ridge=1.0,
+    )
+
+    rule = matrix_optimizer_module._make_matrix_update_rule(config, SimpleNamespace(tp=None))
+
+    expected = -grad / (grad_gram + 1.0).unsqueeze(1)
+    torch.testing.assert_close(rule(grad, None, grad_gram, param), expected)
+
+
+def test_matrix_update_rule_supports_two_sided_diag_preconditioning():
+    from types import SimpleNamespace
+
+    import megatron.core.optimizer.matrix_optimizer as matrix_optimizer_module
+
+    if not matrix_optimizer_module.HAVE_EMERGING_MATRIX_OPTIMIZERS:
+        pytest.skip("emerging_optimizers is not installed")
+
+    param = _param_with_info(tp_layout="none")
+    grad = torch.arange(1, 13, dtype=torch.float32).reshape(4, 3)
+    feature_gram = torch.tensor([1.0, 4.0, 9.0])
+    grad_gram = torch.tensor([2.0, 3.0, 4.0, 5.0])
+    config = OptimizerConfig(
+        matrix_optimizer="sgd",
+        matrix_input_preconditioner="feature_gram",
+        matrix_input_preconditioner_approximation="diag",
+        matrix_input_preconditioner_ridge=0.5,
+        matrix_output_preconditioner="grad_gram",
+        matrix_output_preconditioner_approximation="diag",
+        matrix_output_preconditioner_ridge=1.0,
+    )
+
+    rule = matrix_optimizer_module._make_matrix_update_rule(config, SimpleNamespace(tp=None))
+
+    expected = -grad / (grad_gram + 1.0).unsqueeze(1) / (feature_gram + 0.5).unsqueeze(0)
+    torch.testing.assert_close(rule(grad, feature_gram, grad_gram, param), expected)
 
 
 def test_matrix_update_rule_supports_plain_muon_without_input_preconditioner(monkeypatch):
@@ -322,13 +493,13 @@ def test_matrix_update_rule_supports_plain_muon_without_input_preconditioner(mon
     rule = matrix_optimizer_module._make_matrix_update_rule(config, SimpleNamespace(tp=None))
 
     expected = -grad * (grad.size(-2) / grad.size(-1)) ** 0.5
-    torch.testing.assert_close(rule(grad, None, param), expected)
+    torch.testing.assert_close(rule(grad, None, None, param), expected)
 
 
 def test_matrix_function_optimizer_state_dict_does_not_serialize_update_rule():
     param = _param_with_info()
 
-    def update_rule(grad, feature_gram, model_param):
+    def update_rule(grad, feature_gram, grad_gram, model_param):
         return -grad
 
     opt = MatrixFunctionOptimizer([param], lr=0.1, update_rule=update_rule)
@@ -345,7 +516,7 @@ def test_matrix_function_optimizer_applies_decoupled_weight_decay():
     configure_matrix_update_param(param, recipe=_recipe())
     maybe_accumulate_feature_gram(param, torch.ones(2, 3))
 
-    def update_rule(grad, feature_gram, model_param):
+    def update_rule(grad, feature_gram, grad_gram, model_param):
         return torch.zeros_like(grad)
 
     opt = MatrixFunctionOptimizer(
@@ -372,19 +543,21 @@ def test_matrix_function_optimizer_uses_inplace_update_rule_when_available():
     param.main_grad_feature_count.fill_(1.0)
     calls = []
 
-    def update_rule(grad, feature_gram, model_param):
+    def update_rule(grad, feature_gram, grad_gram, model_param):
         raise AssertionError("generic update_rule should not run")
 
     def inplace_update_rule(
         update_param,
         grad,
         feature_gram,
+        grad_gram,
         model_param,
         lr,
         weight_decay,
         decoupled_weight_decay,
     ):
         calls.append(1)
+        assert grad_gram is None
         update_param.mul_(1.0 - lr * weight_decay)
         update_param.add_(grad / (feature_gram + 1.0), alpha=-lr)
         return True
@@ -438,7 +611,7 @@ def test_matrix_inplace_update_rule_uses_diag_muon_for_local_matrix(monkeypatch)
         config, SimpleNamespace(tp=None)
     )
 
-    assert rule(param, grad, feature_gram, param, 0.1, 0.2, True)
+    assert rule(param, grad, feature_gram, None, param, 0.1, 0.2, True)
     assert len(calls) == 1
     _, seen_grad, seen_feature_gram, kwargs = calls[0]
     assert seen_grad is grad
@@ -469,12 +642,26 @@ def test_row_parallel_nonexact_feature_scope_gets_approximation_label():
     assert plan.approximation_label == "tp_local_block_diag_feature_gram"
 
 
+def test_column_parallel_nonexact_grad_scope_gets_approximation_label():
+    param = _param_with_info(tp_layout="column_parallel")
+    recipe = _output_recipe(approximation=MatrixPreconditionerApproximation.DIAG)
+    recipe.scope = output_preconditioner_scope_for(recipe.approximation, "column_parallel")
+    configure_matrix_update_param(param, output_recipe=recipe)
+
+    plan = default_matrix_apply_plan(
+        param, tp_update_mode=TPUpdateMode.TP_ALLGATHER_LOGICAL_MATRIX
+    )
+
+    assert plan.requires_full_logical_gradient
+    assert plan.approximation_label == "tp_local_block_diag_grad_gram"
+
+
 def test_matrix_function_optimizer_fails_when_grad_has_no_feature_rows():
     param = _param_with_info()
     param.main_grad = torch.ones_like(param.data)
     configure_matrix_update_param(param, recipe=_recipe())
 
-    def update_rule(grad, feature_gram, model_param):
+    def update_rule(grad, feature_gram, grad_gram, model_param):
         return -grad
 
     opt = MatrixFunctionOptimizer([param], lr=0.1, update_rule=update_rule)
@@ -493,6 +680,16 @@ def test_feature_gram_finalization_requires_explicit_process_groups():
         finalize_feature_gram_buffers([param])
 
 
+def test_grad_gram_finalization_requires_explicit_process_groups():
+    param = _param_with_info()
+    configure_matrix_update_param(param, output_recipe=_output_recipe())
+    maybe_accumulate_grad_gram(param, torch.ones(2, 4))
+    set_grad_gram_finalization_required([param], required=True)
+
+    with pytest.raises(RuntimeError, match="explicit process_groups"):
+        finalize_grad_gram_buffers([param])
+
+
 def test_optimizer_config_rejects_standard_distopt_with_matrix_optimizer():
     with pytest.raises(ValueError, match="standard DistributedOptimizer"):
         OptimizerConfig(matrix_optimizer="muon", use_distributed_optimizer=True)
@@ -506,6 +703,25 @@ def test_optimizer_config_accepts_block_diag_feature_gram():
     )
 
     assert config.matrix_input_preconditioner_approximation == "block_diag"
+
+
+def test_optimizer_config_accepts_block_diag_grad_gram():
+    config = OptimizerConfig(
+        matrix_optimizer="sgd",
+        matrix_output_preconditioner="grad_gram",
+        matrix_output_preconditioner_approximation="block_diag",
+        matrix_output_preconditioner_block_size=2,
+    )
+
+    assert config.matrix_output_preconditioner_approximation == "block_diag"
+
+
+def test_optimizer_config_rejects_output_preconditioner_options_when_disabled():
+    with pytest.raises(ValueError, match="matrix_output_preconditioner-specific options"):
+        OptimizerConfig(
+            matrix_optimizer="sgd",
+            matrix_output_preconditioner_approximation="block_diag",
+        )
 
 
 def test_optimizer_config_normalizes_input_preconditioner_accumulation_dtype_strings():
@@ -540,6 +756,8 @@ def test_optimizer_config_rejects_unimplemented_active_matrix_options():
     OptimizerConfig(matrix_optimizer="muon", matrix_input_preconditioner="feature_gram", matrix_input_preconditioner_refresh_interval=2)
     with pytest.raises(ValueError, match="ema_beta"):
         OptimizerConfig(matrix_optimizer="muon", matrix_input_preconditioner="feature_gram", matrix_input_preconditioner_ema_beta=0.9)
+    with pytest.raises(ValueError, match="matrix_output_preconditioner_ema_beta"):
+        OptimizerConfig(matrix_optimizer="muon", matrix_output_preconditioner="grad_gram", matrix_output_preconditioner_ema_beta=0.9)
 
 
 def test_optimizer_config_exposes_muon_ns_coefficients():
@@ -565,6 +783,19 @@ def test_configure_model_matrix_updates_rejects_row_parallel_full_gram():
     config = OptimizerConfig(matrix_optimizer="muon", matrix_input_preconditioner="feature_gram", matrix_input_preconditioner_approximation="full")
 
     with pytest.raises(RuntimeError, match="row-parallel"):
+        configure_model_matrix_updates([module], config)
+
+
+def test_configure_model_matrix_updates_rejects_column_parallel_full_grad_gram():
+    module = torch.nn.Module()
+    module.weight = _param_with_info(tp_layout="column_parallel")
+    config = OptimizerConfig(
+        matrix_optimizer="muon",
+        matrix_output_preconditioner="grad_gram",
+        matrix_output_preconditioner_approximation="full",
+    )
+
+    with pytest.raises(RuntimeError, match="column-parallel"):
         configure_model_matrix_updates([module], config)
 
 
@@ -613,13 +844,15 @@ def test_native_column_parallel_linear_backward_collects_feature_gram():
             skip_bias_add=False,
         ).cuda()
         recipe = _recipe(normalization=MatrixPreconditionerNormalization.SUM)
-        configure_matrix_update_param(layer.weight, recipe=recipe)
+        output_recipe = _output_recipe(normalization=MatrixPreconditionerNormalization.SUM)
+        configure_matrix_update_param(layer.weight, recipe=recipe, output_recipe=output_recipe)
         x = torch.randn(2, 5, 3, device="cuda")
 
         out, _ = layer(x)
         out.square().sum().backward()
 
         x_2d = x.reshape(-1, x.shape[-1]).float()
+        dy_2d = (2 * out.detach()).reshape(-1, out.shape[-1]).float()
         torch.testing.assert_close(
             layer.weight.main_grad_feature_gram,
             x_2d.t().matmul(x_2d),
@@ -629,6 +862,16 @@ def test_native_column_parallel_linear_backward_collects_feature_gram():
         torch.testing.assert_close(
             layer.weight.main_grad_feature_count,
             torch.tensor(float(x_2d.shape[0]), device="cuda", dtype=torch.float64),
+        )
+        torch.testing.assert_close(
+            layer.weight.main_grad_grad_gram,
+            dy_2d.t().matmul(dy_2d),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        torch.testing.assert_close(
+            layer.weight.main_grad_grad_count,
+            torch.tensor(float(dy_2d.shape[0]), device="cuda", dtype=torch.float64),
         )
     finally:
         Utils.destroy_model_parallel()
