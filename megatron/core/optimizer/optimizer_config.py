@@ -320,40 +320,46 @@ class OptimizerConfig:
 
     # Matrix optimizers.
     matrix_optimizer: str = "none"
-    """Matrix optimizer for eligible affine 2D weights: none, newton_muon, or locoprop_s."""
+    """Matrix optimizer for eligible affine 2D weights: none, sgd, or muon."""
 
     matrix_min_dim: int = 2
     """Minimum logical matrix dimension for matrix optimizer eligibility."""
 
-    matrix_feature_gram: str = "diag"
-    """Input-side/right FEATURE_GRAM (X.T @ X) approximation: diag, block_diag, full, or sketch."""
+    matrix_input_preconditioner: str = "none"
+    """Input/right preconditioner for matrix optimizer updates: none or feature_gram."""
 
-    matrix_feature_gram_refresh_interval: int = 1
-    """Number of optimizer steps between input-side FEATURE_GRAM refreshes."""
+    matrix_input_preconditioner_approximation: str = "diag"
+    """Input/right preconditioner approximation: diag, block_diag, or full."""
 
-    matrix_feature_gram_token_sample_size: Optional[int] = None
-    """Optional number of input feature rows/tokens sampled for FEATURE_GRAM collection."""
+    matrix_output_preconditioner: str = "none"
+    """Output/left preconditioner for matrix optimizer updates. Only none is implemented."""
 
-    matrix_feature_gram_source_dtype: str = "bf16_saved"
-    """Source dtype policy for FEATURE_GRAM: bf16_saved, fp32_cast, or fp8_dequant."""
+    matrix_input_preconditioner_refresh_interval: int = 1
+    """Number of optimizer steps between input preconditioner refreshes."""
 
-    matrix_feature_gram_normalization: str = "mean"
-    """FEATURE_GRAM consumption convention: sum or mean."""
+    matrix_input_preconditioner_token_sample_size: Optional[int] = None
+    """Optional number of input feature rows/tokens sampled for input preconditioner collection."""
 
-    matrix_feature_gram_min_samples_per_feature: Optional[float] = None
-    """Minimum samples per feature required when using a full sampled FEATURE_GRAM."""
+    matrix_input_preconditioner_activation_dtype: str = "bf16_saved"
+    """Activation dtype policy for feature-gram input preconditioner collection."""
 
-    matrix_feature_gram_block_size: int = 128
-    """Block size for block_diag FEATURE_GRAM storage."""
+    matrix_input_preconditioner_normalization: str = "mean"
+    """Input preconditioner consumption convention: sum or mean."""
 
-    matrix_feature_gram_ridge: float = 0.0
-    """Default ridge used when consuming the input-side/right FEATURE_GRAM factor."""
+    matrix_input_preconditioner_min_samples_per_feature: Optional[float] = None
+    """Minimum samples per feature required when using a full sampled input preconditioner."""
 
-    matrix_feature_gram_ema_beta: Optional[float] = None
-    """Optional EMA coefficient for persistent FEATURE_GRAM estimates."""
+    matrix_input_preconditioner_block_size: int = 128
+    """Block size for block_diag input preconditioner storage."""
 
-    matrix_feature_gram_accumulation_dtype: torch.dtype = torch.float32
-    """Accumulation dtype for FEATURE_GRAM buffers."""
+    matrix_input_preconditioner_ridge: float = 0.0
+    """Default ridge used when consuming the input/right preconditioner."""
+
+    matrix_input_preconditioner_ema_beta: Optional[float] = None
+    """Optional EMA coefficient for persistent input preconditioner estimates."""
+
+    matrix_input_preconditioner_accumulation_dtype: torch.dtype = torch.float32
+    """Accumulation dtype for input preconditioner buffers."""
 
     matrix_tp_update_mode: str = "allgather"
     """TP apply mode: allgather, small_gram_polar, or block_local."""
@@ -432,10 +438,10 @@ class OptimizerConfig:
     optimizer_cuda_graph: bool = False
     """If true, enables CUDA graph for optimizer step."""
 
-    def _normalize_matrix_feature_gram_accumulation_dtype(self):
+    def _normalize_matrix_input_preconditioner_accumulation_dtype(self):
         """Normalize CLI/YAML string values into ``torch.dtype`` objects."""
 
-        value = self.matrix_feature_gram_accumulation_dtype
+        value = self.matrix_input_preconditioner_accumulation_dtype
         if isinstance(value, str):
             normalized = value.lower().replace("torch.", "")
             dtype_by_name = {
@@ -448,48 +454,54 @@ class OptimizerConfig:
             }
             if normalized not in dtype_by_name:
                 raise ValueError(
-                    "matrix_feature_gram_accumulation_dtype must be one of: "
+                    "matrix_input_preconditioner_accumulation_dtype must be one of: "
                     "fp32, float32, bf16, bfloat16, fp16, float16"
                 )
-            self.matrix_feature_gram_accumulation_dtype = dtype_by_name[normalized]
+            self.matrix_input_preconditioner_accumulation_dtype = dtype_by_name[normalized]
             return
-        if self.matrix_feature_gram_accumulation_dtype not in (
+        if self.matrix_input_preconditioner_accumulation_dtype not in (
             torch.float32,
             torch.bfloat16,
             torch.float16,
         ):
             raise ValueError(
-                "matrix_feature_gram_accumulation_dtype must be torch.float32, "
+                "matrix_input_preconditioner_accumulation_dtype must be torch.float32, "
                 "torch.bfloat16, or torch.float16"
             )
 
     def __post_init__(self):
         """Check the validity of the config."""
-        self._normalize_matrix_feature_gram_accumulation_dtype()
-        if self.matrix_optimizer not in ("none", "newton_muon", "locoprop_s"):
-            raise ValueError("matrix_optimizer must be one of: none, newton_muon, locoprop_s")
-        if self.matrix_feature_gram not in ("diag", "block_diag", "full", "sketch"):
-            raise ValueError("matrix_feature_gram must be one of: diag, block_diag, full, sketch")
-        if self.matrix_feature_gram_refresh_interval < 1:
-            raise ValueError("matrix_feature_gram_refresh_interval must be >= 1")
+        self._normalize_matrix_input_preconditioner_accumulation_dtype()
+        if self.matrix_optimizer not in ("none", "sgd", "muon"):
+            raise ValueError("matrix_optimizer must be one of: none, sgd, muon")
+        if self.matrix_input_preconditioner not in ("none", "feature_gram"):
+            raise ValueError("matrix_input_preconditioner must be one of: none, feature_gram")
+        if self.matrix_input_preconditioner_approximation not in ("diag", "block_diag", "full"):
+            raise ValueError(
+                "matrix_input_preconditioner_approximation must be one of: diag, block_diag, full"
+            )
+        if self.matrix_output_preconditioner != "none":
+            raise ValueError("matrix_output_preconditioner is not implemented yet; use none")
+        if self.matrix_input_preconditioner_refresh_interval < 1:
+            raise ValueError("matrix_input_preconditioner_refresh_interval must be >= 1")
         if (
-            self.matrix_feature_gram_token_sample_size is not None
-            and self.matrix_feature_gram_token_sample_size < 1
+            self.matrix_input_preconditioner_token_sample_size is not None
+            and self.matrix_input_preconditioner_token_sample_size < 1
         ):
-            raise ValueError("matrix_feature_gram_token_sample_size must be >= 1 when set")
-        if self.matrix_feature_gram_source_dtype not in (
+            raise ValueError("matrix_input_preconditioner_token_sample_size must be >= 1 when set")
+        if self.matrix_input_preconditioner_activation_dtype not in (
             "bf16_saved",
             "fp32_cast",
             "fp8_dequant",
         ):
             raise ValueError(
-                "matrix_feature_gram_source_dtype must be one of: "
+                "matrix_input_preconditioner_activation_dtype must be one of: "
                 "bf16_saved, fp32_cast, fp8_dequant"
             )
-        if self.matrix_feature_gram_normalization not in ("sum", "mean"):
-            raise ValueError("matrix_feature_gram_normalization must be one of: sum, mean")
-        if self.matrix_feature_gram_block_size < 1:
-            raise ValueError("matrix_feature_gram_block_size must be >= 1")
+        if self.matrix_input_preconditioner_normalization not in ("sum", "mean"):
+            raise ValueError("matrix_input_preconditioner_normalization must be one of: sum, mean")
+        if self.matrix_input_preconditioner_block_size < 1:
+            raise ValueError("matrix_input_preconditioner_block_size must be >= 1")
         if self.matrix_tp_update_mode not in ("allgather", "small_gram_polar", "block_local"):
             raise ValueError(
                 "matrix_tp_update_mode must be one of: allgather, small_gram_polar, block_local"
@@ -506,6 +518,26 @@ class OptimizerConfig:
             )
         if self.matrix_bias_mode not in ("fallback", "augmented_feature_sum"):
             raise ValueError("matrix_bias_mode must be one of: fallback, augmented_feature_sum")
+        if self.matrix_optimizer == "none" and self.matrix_input_preconditioner != "none":
+            raise ValueError("matrix_optimizer=none requires matrix_input_preconditioner=none")
+        if self.matrix_input_preconditioner == "none":
+            inactive_non_default = (
+                self.matrix_input_preconditioner_approximation != "diag"
+                or self.matrix_input_preconditioner_refresh_interval != 1
+                or self.matrix_input_preconditioner_token_sample_size is not None
+                or self.matrix_input_preconditioner_activation_dtype != "bf16_saved"
+                or self.matrix_input_preconditioner_normalization != "mean"
+                or self.matrix_input_preconditioner_min_samples_per_feature is not None
+                or self.matrix_input_preconditioner_block_size != 128
+                or self.matrix_input_preconditioner_ridge != 0.0
+                or self.matrix_input_preconditioner_ema_beta is not None
+                or self.matrix_input_preconditioner_accumulation_dtype != torch.float32
+            )
+            if inactive_non_default:
+                raise ValueError(
+                    "matrix_input_preconditioner-specific options require "
+                    "matrix_input_preconditioner=feature_gram"
+                )
         if self.matrix_optimizer != "none" and "muon" in self.optimizer:
             raise ValueError("matrix_optimizer cannot be combined with optimizer=muon/dist_muon.")
         if self.matrix_optimizer != "none" and self.use_distributed_optimizer:
@@ -513,19 +545,9 @@ class OptimizerConfig:
                 "Matrix optimizers do not support standard DistributedOptimizer yet; "
                 "use whole-parameter layer-wise ownership or disable --use-distributed-optimizer."
             )
-        if self.matrix_optimizer == "newton_muon" and self.matrix_feature_gram == "block_diag":
+        if self.matrix_input_preconditioner == "feature_gram" and self.matrix_input_preconditioner_ema_beta is not None:
             raise ValueError(
-                "matrix_optimizer=newton_muon does not support block_diag/sketch feature "
-                "Gram storage yet; use diag or full in this checkout."
-            )
-        if self.matrix_optimizer != "none" and self.matrix_feature_gram == "sketch":
-            raise ValueError(
-                "matrix_feature_gram=sketch requires an explicit storage format and collector "
-                "implementation; use diag, block_diag, or full in this checkout."
-            )
-        if self.matrix_optimizer != "none" and self.matrix_feature_gram_ema_beta is not None:
-            raise ValueError(
-                "matrix_feature_gram_ema_beta requires persistent EMA feature Gram state; "
+                "matrix_input_preconditioner_ema_beta requires persistent input preconditioner state; "
                 "use None in this checkout."
             )
         if self.matrix_optimizer != "none" and self.matrix_bias_mode == "augmented_feature_sum":

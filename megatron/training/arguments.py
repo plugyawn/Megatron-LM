@@ -1749,6 +1749,9 @@ def validate_args(args, defaults={}):
             '--no-load-optim with --skip-train --perform-rl-step skips the optimizer; ' \
             '--rl-offload-optimizer-during-inference is incompatible (no optimizer to offload).'
 
+    if args.matrix_optimizer == 'none' and args.matrix_input_preconditioner != 'none':
+        raise ValueError("matrix-optimizer=none requires matrix-input-preconditioner=none")
+
     if args.matrix_optimizer != 'none':
         if 'muon' in args.optimizer:
             raise ValueError("--matrix-optimizer cannot be combined with --optimizer muon/dist_muon.")
@@ -1757,19 +1760,34 @@ def validate_args(args, defaults={}):
                 "Matrix optimizers do not support standard DistributedOptimizer until logical "
                 "matrix gather/apply/scatter views exist."
             )
-        if args.matrix_optimizer == 'newton_muon' and args.matrix_feature_gram == 'block_diag':
+        if args.matrix_input_preconditioner not in ('none', 'feature_gram'):
+            raise ValueError("matrix-input-preconditioner must be one of: none, feature_gram")
+        if args.matrix_input_preconditioner_approximation not in ('diag', 'block_diag', 'full'):
             raise ValueError(
-                "matrix-optimizer=newton_muon does not support block_diag/sketch feature "
-                "Gram storage yet; use diag or full in this checkout."
+                "matrix-input-preconditioner-approximation must be one of: diag, block_diag, full"
             )
-        if args.matrix_feature_gram == 'sketch':
-            raise ValueError(
-                "matrix-feature-gram=sketch requires an explicit storage format and "
-                "collector implementation; use diag, block_diag, or full in this checkout."
+        if args.matrix_output_preconditioner != 'none':
+            raise ValueError("matrix-output-preconditioner is not implemented yet; use none")
+        if args.matrix_input_preconditioner == 'none':
+            inactive_non_default = (
+                args.matrix_input_preconditioner_approximation != 'diag'
+                or args.matrix_input_preconditioner_refresh_interval != 1
+                or args.matrix_input_preconditioner_token_sample_size is not None
+                or args.matrix_input_preconditioner_activation_dtype != 'bf16_saved'
+                or args.matrix_input_preconditioner_normalization != 'mean'
+                or args.matrix_input_preconditioner_min_samples_per_feature is not None
+                or args.matrix_input_preconditioner_block_size != 128
+                or args.matrix_input_preconditioner_ridge != 0.0
+                or args.matrix_input_preconditioner_ema_beta is not None
             )
-        if args.matrix_feature_gram_ema_beta is not None:
+            if inactive_non_default:
+                raise ValueError(
+                    "matrix-input-preconditioner-specific options require "
+                    "matrix-input-preconditioner=feature_gram"
+                )
+        if args.matrix_input_preconditioner_ema_beta is not None:
             raise ValueError(
-                "matrix-feature-gram-ema-beta requires persistent EMA feature Gram state; "
+                "matrix-input-preconditioner-ema-beta requires persistent input preconditioner state; "
                 "use None in this checkout."
             )
         if args.matrix_bias_mode == 'augmented_feature_sum':
@@ -2484,31 +2502,37 @@ def _add_regularization_args(parser):
                        help='Second beta coefficient for Lion optimizer '
                        '(used in momentum EMA update). Default: 0.98.')
     group.add_argument('--matrix-optimizer', type=str, default='none',
-                       choices=['none', 'newton_muon', 'locoprop_s'],
+                       choices=['none', 'sgd', 'muon'],
                        help='Matrix optimizer for eligible affine 2D weights.')
     group.add_argument('--matrix-min-dim', type=int, default=2,
                        help='Minimum logical matrix dimension for matrix optimizer eligibility.')
-    group.add_argument('--matrix-feature-gram', type=str, default='diag',
-                       choices=['diag', 'block_diag', 'full', 'sketch'],
-                       help='Input-side/right FEATURE_GRAM (X.T @ X) approximation to collect beside main_grad.')
-    group.add_argument('--matrix-feature-gram-refresh-interval', type=int, default=1,
-                       help='Number of optimizer steps between input-side FEATURE_GRAM refreshes.')
-    group.add_argument('--matrix-feature-gram-token-sample-size', type=int, default=None,
-                       help='Optional number of input feature rows/tokens sampled for FEATURE_GRAM.')
-    group.add_argument('--matrix-feature-gram-source-dtype', type=str, default='bf16_saved',
+    group.add_argument('--matrix-input-preconditioner', type=str, default='none',
+                       choices=['none', 'feature_gram'],
+                       help='Input/right preconditioner for matrix optimizer updates.')
+    group.add_argument('--matrix-input-preconditioner-approximation', type=str, default='diag',
+                       choices=['diag', 'block_diag', 'full'],
+                       help='Approximation for the input/right preconditioner.')
+    group.add_argument('--matrix-output-preconditioner', type=str, default='none',
+                       choices=['none'],
+                       help='Output/left preconditioner for matrix optimizer updates. Only none is implemented.')
+    group.add_argument('--matrix-input-preconditioner-refresh-interval', type=int, default=1,
+                       help='Number of optimizer steps between input preconditioner refreshes.')
+    group.add_argument('--matrix-input-preconditioner-token-sample-size', type=int, default=None,
+                       help='Optional number of input feature rows/tokens sampled for input preconditioner.')
+    group.add_argument('--matrix-input-preconditioner-activation-dtype', type=str, default='bf16_saved',
                        choices=['bf16_saved', 'fp32_cast', 'fp8_dequant'],
-                       help='Source dtype policy for FEATURE_GRAM collection.')
-    group.add_argument('--matrix-feature-gram-normalization', type=str, default='mean',
+                       help='Activation dtype policy for feature-gram input preconditioner collection.')
+    group.add_argument('--matrix-input-preconditioner-normalization', type=str, default='mean',
                        choices=['sum', 'mean'],
-                       help='FEATURE_GRAM convention consumed by matrix optimizer rules.')
-    group.add_argument('--matrix-feature-gram-min-samples-per-feature', type=float, default=None,
-                       help='Minimum samples per feature required for sampled full FEATURE_GRAM.')
-    group.add_argument('--matrix-feature-gram-block-size', type=int, default=128,
-                       help='Block size for block_diag FEATURE_GRAM storage.')
-    group.add_argument('--matrix-feature-gram-ridge', type=float, default=0.0,
-                       help='Default ridge for matrix optimizer rules consuming input-side FEATURE_GRAM.')
-    group.add_argument('--matrix-feature-gram-ema-beta', type=float, default=None,
-                       help='Optional EMA coefficient for persistent FEATURE_GRAM estimates.')
+                       help='Input preconditioner convention consumed by matrix optimizer rules.')
+    group.add_argument('--matrix-input-preconditioner-min-samples-per-feature', type=float, default=None,
+                       help='Minimum samples per feature required for sampled full input preconditioner.')
+    group.add_argument('--matrix-input-preconditioner-block-size', type=int, default=128,
+                       help='Block size for block_diag input preconditioner storage.')
+    group.add_argument('--matrix-input-preconditioner-ridge', type=float, default=0.0,
+                       help='Default ridge for matrix optimizer rules consuming an input preconditioner.')
+    group.add_argument('--matrix-input-preconditioner-ema-beta', type=float, default=None,
+                       help='Optional EMA coefficient for persistent input preconditioner estimates.')
     group.add_argument('--matrix-tp-update-mode', type=str, default='allgather',
                        choices=['allgather', 'small_gram_polar', 'block_local'],
                        help='Tensor-parallel matrix update apply mode.')

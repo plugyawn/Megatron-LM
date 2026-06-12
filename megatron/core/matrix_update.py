@@ -28,26 +28,31 @@ class ExtraWgradFactor(enum.IntFlag):
     FEATURE_SUM = 2
 
 
-class FeatureGramApproximation(enum.Enum):
+class MatrixPreconditionerKind(enum.Enum):
+    """Kind of matrix preconditioner attached to a matrix optimizer update."""
+
+    NONE = "none"
+    FEATURE_GRAM = "feature_gram"
+
+
+class MatrixPreconditionerApproximation(enum.Enum):
     """Stored representation of ``X.T @ X``."""
 
     FULL = "full"
     DIAG = "diag"
     BLOCK_DIAG = "block_diag"
-    SKETCH = "sketch"
 
 
-class FeatureGramScope(enum.Enum):
+class MatrixPreconditionerScope(enum.Enum):
     """Semantic scope of a collected input-side/right feature Gram."""
 
     GLOBAL_EXACT = "global_exact"
     TP_LOCAL_BLOCK_DIAG = "tp_local_block_diag"
     BLOCK_DIAG_APPROX = "block_diag_approx"
     DIAG_APPROX = "diag_approx"
-    SKETCH_APPROX = "sketch_approx"
 
 
-class FeatureGramNormalization(enum.Enum):
+class MatrixPreconditionerNormalization(enum.Enum):
     """Convention used when an optimizer consumes a feature Gram."""
 
     SUM = "sum"
@@ -80,13 +85,14 @@ class LinearWeightInfo:
 
 
 @dataclass
-class FeatureGramRecipe:
+class MatrixInputPreconditionerRecipe:
     """Collection and consumption policy for input-side ``FEATURE_GRAM = X.T @ X``."""
 
-    approximation: FeatureGramApproximation
-    scope: FeatureGramScope
-    normalization: FeatureGramNormalization
-    source_dtype: Literal["bf16_saved", "fp32_cast", "fp8_dequant"]
+    kind: MatrixPreconditionerKind
+    approximation: MatrixPreconditionerApproximation
+    scope: MatrixPreconditionerScope
+    normalization: MatrixPreconditionerNormalization
+    activation_dtype: Literal["bf16_saved", "fp32_cast", "fp8_dequant"]
     accumulation_dtype: torch.dtype
     refresh_interval: int
     token_sample_size: Optional[int]
@@ -106,7 +112,7 @@ class MatrixApplyPlan:
         "standard_distopt_forbidden",
     ]
     tp_update_mode: TPUpdateMode
-    feature_gram_scope: FeatureGramScope
+    feature_gram_scope: Optional[MatrixPreconditionerScope]
     requires_full_logical_gradient: bool
     requires_full_logical_weight_for_direction: bool = False
     approximation_label: Optional[str] = None
@@ -118,10 +124,10 @@ def _enum_from_string(enum_type, value):
     return enum_type(value)
 
 
-def feature_gram_scope_for(
-    approximation: FeatureGramApproximation,
+def input_preconditioner_scope_for(
+    approximation: MatrixPreconditionerApproximation,
     tp_layout: str,
-) -> FeatureGramScope:
+) -> MatrixPreconditionerScope:
     """Infer the factor scope implied by approximation and TP layout.
 
     Row-parallel linears own only a feature-axis shard. Until cross-TP Gram
@@ -130,14 +136,12 @@ def feature_gram_scope_for(
     """
 
     if tp_layout == "row_parallel":
-        return FeatureGramScope.TP_LOCAL_BLOCK_DIAG
-    if approximation == FeatureGramApproximation.BLOCK_DIAG:
-        return FeatureGramScope.BLOCK_DIAG_APPROX
-    if approximation == FeatureGramApproximation.DIAG:
-        return FeatureGramScope.DIAG_APPROX
-    if approximation == FeatureGramApproximation.SKETCH:
-        return FeatureGramScope.SKETCH_APPROX
-    return FeatureGramScope.GLOBAL_EXACT
+        return MatrixPreconditionerScope.TP_LOCAL_BLOCK_DIAG
+    if approximation == MatrixPreconditionerApproximation.BLOCK_DIAG:
+        return MatrixPreconditionerScope.BLOCK_DIAG_APPROX
+    if approximation == MatrixPreconditionerApproximation.DIAG:
+        return MatrixPreconditionerScope.DIAG_APPROX
+    return MatrixPreconditionerScope.GLOBAL_EXACT
 
 
 def set_linear_weight_info(
@@ -213,13 +217,13 @@ def _feature_dim(param: torch.nn.Parameter) -> int:
     return info.local_shape[1]
 
 
-def _feature_gram_shape(param: torch.nn.Parameter, recipe: FeatureGramRecipe) -> tuple[int, ...]:
+def _feature_gram_shape(param: torch.nn.Parameter, recipe: MatrixInputPreconditionerRecipe) -> tuple[int, ...]:
     dim = _feature_dim(param)
-    if recipe.approximation == FeatureGramApproximation.FULL:
+    if recipe.approximation == MatrixPreconditionerApproximation.FULL:
         return (dim, dim)
-    if recipe.approximation == FeatureGramApproximation.DIAG:
+    if recipe.approximation == MatrixPreconditionerApproximation.DIAG:
         return (dim,)
-    if recipe.approximation == FeatureGramApproximation.BLOCK_DIAG:
+    if recipe.approximation == MatrixPreconditionerApproximation.BLOCK_DIAG:
         num_blocks = (dim + recipe.block_size - 1) // recipe.block_size
         return (num_blocks, recipe.block_size, recipe.block_size)
     raise NotImplementedError(
@@ -228,23 +232,23 @@ def _feature_gram_shape(param: torch.nn.Parameter, recipe: FeatureGramRecipe) ->
     )
 
 
-def _validate_feature_gram_recipe(param: torch.nn.Parameter, recipe: FeatureGramRecipe) -> None:
+def _validate_feature_gram_recipe(param: torch.nn.Parameter, recipe: MatrixInputPreconditionerRecipe) -> None:
     if recipe.refresh_interval < 1:
-        raise ValueError("matrix-feature-gram-refresh-interval must be >= 1")
+        raise ValueError("matrix-input-preconditioner-refresh-interval must be >= 1")
     if recipe.block_size < 1:
-        raise ValueError("matrix-feature-gram-block-size must be >= 1")
+        raise ValueError("matrix-input-preconditioner-block-size must be >= 1")
     if recipe.token_sample_size is not None and recipe.token_sample_size < 1:
-        raise ValueError("matrix-feature-gram-token-sample-size must be >= 1 when set")
+        raise ValueError("matrix-input-preconditioner-token-sample-size must be >= 1 when set")
     if recipe.min_samples_per_feature is not None and recipe.token_sample_size is not None:
         feature_dim = _feature_dim(param)
         min_samples = recipe.min_samples_per_feature * feature_dim
         if (
-            recipe.approximation == FeatureGramApproximation.FULL
+            recipe.approximation == MatrixPreconditionerApproximation.FULL
             and recipe.token_sample_size < min_samples
         ):
             raise ValueError(
                 "Full FEATURE_GRAM is rank-deficient under this token sample size; "
-                "use diag/block_diag/sketch or increase matrix-feature-gram-token-sample-size."
+                "use diag/block_diag or increase matrix-input-preconditioner-token-sample-size."
             )
 
 
@@ -315,7 +319,7 @@ def finalize_feature_gram_buffers(
         param._feature_gram_finalized = True
 
 
-def allocate_feature_gram_buffers(param: torch.nn.Parameter, recipe: FeatureGramRecipe) -> None:
+def allocate_feature_gram_buffers(param: torch.nn.Parameter, recipe: MatrixInputPreconditionerRecipe) -> None:
     """Allocate per-parameter extra wgrad buffers for a requested recipe."""
 
     _validate_feature_gram_recipe(param, recipe)
@@ -380,7 +384,7 @@ def iter_matrix_update_params(modules: Iterable[torch.nn.Module]):
 def configure_matrix_update_param(
     param: torch.nn.Parameter,
     *,
-    recipe: FeatureGramRecipe,
+    recipe: MatrixInputPreconditionerRecipe,
     factors: ExtraWgradFactor = ExtraWgradFactor.FEATURE_GRAM,
 ) -> None:
     """Enable requested extra wgrad factors on an eligible parameter."""
@@ -390,26 +394,27 @@ def configure_matrix_update_param(
     reset_feature_gram_buffers(param, active=True)
 
 
-def recipe_from_optimizer_config(config, info: LinearWeightInfo) -> FeatureGramRecipe:
+def recipe_from_optimizer_config(config, info: LinearWeightInfo) -> MatrixInputPreconditionerRecipe:
     """Build a feature Gram recipe from an ``OptimizerConfig``-like object."""
 
-    approximation = _enum_from_string(FeatureGramApproximation, config.matrix_feature_gram)
-    scope = feature_gram_scope_for(approximation, info.tp_layout)
+    approximation = _enum_from_string(MatrixPreconditionerApproximation, config.matrix_input_preconditioner_approximation)
+    scope = input_preconditioner_scope_for(approximation, info.tp_layout)
     normalization = _enum_from_string(
-        FeatureGramNormalization, config.matrix_feature_gram_normalization
+        MatrixPreconditionerNormalization, config.matrix_input_preconditioner_normalization
     )
-    return FeatureGramRecipe(
+    return MatrixInputPreconditionerRecipe(
+        kind=MatrixPreconditionerKind.FEATURE_GRAM,
         approximation=approximation,
         scope=scope,
         normalization=normalization,
-        source_dtype=config.matrix_feature_gram_source_dtype,
-        accumulation_dtype=getattr(config, "matrix_feature_gram_accumulation_dtype", torch.float32),
-        refresh_interval=config.matrix_feature_gram_refresh_interval,
-        token_sample_size=config.matrix_feature_gram_token_sample_size,
-        ridge=config.matrix_feature_gram_ridge,
-        ema_beta=config.matrix_feature_gram_ema_beta,
-        min_samples_per_feature=config.matrix_feature_gram_min_samples_per_feature,
-        block_size=getattr(config, "matrix_feature_gram_block_size", 128),
+        activation_dtype=config.matrix_input_preconditioner_activation_dtype,
+        accumulation_dtype=getattr(config, "matrix_input_preconditioner_accumulation_dtype", torch.float32),
+        refresh_interval=config.matrix_input_preconditioner_refresh_interval,
+        token_sample_size=config.matrix_input_preconditioner_token_sample_size,
+        ridge=config.matrix_input_preconditioner_ridge,
+        ema_beta=config.matrix_input_preconditioner_ema_beta,
+        min_samples_per_feature=config.matrix_input_preconditioner_min_samples_per_feature,
+        block_size=getattr(config, "matrix_input_preconditioner_block_size", 128),
     )
 
 
@@ -448,49 +453,51 @@ def configure_model_matrix_updates(modules: Iterable[torch.nn.Module], config) -
             )
         if not is_matrix_update_eligible(param, min_matrix_dim=config.matrix_min_dim):
             continue
-        collector = getattr(param, "_feature_gram_collector", "unknown")
-        if collector == "transformer_engine":
-            if not _transformer_engine_feature_gram_available():
+        if config.matrix_input_preconditioner == "feature_gram":
+            collector = getattr(param, "_feature_gram_collector", "unknown")
+            if collector == "transformer_engine":
+                if not _transformer_engine_feature_gram_available():
+                    raise RuntimeError(
+                        "FEATURE_GRAM collection for Transformer Engine linears requires a "
+                        "Transformer Engine build that exposes "
+                        "transformer_engine.pytorch.module.extra_wgrad.maybe_accumulate_feature_gram."
+                    )
+            elif collector != "native":
                 raise RuntimeError(
-                    "FEATURE_GRAM collection for Transformer Engine linears requires a "
-                    "Transformer Engine build that exposes "
-                    "transformer_engine.pytorch.module.extra_wgrad.maybe_accumulate_feature_gram."
+                    f"FEATURE_GRAM collection for {collector!r} linears is not available in this "
+                    f"checkout (role={info.role!r}, tp_layout={info.tp_layout!r})."
                 )
-        elif collector != "native":
-            raise RuntimeError(
-                f"FEATURE_GRAM collection for {collector!r} linears is not available in this "
-                f"checkout (role={info.role!r}, tp_layout={info.tp_layout!r})."
-            )
-        recipe = recipe_from_optimizer_config(config, info)
-        if (
-            info.tp_layout == "row_parallel"
-            and recipe.approximation == FeatureGramApproximation.FULL
-        ):
-            raise RuntimeError(
-                "matrix-feature-gram=full is not supported for row-parallel weights without "
-                "cross-TP FEATURE_GRAM collection; use diag/block_diag/sketch or disable the "
-                f"matrix optimizer for this parameter (role={info.role!r})."
-            )
-        if collector == "native" and recipe.source_dtype == "fp8_dequant":
-            raise RuntimeError(
-                "FEATURE_GRAM source_dtype=fp8_dequant requires Transformer Engine "
-                "collection at the wgrad site; native linears cannot dequantize FP8 sources."
-            )
-        factors = ExtraWgradFactor.FEATURE_GRAM
-        configure_matrix_update_param(param, recipe=recipe, factors=factors)
+            recipe = recipe_from_optimizer_config(config, info)
+            if (
+                info.tp_layout == "row_parallel"
+                and recipe.approximation == MatrixPreconditionerApproximation.FULL
+            ):
+                raise RuntimeError(
+                    "matrix-input-preconditioner-approximation=full is not supported for "
+                    "row-parallel weights without cross-TP FEATURE_GRAM collection; use "
+                    "diag/block_diag or disable the matrix optimizer for this parameter "
+                    f"(role={info.role!r})."
+                )
+            if collector == "native" and recipe.activation_dtype == "fp8_dequant":
+                raise RuntimeError(
+                    "FEATURE_GRAM activation_dtype=fp8_dequant requires Transformer Engine "
+                    "collection at the wgrad site; native linears cannot dequantize FP8 sources."
+                )
+            factors = ExtraWgradFactor.FEATURE_GRAM
+            configure_matrix_update_param(param, recipe=recipe, factors=factors)
         configured.append(param)
     return configured
 
 
-def _cast_feature_input(inputmat: torch.Tensor, recipe: FeatureGramRecipe) -> torch.Tensor:
-    if recipe.source_dtype not in ("bf16_saved", "fp32_cast", "fp8_dequant"):
-        raise ValueError(f"Unsupported feature Gram source dtype: {recipe.source_dtype}")
-    if recipe.source_dtype == "fp8_dequant":
+def _cast_feature_input(inputmat: torch.Tensor, recipe: MatrixInputPreconditionerRecipe) -> torch.Tensor:
+    if recipe.activation_dtype not in ("bf16_saved", "fp32_cast", "fp8_dequant"):
+        raise ValueError(f"Unsupported feature Gram activation dtype: {recipe.activation_dtype}")
+    if recipe.activation_dtype == "fp8_dequant":
         raise NotImplementedError(
-            "FEATURE_GRAM source_dtype=fp8_dequant requires Transformer Engine dequantization "
+            "FEATURE_GRAM activation_dtype=fp8_dequant requires Transformer Engine dequantization "
             "support at the wgrad site; this native collector fails closed."
         )
-    if recipe.source_dtype == "fp32_cast":
+    if recipe.activation_dtype == "fp32_cast":
         return inputmat.to(torch.float32)
     return inputmat.to(recipe.accumulation_dtype)
 
@@ -548,7 +555,7 @@ def maybe_accumulate_feature_gram(weight: torch.Tensor, inputmat: torch.Tensor) 
         return
     recipe = getattr(weight, "_feature_gram_recipe", None)
     if recipe is None:
-        raise RuntimeError("FEATURE_GRAM requested without a FeatureGramRecipe.")
+        raise RuntimeError("FEATURE_GRAM requested without a MatrixInputPreconditionerRecipe.")
     if inputmat.dim() != 2:
         inputmat = inputmat.reshape(-1, inputmat.shape[-1])
     x = _cast_feature_input(inputmat, recipe)
@@ -561,11 +568,11 @@ def maybe_accumulate_feature_gram(weight: torch.Tensor, inputmat: torch.Tensor) 
             x = x[:remaining]
 
     gram = weight.main_grad_feature_gram
-    if recipe.approximation == FeatureGramApproximation.FULL:
+    if recipe.approximation == MatrixPreconditionerApproximation.FULL:
         gram.add_(x.t().matmul(x))
-    elif recipe.approximation == FeatureGramApproximation.DIAG:
+    elif recipe.approximation == MatrixPreconditionerApproximation.DIAG:
         _accumulate_diag_feature_gram(gram, x)
-    elif recipe.approximation == FeatureGramApproximation.BLOCK_DIAG:
+    elif recipe.approximation == MatrixPreconditionerApproximation.BLOCK_DIAG:
         _accumulate_block_diag_feature_gram(
             gram,
             x,
@@ -589,7 +596,7 @@ def get_feature_gram_for_optimizer(param: torch.nn.Parameter) -> torch.Tensor:
 
     recipe = getattr(param, "_feature_gram_recipe", None)
     if recipe is None:
-        raise RuntimeError("Parameter has no FeatureGramRecipe.")
+        raise RuntimeError("Parameter has no MatrixInputPreconditionerRecipe.")
     if _needs_distributed_finalization() and not getattr(param, "_feature_gram_finalized", False):
         raise RuntimeError(
             "FEATURE_GRAM has not been finalized across distributed groups; call "
@@ -601,7 +608,7 @@ def get_feature_gram_for_optimizer(param: torch.nn.Parameter) -> torch.Tensor:
             "FEATURE_GRAM has zero collected feature rows; ensure the wgrad path collected "
             "main_grad_feature_gram before optimizer consumption."
         )
-    if recipe.normalization == FeatureGramNormalization.MEAN:
+    if recipe.normalization == MatrixPreconditionerNormalization.MEAN:
         count = param.main_grad_feature_count.clamp_min(1.0).to(gram.dtype)
         return gram / count
     return gram

@@ -1,10 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Megatron matrix optimizer integration for input-side FEATURE_GRAM consumers.
+"""Megatron matrix optimizer integration for composable matrix update rules.
 
-``matrix_feature_gram`` is the right-preconditioner factor collected from layer
-inputs as ``X.T @ X``. Left/output-side factors are intentionally not part of
-this integration yet.
+``matrix_optimizer`` selects the matrix update rule for eligible affine weights.
+``matrix_input_preconditioner=feature_gram`` optionally right-preconditions that
+rule with ``C = X.T @ X``. Left/output-side preconditioners are intentionally not
+part of this integration yet.
 """
 
 from __future__ import annotations
@@ -15,7 +16,6 @@ from typing import Dict, List, Optional
 import torch
 
 from megatron.core.matrix_update import (
-    FeatureGramScope,
     TPUpdateMode,
     configure_model_matrix_updates,
     set_feature_gram_finalization_required,
@@ -92,42 +92,44 @@ def _make_matrix_update_rule(config: OptimizerConfig, pg_collection: ProcessGrou
             use_syrk=False,
         )
 
-    def get_cached_factorization(
-        param: torch.nn.Parameter, feature_gram: torch.Tensor
-    ):
+    def get_cached_factorization(param: torch.nn.Parameter, feature_gram: torch.Tensor):
         generation = getattr(param, "_feature_gram_generation", None)
         cache_key = (
             generation,
             tuple(feature_gram.shape),
             feature_gram.dtype,
             feature_gram.device,
-            config.matrix_feature_gram_ridge,
+            config.matrix_input_preconditioner_ridge,
         )
         cached = factor_cache.get(id(param))
         if cached is not None and cached[0] == cache_key:
             return cached[1]
         factorization = factorize_feature_gram(
-            feature_gram, ridge=config.matrix_feature_gram_ridge
+            feature_gram, ridge=config.matrix_input_preconditioner_ridge
         )
         factor_cache[id(param)] = (cache_key, factorization)
         return factorization
 
-    def update_rule(grad: torch.Tensor, feature_gram: torch.Tensor, param: torch.nn.Parameter):
-        # ``feature_gram`` is the input-side/right factor. LocoProp-S applies
-        # G C^-1 directly; Newton-Muon applies Muon to that right-preconditioned
-        # direction.
+    def update_rule(
+        grad: torch.Tensor, feature_gram: Optional[torch.Tensor], param: torch.nn.Parameter
+    ):
         info = getattr(param, "_mcore_linear_weight_info", None)
         if info is None:
             raise RuntimeError("Matrix optimizer parameter is missing LinearWeightInfo.")
-        factorization = get_cached_factorization(param, feature_gram)
-        if config.matrix_optimizer == "locoprop_s":
-            return -right_precondition_with_factorized_feature_gram(grad, factorization)
-        if config.matrix_optimizer != "newton_muon":
+
+        direction = grad
+        if config.matrix_input_preconditioner == "feature_gram":
+            if feature_gram is None:
+                raise RuntimeError("feature_gram input preconditioner requested but not collected.")
+            factorization = get_cached_factorization(param, feature_gram)
+            direction = right_precondition_with_factorized_feature_gram(grad, factorization)
+
+        if config.matrix_optimizer == "sgd":
+            return -direction
+        if config.matrix_optimizer != "muon":
             raise RuntimeError(f"Unsupported matrix optimizer: {config.matrix_optimizer}")
 
-        preconditioned = right_precondition_with_factorized_feature_gram(
-            grad, factorization
-        ).to(torch.float32)
+        preconditioned = direction.to(torch.float32)
         tp_group = pg_collection.tp
         tp_layout = info.tp_layout
         with fp32_matmul_precision(config.muon_fp32_matmul_prec):
@@ -161,7 +163,9 @@ def _make_matrix_inplace_update_rule(
 ):
     """Return an optional fused in-place update rule for cheap diagonal cases."""
 
-    if config.matrix_optimizer not in ("locoprop_s", "newton_muon"):
+    if config.matrix_optimizer not in ("sgd", "muon"):
+        return None
+    if config.matrix_input_preconditioner != "feature_gram":
         return None
     tp_update_mode = _tp_mode_from_config(config)
 
@@ -178,21 +182,21 @@ def _make_matrix_inplace_update_rule(
     def inplace_update_rule(
         param: torch.nn.Parameter,
         grad: torch.Tensor,
-        feature_gram: torch.Tensor,
+        feature_gram: Optional[torch.Tensor],
         model_param: torch.nn.Parameter,
         lr: float,
         weight_decay: float,
         decoupled_weight_decay: bool,
     ) -> bool:
-        if feature_gram.ndim != 1:
+        if feature_gram is None or feature_gram.ndim != 1:
             return False
-        if config.matrix_optimizer == "locoprop_s":
+        if config.matrix_optimizer == "sgd":
             apply_diag_right_preconditioned_update_(
                 param,
                 grad,
                 feature_gram,
                 lr=lr,
-                ridge=config.matrix_feature_gram_ridge,
+                ridge=config.matrix_input_preconditioner_ridge,
                 update_scale=1.0,
                 weight_decay=weight_decay,
                 decoupled_weight_decay=decoupled_weight_decay,
@@ -205,7 +209,7 @@ def _make_matrix_inplace_update_rule(
             grad,
             feature_gram,
             lr=lr,
-            ridge=config.matrix_feature_gram_ridge,
+            ridge=config.matrix_input_preconditioner_ridge,
             num_ns_steps=config.muon_num_ns_steps,
             coefficient_type=config.muon_ns_coefficients,
             scale_mode=config.muon_scale_mode,
@@ -245,11 +249,14 @@ def get_megatron_matrix_optimizer(
     if not configured_matrix_params:
         raise RuntimeError("matrix_optimizer requested, but no eligible native affine matrix parameters were found.")
 
+    feature_gram_params = [
+        param for param in configured_matrix_params if hasattr(param, "_feature_gram_recipe")
+    ]
     feature_gram_groups = []
-    if get_pg_size(pg_collection.dp_cp) > 1:
+    if feature_gram_params and get_pg_size(pg_collection.dp_cp) > 1:
         feature_gram_groups.append(pg_collection.dp_cp)
     set_feature_gram_finalization_required(
-        configured_matrix_params, required=bool(feature_gram_groups)
+        feature_gram_params, required=bool(feature_gram_groups)
     )
 
     log_single_rank(

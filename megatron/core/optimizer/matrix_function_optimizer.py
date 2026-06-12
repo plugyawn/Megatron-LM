@@ -1,13 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Matrix-shaped optimizer shim for input-side FEATURE_GRAM consumers.
+"""Matrix-shaped optimizer shim for matrix update rules.
 
-This module provides the Megatron-side optimizer surface for rules that consume
-``(main_grad, main_grad_feature_gram)`` where ``main_grad_feature_gram`` is
-``X.T @ X`` for the affine layer input. It is intentionally rule-agnostic:
-Newton-Muon and LocoProp-S implementations live outside Megatron Core, while
-Megatron owns parameter metadata, factor buffers, validation, and fail-closed
-routing.
+This module provides the Megatron-side optimizer surface for rules that own
+eligible matrix-shaped parameters. Rules may optionally consume an input-side
+feature gram preconditioner, but plain matrix SGD/Muon paths do not require one.
 """
 
 from __future__ import annotations
@@ -18,17 +15,28 @@ from typing import Optional
 import torch
 
 from megatron.core.matrix_update import (
-    FeatureGramScope,
     MatrixApplyPlan,
+    MatrixPreconditionerScope,
     TPUpdateMode,
     finalize_feature_gram_buffers,
     get_feature_gram_for_optimizer,
     reset_feature_gram_buffers,
 )
 
-MatrixUpdateRuleFn = Callable[[torch.Tensor, torch.Tensor, torch.nn.Parameter], torch.Tensor]
+MatrixUpdateRuleFn = Callable[
+    [torch.Tensor, Optional[torch.Tensor], torch.nn.Parameter], torch.Tensor
+]
 MatrixInplaceUpdateRuleFn = Callable[
-    [torch.nn.Parameter, torch.Tensor, torch.Tensor, torch.nn.Parameter, float, float, bool], bool
+    [
+        torch.nn.Parameter,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        torch.nn.Parameter,
+        float,
+        float,
+        bool,
+    ],
+    bool,
 ]
 
 
@@ -42,16 +50,24 @@ def default_matrix_apply_plan(
         model_param = getattr(param, "_matrix_update_model_param", None)
         feature_gram_scope = getattr(model_param, "_feature_gram_scope", None)
     if feature_gram_scope is None:
-        raise RuntimeError("Matrix parameter is missing FeatureGramScope metadata.")
+        approximation_labels: list[str] = []
+        if tp_update_mode == TPUpdateMode.TP_BLOCK_LOCAL_APPROX:
+            approximation_labels.append("tp_block_local_matrix_update")
+        return MatrixApplyPlan(
+            dp_apply_mode="layerwise_whole_param_owner",
+            tp_update_mode=tp_update_mode,
+            feature_gram_scope=None,
+            requires_full_logical_gradient=tp_update_mode != TPUpdateMode.TP_BLOCK_LOCAL_APPROX,
+            requires_full_logical_weight_for_direction=False,
+            approximation_label="+".join(approximation_labels) if approximation_labels else None,
+        )
     approximation_labels: list[str] = []
-    if feature_gram_scope == FeatureGramScope.TP_LOCAL_BLOCK_DIAG:
+    if feature_gram_scope == MatrixPreconditionerScope.TP_LOCAL_BLOCK_DIAG:
         approximation_labels.append("tp_local_block_diag_feature_gram")
-    elif feature_gram_scope == FeatureGramScope.BLOCK_DIAG_APPROX:
+    elif feature_gram_scope == MatrixPreconditionerScope.BLOCK_DIAG_APPROX:
         approximation_labels.append("block_diag_feature_gram")
-    elif feature_gram_scope == FeatureGramScope.DIAG_APPROX:
+    elif feature_gram_scope == MatrixPreconditionerScope.DIAG_APPROX:
         approximation_labels.append("diag_feature_gram")
-    elif feature_gram_scope == FeatureGramScope.SKETCH_APPROX:
-        approximation_labels.append("sketch_feature_gram")
     if tp_update_mode == TPUpdateMode.TP_BLOCK_LOCAL_APPROX:
         approximation_labels.append("tp_block_local_matrix_update")
     return MatrixApplyPlan(
@@ -129,6 +145,8 @@ class MatrixFunctionOptimizer(torch.optim.Optimizer):
         super().zero_grad(set_to_none=set_to_none)
         for param in self._factor_params():
             recipe = getattr(param, "_feature_gram_recipe", None)
+            if recipe is None:
+                continue
             refresh_interval = getattr(recipe, "refresh_interval", 1)
             refresh_active = self._matrix_step % refresh_interval == 0
             reset_feature_gram_buffers(param, active=refresh_active, zero=refresh_active)
@@ -140,7 +158,9 @@ class MatrixFunctionOptimizer(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        factor_params = self._factor_params()
+        factor_params = [
+            param for param in self._factor_params() if hasattr(param, "_feature_gram_recipe")
+        ]
         finalize_feature_gram_buffers(
             factor_params, process_groups=self.feature_gram_process_groups
         )
@@ -160,7 +180,11 @@ class MatrixFunctionOptimizer(torch.optim.Optimizer):
                 model_param = self._model_param_for_factor(param)
                 plan = default_matrix_apply_plan(model_param, tp_update_mode=self.tp_update_mode)
                 validate_matrix_apply_plan(plan)
-                feature_gram = get_feature_gram_for_optimizer(model_param)
+                feature_gram = (
+                    get_feature_gram_for_optimizer(model_param)
+                    if hasattr(model_param, "_feature_gram_recipe")
+                    else None
+                )
                 if self.inplace_update_rule is not None and self.inplace_update_rule(
                     param,
                     grad,
