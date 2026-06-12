@@ -432,8 +432,40 @@ class OptimizerConfig:
     optimizer_cuda_graph: bool = False
     """If true, enables CUDA graph for optimizer step."""
 
+    def _normalize_matrix_feature_gram_accumulation_dtype(self):
+        """Normalize CLI/YAML string values into ``torch.dtype`` objects."""
+
+        value = self.matrix_feature_gram_accumulation_dtype
+        if isinstance(value, str):
+            normalized = value.lower().replace("torch.", "")
+            dtype_by_name = {
+                "fp32": torch.float32,
+                "float32": torch.float32,
+                "bf16": torch.bfloat16,
+                "bfloat16": torch.bfloat16,
+                "fp16": torch.float16,
+                "float16": torch.float16,
+            }
+            if normalized not in dtype_by_name:
+                raise ValueError(
+                    "matrix_feature_gram_accumulation_dtype must be one of: "
+                    "fp32, float32, bf16, bfloat16, fp16, float16"
+                )
+            self.matrix_feature_gram_accumulation_dtype = dtype_by_name[normalized]
+            return
+        if self.matrix_feature_gram_accumulation_dtype not in (
+            torch.float32,
+            torch.bfloat16,
+            torch.float16,
+        ):
+            raise ValueError(
+                "matrix_feature_gram_accumulation_dtype must be torch.float32, "
+                "torch.bfloat16, or torch.float16"
+            )
+
     def __post_init__(self):
         """Check the validity of the config."""
+        self._normalize_matrix_feature_gram_accumulation_dtype()
         if self.matrix_optimizer not in ("none", "newton_muon", "locoprop_s"):
             raise ValueError("matrix_optimizer must be one of: none, newton_muon, locoprop_s")
         if self.matrix_feature_gram not in ("diag", "block_diag", "full", "sketch"):

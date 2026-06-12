@@ -460,6 +460,26 @@ def test_optimizer_config_accepts_block_diag_feature_gram():
     assert config.matrix_feature_gram == "block_diag"
 
 
+def test_optimizer_config_normalizes_feature_gram_accumulation_dtype_strings():
+    config = OptimizerConfig(
+        matrix_optimizer="locoprop_s",
+        matrix_feature_gram_accumulation_dtype="fp32",
+    )
+    assert config.matrix_feature_gram_accumulation_dtype is torch.float32
+
+    config = OptimizerConfig(
+        matrix_optimizer="locoprop_s",
+        matrix_feature_gram_accumulation_dtype="bf16",
+    )
+    assert config.matrix_feature_gram_accumulation_dtype is torch.bfloat16
+
+    with pytest.raises(ValueError, match="matrix_feature_gram_accumulation_dtype"):
+        OptimizerConfig(
+            matrix_optimizer="locoprop_s",
+            matrix_feature_gram_accumulation_dtype="int32",
+        )
+
+
 def test_optimizer_config_rejects_unimplemented_active_matrix_options():
     with pytest.raises(ValueError, match="block_diag/sketch"):
         OptimizerConfig(matrix_optimizer="newton_muon", matrix_feature_gram="block_diag")
