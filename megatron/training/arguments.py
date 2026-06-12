@@ -2490,11 +2490,11 @@ def _add_regularization_args(parser):
                        help='Minimum logical matrix dimension for matrix optimizer eligibility.')
     group.add_argument('--matrix-feature-gram', type=str, default='diag',
                        choices=['diag', 'block_diag', 'full', 'sketch'],
-                       help='FEATURE_GRAM approximation to collect beside main_grad.')
+                       help='Input-side/right FEATURE_GRAM (X.T @ X) approximation to collect beside main_grad.')
     group.add_argument('--matrix-feature-gram-refresh-interval', type=int, default=1,
-                       help='Number of optimizer steps between FEATURE_GRAM refreshes.')
+                       help='Number of optimizer steps between input-side FEATURE_GRAM refreshes.')
     group.add_argument('--matrix-feature-gram-token-sample-size', type=int, default=None,
-                       help='Optional number of feature rows/tokens sampled for FEATURE_GRAM.')
+                       help='Optional number of input feature rows/tokens sampled for FEATURE_GRAM.')
     group.add_argument('--matrix-feature-gram-source-dtype', type=str, default='bf16_saved',
                        choices=['bf16_saved', 'fp32_cast', 'fp8_dequant'],
                        help='Source dtype policy for FEATURE_GRAM collection.')
@@ -2506,7 +2506,7 @@ def _add_regularization_args(parser):
     group.add_argument('--matrix-feature-gram-block-size', type=int, default=128,
                        help='Block size for block_diag FEATURE_GRAM storage.')
     group.add_argument('--matrix-feature-gram-ridge', type=float, default=0.0,
-                       help='Default ridge for matrix optimizer rules consuming FEATURE_GRAM.')
+                       help='Default ridge for matrix optimizer rules consuming input-side FEATURE_GRAM.')
     group.add_argument('--matrix-feature-gram-ema-beta', type=float, default=None,
                        help='Optional EMA coefficient for persistent FEATURE_GRAM estimates.')
     group.add_argument('--matrix-tp-update-mode', type=str, default='allgather',

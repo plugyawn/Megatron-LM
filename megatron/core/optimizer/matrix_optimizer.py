@@ -1,6 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Megatron matrix optimizer integration for FEATURE_GRAM consumers."""
+"""Megatron matrix optimizer integration for input-side FEATURE_GRAM consumers.
+
+``matrix_feature_gram`` is the right-preconditioner factor collected from layer
+inputs as ``X.T @ X``. Left/output-side factors are intentionally not part of
+this integration yet.
+"""
 
 from __future__ import annotations
 
@@ -108,6 +113,9 @@ def _make_matrix_update_rule(config: OptimizerConfig, pg_collection: ProcessGrou
         return factorization
 
     def update_rule(grad: torch.Tensor, feature_gram: torch.Tensor, param: torch.nn.Parameter):
+        # ``feature_gram`` is the input-side/right factor. LocoProp-S applies
+        # G C^-1 directly; Newton-Muon applies Muon to that right-preconditioned
+        # direction.
         info = getattr(param, "_mcore_linear_weight_info", None)
         if info is None:
             raise RuntimeError("Matrix optimizer parameter is missing LinearWeightInfo.")

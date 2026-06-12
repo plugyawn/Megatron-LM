@@ -326,13 +326,13 @@ class OptimizerConfig:
     """Minimum logical matrix dimension for matrix optimizer eligibility."""
 
     matrix_feature_gram: str = "diag"
-    """FEATURE_GRAM approximation: diag, block_diag, full, or sketch."""
+    """Input-side/right FEATURE_GRAM (X.T @ X) approximation: diag, block_diag, full, or sketch."""
 
     matrix_feature_gram_refresh_interval: int = 1
-    """Number of optimizer steps between FEATURE_GRAM refreshes."""
+    """Number of optimizer steps between input-side FEATURE_GRAM refreshes."""
 
     matrix_feature_gram_token_sample_size: Optional[int] = None
-    """Optional number of feature rows/tokens sampled for FEATURE_GRAM collection."""
+    """Optional number of input feature rows/tokens sampled for FEATURE_GRAM collection."""
 
     matrix_feature_gram_source_dtype: str = "bf16_saved"
     """Source dtype policy for FEATURE_GRAM: bf16_saved, fp32_cast, or fp8_dequant."""
@@ -347,7 +347,7 @@ class OptimizerConfig:
     """Block size for block_diag FEATURE_GRAM storage."""
 
     matrix_feature_gram_ridge: float = 0.0
-    """Default ridge used by matrix optimizer rules when consuming FEATURE_GRAM."""
+    """Default ridge used when consuming the input-side/right FEATURE_GRAM factor."""
 
     matrix_feature_gram_ema_beta: Optional[float] = None
     """Optional EMA coefficient for persistent FEATURE_GRAM estimates."""

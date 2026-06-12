@@ -5,6 +5,10 @@
 This module intentionally keeps collection method-free: affine matrix optimizers
 may request extra factors beside ``main_grad``, but optimizers do not receive raw
 activations or method-specific targets.
+
+The current ``FEATURE_GRAM`` factor is the input-side/right preconditioner
+statistic ``X.T @ X``. Output-side/left factors such as ``dY.T @ dY`` are not
+collected here yet.
 """
 
 from __future__ import annotations
@@ -34,7 +38,7 @@ class FeatureGramApproximation(enum.Enum):
 
 
 class FeatureGramScope(enum.Enum):
-    """Semantic scope of a collected feature Gram."""
+    """Semantic scope of a collected input-side/right feature Gram."""
 
     GLOBAL_EXACT = "global_exact"
     TP_LOCAL_BLOCK_DIAG = "tp_local_block_diag"
@@ -77,7 +81,7 @@ class LinearWeightInfo:
 
 @dataclass
 class FeatureGramRecipe:
-    """Collection and consumption policy for ``FEATURE_GRAM``."""
+    """Collection and consumption policy for input-side ``FEATURE_GRAM = X.T @ X``."""
 
     approximation: FeatureGramApproximation
     scope: FeatureGramScope
@@ -279,7 +283,7 @@ def finalize_feature_gram_buffers(
     *,
     process_groups: Iterable[torch.distributed.ProcessGroup] = (),
 ) -> None:
-    """Reduce FEATURE_GRAM buffers across caller-specified groups and mark them final.
+    """Reduce input-side FEATURE_GRAM buffers across caller-specified groups.
 
     Megatron call sites must pass the DP/CP groups required by their exactness
     contract. This function deliberately does not infer those groups from the

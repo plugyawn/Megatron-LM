@@ -1,9 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Matrix-shaped optimizer shim for FEATURE_GRAM consumers.
+"""Matrix-shaped optimizer shim for input-side FEATURE_GRAM consumers.
 
 This module provides the Megatron-side optimizer surface for rules that consume
-``(main_grad, main_grad_feature_gram)``. It is intentionally rule-agnostic:
+``(main_grad, main_grad_feature_gram)`` where ``main_grad_feature_gram`` is
+``X.T @ X`` for the affine layer input. It is intentionally rule-agnostic:
 Newton-Muon and LocoProp-S implementations live outside Megatron Core, while
 Megatron owns parameter metadata, factor buffers, validation, and fail-closed
 routing.
