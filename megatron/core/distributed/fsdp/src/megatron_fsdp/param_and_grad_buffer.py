@@ -61,12 +61,10 @@ logger = logging.getLogger(__name__)
 
 try:
     from megatron.core.matrix_update import (
-        MATRIX_OPTIMIZER_INFO_ATTR,
-        MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
-        MATRIX_OPTIMIZER_OWNER_MUON,
-        MATRIX_SHARD_SPEC_ATTR,
+        copy_matrix_optimizer_registration,
         get_matrix_optimizer_info,
         get_matrix_shard_spec,
+        is_matrix_optimizer_owned_parameter,
         matrix_fsdp_shard_axis_for_spec,
         matrix_shard_spec_with_dp_axis,
         set_matrix_shard_spec,
@@ -75,18 +73,12 @@ try:
     HAVE_MCORE_MATRIX_UPDATE = True
 except ImportError:
     HAVE_MCORE_MATRIX_UPDATE = False
-    MATRIX_OPTIMIZER_INFO_ATTR = "_mcore_matrix_optimizer_info"
-    MATRIX_SHARD_SPEC_ATTR = "_mcore_matrix_shard_spec"
 
 
 def _is_matrix_optimizer_owned_param(param: torch.nn.Parameter) -> bool:
     if not HAVE_MCORE_MATRIX_UPDATE:
         return False
-    matrix_optimizer_info = get_matrix_optimizer_info(param)
-    return matrix_optimizer_info is not None and getattr(matrix_optimizer_info, "owner", None) in (
-        MATRIX_OPTIMIZER_OWNER_MUON,
-        MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
-    )
+    return is_matrix_optimizer_owned_parameter(param)
 
 
 def _matrix_optimizer_dp_shard_axis(param: torch.nn.Parameter) -> Optional[int]:
@@ -3425,11 +3417,11 @@ class ParamAndGradBuffer:
                             "parameterization_shared_group",
                             "parameterization_tags",
                             "_tensor_parallel_mode",
-                            MATRIX_OPTIMIZER_INFO_ATTR,
-                            MATRIX_SHARD_SPEC_ATTR,
                         ]:
                             if hasattr(orig_param, attr_name):
                                 setattr(param, attr_name, getattr(orig_param, attr_name))
+                        if HAVE_MCORE_MATRIX_UPDATE:
+                            copy_matrix_optimizer_registration(orig_param, param)
 
                     return set_param_attribute
 
@@ -5182,9 +5174,7 @@ def make_fsdp_dtensor(
 
     if HAVE_MCORE_MATRIX_UPDATE and is_sharded_param:
         matrix_optimizer_info = get_matrix_optimizer_info(orig_param)
-        if matrix_optimizer_info is not None and getattr(
-            matrix_optimizer_info, "owner", None
-        ) in ("muon", "matrix_function"):
+        if matrix_optimizer_info is not None and _is_matrix_optimizer_owned_param(orig_param):
             matrix_shard_spec = get_matrix_shard_spec(orig_param)
             if matrix_shard_spec is None:
                 raise RuntimeError(
@@ -5279,11 +5269,7 @@ def make_fsdp_dtensor(
         validate_uneven_dtensor(fsdp_tensor)
 
     if HAVE_MCORE_MATRIX_UPDATE:
-        matrix_optimizer_info = get_matrix_optimizer_info(orig_param)
         matrix_shard_spec = get_matrix_shard_spec(orig_param)
-        if matrix_optimizer_info is not None:
-            setattr(fsdp_tensor, MATRIX_OPTIMIZER_INFO_ATTR, matrix_optimizer_info)
-        if matrix_shard_spec is not None:
-            set_matrix_shard_spec(fsdp_tensor, matrix_shard_spec)
+        copy_matrix_optimizer_registration(orig_param, fsdp_tensor, shard_spec=matrix_shard_spec)
 
     return fsdp_tensor

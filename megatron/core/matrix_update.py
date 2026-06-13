@@ -465,7 +465,7 @@ def set_matrix_optimizer_info(
     owner: Literal["none", "muon", "matrix_function", "fallback"],
     update_family: Literal["none", "sgd", "muon"],
     requires_layerwise_layout: bool = False,
-) -> None:
+) -> MatrixOptimizerInfo:
     if owner not in _MATRIX_OPTIMIZER_OWNERS:
         raise ValueError(
             f"{owner!r} is not a stable matrix optimizer owner. Expected one of: "
@@ -494,15 +494,13 @@ def set_matrix_optimizer_info(
                 "matrix optimizer owner 'matrix_function' requires an active "
                 "update_family, got 'none'."
             )
-    setattr(
-        param,
-        MATRIX_OPTIMIZER_INFO_ATTR,
-        MatrixOptimizerInfo(
-            owner=owner,
-            update_family=update_family,
-            requires_layerwise_layout=requires_layerwise_layout,
-        ),
+    info = MatrixOptimizerInfo(
+        owner=owner,
+        update_family=update_family,
+        requires_layerwise_layout=requires_layerwise_layout,
     )
+    setattr(param, MATRIX_OPTIMIZER_INFO_ATTR, info)
+    return info
 
 
 def get_matrix_optimizer_info(param: torch.nn.Parameter) -> Optional[MatrixOptimizerInfo]:
@@ -521,6 +519,78 @@ def is_matrix_optimizer_owned_parameter(param: torch.nn.Parameter) -> bool:
         MATRIX_OPTIMIZER_OWNER_MUON,
         MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
     )
+
+
+def requires_matrix_layerwise_layout(param: torch.nn.Parameter) -> bool:
+    """Return whether a parameter must be routed through LayerWise buffers."""
+
+    info = get_matrix_optimizer_info(param)
+    if info is None:
+        return False
+    return is_matrix_optimizer_owned_parameter(param) and info.requires_layerwise_layout
+
+
+def is_matrix_optimizer_fallback_parameter(param: torch.nn.Parameter) -> bool:
+    """Return whether a parameter is explicitly owned by the fallback optimizer."""
+
+    return get_matrix_optimizer_owner(param) == MATRIX_OPTIMIZER_OWNER_FALLBACK
+
+
+def register_matrix_optimizer_param(
+    param: torch.nn.Parameter,
+    *,
+    owner: Literal["none", "muon", "matrix_function", "fallback"],
+    update_family: Literal["none", "sgd", "muon"],
+    requires_layerwise_layout: bool = False,
+    ensure_shard_spec: bool = True,
+) -> MatrixOptimizerInfo:
+    """Register matrix-optimizer ownership and derived routing metadata.
+
+    This is the single boundary for optimizer ownership metadata. Callers should
+    not separately set ``MatrixOptimizerInfo``, synthesize ``MatrixShardSpec``,
+    and tag LayerWise routing; those invariants must move together.
+    """
+
+    info = set_matrix_optimizer_info(
+        param,
+        owner=owner,
+        update_family=update_family,
+        requires_layerwise_layout=requires_layerwise_layout,
+    )
+    if owner in (MATRIX_OPTIMIZER_OWNER_MUON, MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION):
+        if ensure_shard_spec:
+            ensure_matrix_shard_spec(param)
+        param.is_managed_by_layer_wise_optimizer = info.requires_layerwise_layout
+    else:
+        param.is_managed_by_layer_wise_optimizer = False
+    return info
+
+
+def copy_matrix_optimizer_registration(
+    src_param: torch.nn.Parameter,
+    dst_param: torch.Tensor,
+    *,
+    shard_spec: Optional[MatrixShardSpec] = None,
+) -> Optional[MatrixOptimizerInfo]:
+    """Copy validated matrix optimizer metadata from one param object to another."""
+
+    info = get_matrix_optimizer_info(src_param)
+    copied_info = None
+    if info is not None:
+        copied_info = set_matrix_optimizer_info(
+            dst_param,
+            owner=info.owner,
+            update_family=info.update_family,
+            requires_layerwise_layout=info.requires_layerwise_layout,
+        )
+        dst_param.is_managed_by_layer_wise_optimizer = (
+            info.owner in (MATRIX_OPTIMIZER_OWNER_MUON, MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION)
+            and info.requires_layerwise_layout
+        )
+    spec = shard_spec if shard_spec is not None else get_matrix_shard_spec(src_param)
+    if spec is not None:
+        set_matrix_shard_spec(dst_param, spec)
+    return copied_info
 
 
 def input_preconditioner_scope_for(
@@ -1096,7 +1166,7 @@ def configure_model_matrix_updates(modules: Iterable[torch.nn.Module], config) -
         input_recipe = None
         output_recipe = None
         factors = ExtraWgradFactor.NONE
-        set_matrix_optimizer_info(
+        register_matrix_optimizer_param(
             param,
             owner=MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
             update_family=matrix_update_family_from_optimizer_name(config.matrix_optimizer),

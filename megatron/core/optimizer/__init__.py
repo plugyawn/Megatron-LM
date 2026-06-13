@@ -844,8 +844,7 @@ def _get_megatron_emerging_optimizer(
     from megatron.core.matrix_update import (
         MATRIX_OPTIMIZER_OWNER_FALLBACK,
         MATRIX_OPTIMIZER_OWNER_MUON,
-        ensure_matrix_shard_spec,
-        set_matrix_optimizer_info,
+        register_matrix_optimizer_param,
     )
 
     # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv) and
@@ -865,7 +864,7 @@ def _get_megatron_emerging_optimizer(
                     len(param.shape) == 2
                     and not getattr(param, 'is_embedding_or_output_parameter', False)
                 )
-                set_matrix_optimizer_info(
+                register_matrix_optimizer_param(
                     param,
                     owner=(
                         MATRIX_OPTIMIZER_OWNER_MUON
@@ -874,9 +873,8 @@ def _get_megatron_emerging_optimizer(
                     ),
                     update_family='muon' if is_muon_matrix else 'none',
                     requires_layerwise_layout=use_layer_wise and is_muon_matrix,
+                    ensure_shard_spec=is_muon_matrix,
                 )
-                if is_muon_matrix:
-                    ensure_matrix_shard_spec(param)
 
     # Apply optimizer-specific param overrides (e.g. muon: non-linear -> scalar optimizer).
     entry = _EMERGING_OPTIMIZERS[eopt_name]
