@@ -26,6 +26,7 @@ from megatron.core.matrix_update import (
     TPUpdateMode,
     configure_model_matrix_updates,
     get_matrix_optimizer_info,
+    get_matrix_optimizer_state_spec,
     get_matrix_shard_spec,
     matrix_update_family_from_optimizer_name,
     matrix_small_gram_side_for_spec,
@@ -297,15 +298,81 @@ class MegatronFSDPOptimizer(MegatronOptimizer):
                         step_value, dtype=torch.float32, device=local_param.device
                     )
 
-    def _init_optimizer_states_with_dummy_values(self) -> None:
+    def _local_param_tensor(self, param: torch.Tensor) -> torch.Tensor:
+        if DTensor is not None and isinstance(param, DTensor):
+            return param.to_local()
+        return param
+
+    def _state_tensor_placeholder_like_param(
+        self, param: torch.Tensor, *, dtype: Optional[torch.dtype] = None
+    ) -> torch.Tensor:
+        local_param = self._local_param_tensor(param)
+        state_dtype = dtype if dtype is not None else local_param.dtype
+        local_placeholder = torch.empty_strided(
+            tuple(local_param.shape),
+            tuple(local_param.stride()),
+            dtype=state_dtype,
+            device=local_param.device,
+        )
+        if DTensor is not None and isinstance(param, DTensor):
+            return DTensor.from_local(
+                local_tensor=local_placeholder,
+                device_mesh=param.device_mesh,
+                placements=param.placements,
+                shape=param.shape,
+                stride=param.stride(),
+            )
+        return local_placeholder
+
+    def _scalar_step_placeholder(self, param: torch.Tensor) -> torch.Tensor:
+        local_param = self._local_param_tensor(param)
+        return torch.tensor(0.0, dtype=torch.float32, device=local_param.device)
+
+    def _matrix_state_placeholder_dtype(
+        self, param: torch.Tensor, state_name: str
+    ) -> Optional[torch.dtype]:
+        if state_name == "master_param":
+            return self.config.main_params_dtype
+        return self._local_param_tensor(param).dtype
+
+    def _load_state_placeholders_for_param(self, param: torch.Tensor, group: dict) -> dict:
+        placeholders = {}
+        if "betas" in group:
+            placeholders["step"] = self._scalar_step_placeholder(param)
+            placeholders["exp_avg"] = self._state_tensor_placeholder_like_param(
+                param, dtype=self.config.exp_avg_dtype
+            )
+            placeholders["exp_avg_sq"] = self._state_tensor_placeholder_like_param(
+                param, dtype=self.config.exp_avg_sq_dtype
+            )
+            if group.get("amsgrad", False):
+                placeholders["max_exp_avg_sq"] = self._state_tensor_placeholder_like_param(
+                    param, dtype=self.config.exp_avg_sq_dtype
+                )
+        elif float(group.get("momentum", 0.0) or 0.0) != 0.0:
+            placeholders["momentum_buffer"] = self._state_tensor_placeholder_like_param(param)
+
+        state_spec = get_matrix_optimizer_state_spec(param)
+        if state_spec is not None:
+            for state_name in state_spec.same_shard_state_names:
+                placeholders.setdefault(
+                    state_name,
+                    self._state_tensor_placeholder_like_param(
+                        param, dtype=self._matrix_state_placeholder_dtype(param, state_name)
+                    ),
+                )
+        return placeholders
+
+    def _add_load_state_placeholders(self, packed_state: dict) -> None:
         for group in self.optimizer.param_groups:
             for param in group["params"]:
-                local_param = param.to_local() if DTensor is not None and isinstance(param, DTensor) else param
-                if local_param.numel() == 0:
+                param_state = packed_state.setdefault(self._param_name(param), {})
+                if not isinstance(param_state, dict):
                     continue
-                param.grad = torch.zeros_like(param)
-        self.optimizer.step()
-        self.optimizer.zero_grad()
+                for state_name, state_value in self._load_state_placeholders_for_param(
+                    param, group
+                ).items():
+                    param_state.setdefault(state_name, state_value)
 
     def prepare_grads(self) -> bool:
         return False
@@ -363,9 +430,6 @@ class MegatronFSDPOptimizer(MegatronOptimizer):
         return True, None, None
 
     def sharded_state_dict(self, model_sharded_state_dict, is_loading: bool = False, **kwargs):
-        if is_loading:
-            self._init_optimizer_states_with_dummy_values()
-
         state_dict = self.optimizer.state_dict()
         index_to_name = self._param_state_index_to_name()
         dtensor_state_keys = self._optimizer_state_dtensor_keys()
@@ -378,9 +442,12 @@ class MegatronFSDPOptimizer(MegatronOptimizer):
                 packed_state[index_to_name[int(param_idx)]] = param_state
             else:
                 packed_state[param_idx] = param_state
-        self._add_empty_dtensor_state_for_missing_params(
-            packed_state, dtensor_state_keys, step_value
-        )
+        if is_loading:
+            self._add_load_state_placeholders(packed_state)
+        else:
+            self._add_empty_dtensor_state_for_missing_params(
+                packed_state, dtensor_state_keys, step_value
+            )
 
         sharded_state_dict = {
             key: value
@@ -392,17 +459,16 @@ class MegatronFSDPOptimizer(MegatronOptimizer):
             self.optimizer.param_groups
         )
 
-        if not is_loading:
-            from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
-                _add_matrix_optimizer_checkpoint_metadata,
-                _megatron_fsdp_model_from_optimizer_params,
-            )
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
+            _add_matrix_optimizer_checkpoint_metadata,
+            _megatron_fsdp_model_from_optimizer_params,
+        )
 
-            mfsdp_model = _megatron_fsdp_model_from_optimizer_params(self.optimizer)
-            if mfsdp_model is not None:
-                _add_matrix_optimizer_checkpoint_metadata(
-                    self.optimizer, mfsdp_model, sharded_state_dict
-                )
+        mfsdp_model = _megatron_fsdp_model_from_optimizer_params(self.optimizer)
+        if mfsdp_model is not None:
+            _add_matrix_optimizer_checkpoint_metadata(
+                self.optimizer, mfsdp_model, sharded_state_dict
+            )
         return sharded_state_dict
 
 
@@ -907,6 +973,29 @@ def get_megatron_matrix_optimizer(
     fallback_config = replace(
         config,
         matrix_optimizer="none",
+        matrix_input_preconditioner="none",
+        matrix_input_preconditioner_approximation="diag",
+        matrix_input_preconditioner_refresh_interval=1,
+        matrix_input_preconditioner_token_sample_size=None,
+        matrix_input_preconditioner_activation_dtype="bf16_saved",
+        matrix_input_preconditioner_normalization="mean",
+        matrix_input_preconditioner_min_samples_per_feature=None,
+        matrix_input_preconditioner_block_size=128,
+        matrix_input_preconditioner_ridge=0.0,
+        matrix_input_preconditioner_ema_beta=None,
+        matrix_input_preconditioner_accumulation_dtype=torch.float32,
+        matrix_output_preconditioner="none",
+        matrix_output_preconditioner_approximation="diag",
+        matrix_output_preconditioner_refresh_interval=1,
+        matrix_output_preconditioner_token_sample_size=None,
+        matrix_output_preconditioner_gradient_dtype="bf16_saved",
+        matrix_output_preconditioner_normalization="mean",
+        matrix_output_preconditioner_min_samples_per_feature=None,
+        matrix_output_preconditioner_block_size=128,
+        matrix_output_preconditioner_ridge=0.0,
+        matrix_output_preconditioner_ema_beta=None,
+        matrix_output_preconditioner_accumulation_dtype=torch.float32,
+        matrix_bias_mode="fallback",
         use_layer_wise_distributed_optimizer=False,
     )
     if use_separate_distributed_optimizer:
@@ -935,7 +1024,7 @@ def get_megatron_matrix_optimizer(
             )
             fallback_optimizer = MegatronFSDPOptimizer(
                 megatron_fsdp_fully_shard_optimizer(fallback_torch_optimizer),
-                config,
+                fallback_config,
                 pg_collection,
             )
         elif use_separate_distributed_optimizer:

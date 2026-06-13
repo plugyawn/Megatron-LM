@@ -20,6 +20,7 @@ from megatron.core.matrix_update import (
     register_matrix_optimizer_param,
     requires_matrix_layerwise_layout,
 )
+from megatron.core.parameterization.roles import is_embedding_or_output_parameter
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
 
@@ -70,7 +71,7 @@ def is_managed_by_layer_wise_optimizer(param: torch.nn.Parameter) -> bool:
         return requires_matrix_layerwise_layout(param)
     if not param.dim() == 2:
         return False
-    if getattr(param, 'is_embedding_or_output_parameter', False):
+    if is_embedding_or_output_parameter(param):
         return False
     return True
 
@@ -142,9 +143,7 @@ def _resolve_layerwise_matrix_optimizer_info(
         return
     if not _is_canonical_muon_optimizer_type(optimizer_type):
         return
-    is_muon_matrix = param.dim() == 2 and not getattr(
-        param, 'is_embedding_or_output_parameter', False
-    )
+    is_muon_matrix = param.dim() == 2 and not is_embedding_or_output_parameter(param)
     update_family = "none"
     if is_muon_matrix:
         update_family = "muon"

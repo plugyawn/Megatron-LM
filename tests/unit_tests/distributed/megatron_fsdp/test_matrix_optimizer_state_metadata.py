@@ -13,6 +13,8 @@ fully_shard_module = importlib.import_module(
 )
 import megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer as param_buffer_module
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.matrix_optimizer import MegatronFSDPOptimizer
+from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
     Bucket,
     BucketingPolicy,
@@ -537,6 +539,53 @@ def test_fully_shard_optimizer_registration_does_not_step():
     assert optimizer.step_calls == 0
     assert optimizer.state == {}
     torch.testing.assert_close(param, param_before)
+
+
+def test_megatron_fsdp_optimizer_loading_schema_does_not_step(monkeypatch):
+    class _StepCountingSGD(torch.optim.SGD):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.step_calls = 0
+
+        def step(self, *args, **kwargs):
+            self.step_calls += 1
+            return super().step(*args, **kwargs)
+
+    param = torch.nn.Parameter(torch.ones(2, 3))
+    optimizer = _StepCountingSGD([param], lr=0.1, momentum=0.9, weight_decay=0.1)
+    param_before = param.detach().clone()
+
+    monkeypatch.setattr(
+        fully_shard_module,
+        "_megatron_fsdp_model_from_optimizer_params",
+        lambda optimizer: SimpleNamespace(
+            param_and_grad_buffer=SimpleNamespace(
+                bucketing_policy=SimpleNamespace(data_parallel_sharding_strategy="no_shard")
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        fully_shard_module,
+        "_optimizer_param_state_indices",
+        lambda optimizer: {id(param): 0},
+    )
+    monkeypatch.setattr(
+        fully_shard_module,
+        "_matrix_optimizer_param_checkpoint_identity",
+        lambda param, mfsdp_model: "param0",
+    )
+
+    wrapped = MegatronFSDPOptimizer(
+        optimizer,
+        OptimizerConfig(),
+        SimpleNamespace(tp=None, dp=None, dp_cp=None, tp_dp_cp=None, mp=None),
+    )
+    state_dict = wrapped.sharded_state_dict({}, is_loading=True)
+
+    assert optimizer.step_calls == 0
+    assert optimizer.state == {}
+    torch.testing.assert_close(param, param_before)
+    assert "momentum_buffer" in state_dict["state"]["param0"]
 
 
 def test_matrix_optimizer_checkpoint_metadata_records_master_param_state(monkeypatch):

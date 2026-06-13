@@ -20,6 +20,10 @@ from typing import Iterable, Literal, Optional
 
 import torch
 
+from megatron.core.parameterization.roles import (
+    is_embedding_or_output_parameter as _is_embedding_or_output_parameter,
+)
+
 
 class ExtraWgradFactor(enum.IntFlag):
     """Optional affine wgrad-side statistics."""
@@ -764,7 +768,7 @@ def is_matrix_update_eligible(
         return False
     if info.expert_parallel or info.tp_layout == "grouped_expert":
         return False
-    if getattr(param, "is_embedding_or_output_parameter", False):
+    if _is_embedding_or_output_parameter(param):
         return False
     if getattr(param, "is_embedding_parameter", False):
         return False
@@ -1322,31 +1326,38 @@ def _cast_grad_output(grad_output: torch.Tensor, recipe: MatrixOutputPreconditio
     return grad_output.to(recipe.accumulation_dtype)
 
 
-def _try_accumulate_cuda_diag_gram(gram: torch.Tensor, value: torch.Tensor) -> bool:
+def _try_accumulate_cuda_diag_gram(
+    gram: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    kind: Literal["feature", "grad"],
+) -> bool:
     if not (gram.is_cuda and value.is_cuda):
         return False
     try:
-        from emerging_optimizers.triton_kernels.diag_gram import diag_gram_reduce
+        from emerging_optimizers.triton_kernels.diag_gram import (
+            diag_feature_gram_reduce,
+            diag_grad_gram_reduce,
+        )
     except ModuleNotFoundError as exc:
         missing_name = getattr(exc, "name", "")
         if missing_name and not missing_name.startswith("emerging_optimizers"):
             raise
         return False
-    except ImportError:
-        return False
 
-    diag_gram_reduce(value, out=gram, accumulate=True)
+    reducer = diag_feature_gram_reduce if kind == "feature" else diag_grad_gram_reduce
+    reducer(value, out=gram, accumulate=True)
     return True
 
 
 def _accumulate_diag_feature_gram(gram: torch.Tensor, x: torch.Tensor) -> None:
-    if _try_accumulate_cuda_diag_gram(gram, x):
+    if _try_accumulate_cuda_diag_gram(gram, x, kind="feature"):
         return
     gram.add_(torch.sum(x * x, dim=0))
 
 
 def _accumulate_diag_grad_gram(gram: torch.Tensor, dy: torch.Tensor) -> None:
-    if _try_accumulate_cuda_diag_gram(gram, dy):
+    if _try_accumulate_cuda_diag_gram(gram, dy, kind="grad"):
         return
     gram.add_(torch.sum(dy * dy, dim=0))
 

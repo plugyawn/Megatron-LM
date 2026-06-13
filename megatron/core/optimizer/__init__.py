@@ -960,10 +960,7 @@ def _get_megatron_emerging_optimizer(
             if 'linear_qkv.weight' in name and len(param.shape) == 2:
                 param.is_qkv = True
             if eopt_name == 'muon':
-                is_muon_matrix = (
-                    len(param.shape) == 2
-                    and not getattr(param, 'is_embedding_or_output_parameter', False)
-                )
+                is_muon_matrix = len(param.shape) == 2 and not is_embedding_or_output_parameter(param)
                 register_matrix_optimizer_param(
                     param,
                     owner=(

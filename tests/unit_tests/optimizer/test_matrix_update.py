@@ -183,8 +183,12 @@ def test_diag_gram_cuda_routes_use_generic_reducer(monkeypatch):
 
     calls = []
 
-    def fake_diag_gram_reduce(x, *, out, accumulate):
-        calls.append((x, out, accumulate))
+    def fake_diag_feature_gram_reduce(x, *, out, accumulate):
+        calls.append(("feature", x, out, accumulate))
+        return out
+
+    def fake_diag_grad_gram_reduce(x, *, out, accumulate):
+        calls.append(("grad", x, out, accumulate))
         return out
 
     emerging_pkg = types.ModuleType("emerging_optimizers")
@@ -192,7 +196,8 @@ def test_diag_gram_cuda_routes_use_generic_reducer(monkeypatch):
     kernels_pkg = types.ModuleType("emerging_optimizers.triton_kernels")
     kernels_pkg.__path__ = []
     diag_gram_module = types.ModuleType("emerging_optimizers.triton_kernels.diag_gram")
-    diag_gram_module.diag_gram_reduce = fake_diag_gram_reduce
+    diag_gram_module.diag_feature_gram_reduce = fake_diag_feature_gram_reduce
+    diag_gram_module.diag_grad_gram_reduce = fake_diag_grad_gram_reduce
     monkeypatch.setitem(sys.modules, "emerging_optimizers", emerging_pkg)
     monkeypatch.setitem(sys.modules, "emerging_optimizers.triton_kernels", kernels_pkg)
     monkeypatch.setitem(
@@ -212,7 +217,7 @@ def test_diag_gram_cuda_routes_use_generic_reducer(monkeypatch):
     matrix_update_module._accumulate_diag_feature_gram(gram, x)
     matrix_update_module._accumulate_diag_grad_gram(gram, dy)
 
-    assert calls == [(x, gram, True), (dy, gram, True)]
+    assert calls == [("feature", x, gram, True), ("grad", dy, gram, True)]
 
 
 def test_diag_gram_cuda_kernel_failure_fails_closed(monkeypatch):
@@ -229,7 +234,8 @@ def test_diag_gram_cuda_kernel_failure_fails_closed(monkeypatch):
     kernels_pkg = types.ModuleType("emerging_optimizers.triton_kernels")
     kernels_pkg.__path__ = []
     diag_gram_module = types.ModuleType("emerging_optimizers.triton_kernels.diag_gram")
-    diag_gram_module.diag_gram_reduce = fake_diag_gram_reduce
+    diag_gram_module.diag_feature_gram_reduce = fake_diag_gram_reduce
+    diag_gram_module.diag_grad_gram_reduce = fake_diag_gram_reduce
     monkeypatch.setitem(sys.modules, "emerging_optimizers", emerging_pkg)
     monkeypatch.setitem(sys.modules, "emerging_optimizers.triton_kernels", kernels_pkg)
     monkeypatch.setitem(
@@ -627,7 +633,6 @@ def test_layerwise_buffer_routing_preserves_parameterization_role():
     module.hidden_weight.parameterization_role = "hidden_matrix"
     module.output_weight = _param_with_info()
     module.output_weight.parameterization_role = "output"
-    module.output_weight.is_embedding_or_output_parameter = True
 
     tag_params_for_buffer_routing(
         [module],
