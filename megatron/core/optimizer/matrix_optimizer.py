@@ -31,7 +31,6 @@ from . import (
     _distributed_optimizer_instance_id_from_process_groups,
     _get_megatron_optimizer_based_on_param_groups,
     _get_param_groups,
-    get_megatron_optimizer,
 )
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer
 from .matrix_function_optimizer import MatrixFunctionOptimizer
@@ -98,7 +97,7 @@ def _make_matrix_update_rule(config: OptimizerConfig, pg_collection: ProcessGrou
         return newton_schulz_orthogonalize(
             matrix,
             steps=config.muon_num_ns_steps,
-            coefficient_type=config.muon_ns_coefficients,
+            coefficient_type=config.muon_coefficient_type,
             use_syrk=False,
         )
 
@@ -179,7 +178,7 @@ def _make_matrix_update_rule(config: OptimizerConfig, pg_collection: ProcessGrou
                     tp_layout=tp_layout,
                     group=tp_group,
                     steps=config.muon_num_ns_steps,
-                    coefficient_type=config.muon_ns_coefficients,
+                    coefficient_type=config.muon_coefficient_type,
                     use_syrk=False,
                 )
             elif tp_update_mode == TPUpdateMode.TP_BLOCK_LOCAL_APPROX:
@@ -296,7 +295,7 @@ def _make_matrix_inplace_update_rule(
             lr=lr,
             ridge=config.matrix_input_preconditioner_ridge,
             num_ns_steps=config.muon_num_ns_steps,
-            coefficient_type=config.muon_ns_coefficients,
+            coefficient_type=config.muon_coefficient_type,
             scale_mode=config.muon_scale_mode,
             extra_scale_factor=config.muon_extra_scale_factor,
             weight_decay=weight_decay,
@@ -357,24 +356,17 @@ def get_megatron_matrix_optimizer(
     )
 
     matrix_param_ids = {id(param) for param in configured_matrix_params}
-    matrix_params = []
-    fallback_params = []
-    for model_chunk in model_chunks:
-        for _, param in model_chunk.named_parameters():
-            if not param.requires_grad:
-                continue
-            if id(param) in matrix_param_ids:
-                matrix_params.append(param)
-            else:
-                fallback_params.append(param)
+    def is_matrix_param(name: str, param: torch.nn.Parameter) -> bool:
+        del name
+        return id(param) in matrix_param_ids
 
-    try:
-        for param in fallback_params:
-            param.requires_grad = False
-        matrix_param_groups = _get_param_groups(model_chunks, config, config_overrides)
-    finally:
-        for param in fallback_params:
-            param.requires_grad = True
+    def is_fallback_param(name: str, param: torch.nn.Parameter) -> bool:
+        del name
+        return id(param) not in matrix_param_ids
+
+    matrix_param_groups = _get_param_groups(
+        model_chunks, config, config_overrides, param_filter=is_matrix_param
+    )
 
     use_layer_wise = config.use_layer_wise_distributed_optimizer
     ddp_uses_distributed_optimizer = (
@@ -415,63 +407,58 @@ def get_megatron_matrix_optimizer(
     else:
         matrix_optimizer = FP32Optimizer(matrix_optimizer, config, matrix_init_state_fn)
 
-    previous_matrix_optimizer = config.matrix_optimizer
-    try:
-        for param in matrix_params:
-            param.requires_grad = False
-        config.matrix_optimizer = "none"
-        if use_separate_distributed_optimizer:
-            fallback_config = copy.copy(config)
-            fallback_config.use_distributed_optimizer = True
-            fallback_config.use_layer_wise_distributed_optimizer = False
-            fallback_param_groups = _get_param_groups(
-                model_chunks, fallback_config, config_overrides
-            )
-            distopt_process_groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
-                pg_collection, model_chunks, use_gloo_process_groups=False
-            )
-            distopt_distributed_optimizer_instance_id = (
-                _distributed_optimizer_instance_id_from_process_groups(distopt_process_groups)
-            )
-            distopt_per_model_buffers = {}
-            for model_chunk_idx, model_chunk in enumerate(model_chunks):
-                if not hasattr(model_chunk, 'buffers'):
-                    continue
-                non_layer_wise_buffers = [
-                    buffer
-                    for buffer in model_chunk.buffers
-                    if buffer.params
-                    and not getattr(buffer.params[0], 'is_managed_by_layer_wise_optimizer', False)
-                ]
-                if non_layer_wise_buffers:
-                    distopt_per_model_buffers[model_chunk_idx] = non_layer_wise_buffers
-            fallback_optimizer = _get_megatron_optimizer_based_on_param_groups(
-                config=fallback_config,
-                model_chunks=model_chunks,
-                param_groups=fallback_param_groups,
-                per_model_buffers=distopt_per_model_buffers,
-                model_parallel_group=distopt_process_groups['mp_group'],
-                data_parallel_group=distopt_process_groups['intra_dp_cp_group'],
-                data_parallel_group_gloo=distopt_process_groups['intra_dp_cp_group_gloo'],
-                data_parallel_group_idx=get_pg_rank(distopt_process_groups['mp_group']),
-                intra_dist_opt_group=distopt_process_groups['intra_dist_opt_group'],
-                distributed_optimizer_instance_id=distopt_distributed_optimizer_instance_id,
-                pg_collection=pg_collection,
-                skip_megatron_wrapping=False,
-            )
-            if hasattr(fallback_optimizer, 'config'):
-                fallback_optimizer.config = config
-        else:
-            fallback_optimizer = get_megatron_optimizer(
-                config,
-                model_chunks,
-                config_overrides=config_overrides,
-                use_gloo_process_groups=use_gloo_process_groups,
-            )
-    finally:
-        config.matrix_optimizer = previous_matrix_optimizer
-        for param in matrix_params:
-            param.requires_grad = True
+    fallback_config = copy.copy(config)
+    fallback_config.matrix_optimizer = "none"
+    fallback_config.use_layer_wise_distributed_optimizer = False
+    if use_separate_distributed_optimizer:
+        fallback_config.use_distributed_optimizer = True
+    fallback_param_groups = _get_param_groups(
+        model_chunks, fallback_config, config_overrides, param_filter=is_fallback_param
+    )
+    if use_separate_distributed_optimizer:
+        distopt_process_groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
+            pg_collection, model_chunks, use_gloo_process_groups=False
+        )
+        distopt_distributed_optimizer_instance_id = (
+            _distributed_optimizer_instance_id_from_process_groups(distopt_process_groups)
+        )
+        distopt_per_model_buffers = {}
+        for model_chunk_idx, model_chunk in enumerate(model_chunks):
+            if not hasattr(model_chunk, 'buffers'):
+                continue
+            non_layer_wise_buffers = [
+                buffer
+                for buffer in model_chunk.buffers
+                if buffer.params
+                and not getattr(buffer.params[0], 'is_managed_by_layer_wise_optimizer', False)
+            ]
+            if non_layer_wise_buffers:
+                distopt_per_model_buffers[model_chunk_idx] = non_layer_wise_buffers
+        fallback_optimizer = _get_megatron_optimizer_based_on_param_groups(
+            config=fallback_config,
+            model_chunks=model_chunks,
+            param_groups=fallback_param_groups,
+            per_model_buffers=distopt_per_model_buffers,
+            model_parallel_group=distopt_process_groups['mp_group'],
+            data_parallel_group=distopt_process_groups['intra_dp_cp_group'],
+            data_parallel_group_gloo=distopt_process_groups['intra_dp_cp_group_gloo'],
+            data_parallel_group_idx=get_pg_rank(distopt_process_groups['mp_group']),
+            intra_dist_opt_group=distopt_process_groups['intra_dist_opt_group'],
+            distributed_optimizer_instance_id=distopt_distributed_optimizer_instance_id,
+            pg_collection=pg_collection,
+            skip_megatron_wrapping=False,
+        )
+        if hasattr(fallback_optimizer, 'config'):
+            fallback_optimizer.config = config
+    else:
+        fallback_optimizer = _get_megatron_optimizer_based_on_param_groups(
+            config=fallback_config,
+            model_chunks=model_chunks,
+            param_groups=fallback_param_groups,
+            model_parallel_group=pg_collection.tp,
+            pg_collection=pg_collection,
+            skip_megatron_wrapping=False,
+        )
 
     optimizers = [matrix_optimizer]
     if isinstance(fallback_optimizer, ChainedOptimizer):

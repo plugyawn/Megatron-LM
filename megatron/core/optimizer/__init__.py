@@ -368,6 +368,7 @@ def _get_param_groups(
     model_chunks: List[MegatronModule],
     config: OptimizerConfig,
     config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]],
+    param_filter: Optional[Callable[[str, torch.nn.Parameter], bool]] = None,
 ) -> List[Dict]:
     """Create parameter groups for optimizer.
 
@@ -396,6 +397,8 @@ def _get_param_groups(
     for model_chunk in model_chunks:
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
+                continue
+            if param_filter is not None and not param_filter(name, param):
                 continue
 
             uses_default_config = False

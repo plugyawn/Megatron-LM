@@ -587,6 +587,8 @@ class OptimizerConfig:
             raise ValueError(
                 "matrix_tp_update_mode must be one of: allgather, small_gram_polar, block_local"
             )
+        if self.muon_fp32_matmul_prec not in ("highest", "high", "medium"):
+            raise ValueError("muon_fp32_matmul_prec must be one of: highest, high, medium")
         if self.muon_ns_coefficients not in (
             "simple",
             "quintic",
@@ -597,6 +599,16 @@ class OptimizerConfig:
             raise ValueError(
                 "muon_ns_coefficients must be one of: simple, quintic, polar_express, cans, aol"
             )
+        if self.muon_ns_coefficients != "quintic":
+            if (
+                self.muon_coefficient_type != "quintic"
+                and self.muon_coefficient_type != self.muon_ns_coefficients
+            ):
+                raise ValueError(
+                    "muon_ns_coefficients is a deprecated alias for muon_coefficient_type; "
+                    "when both are set they must match."
+                )
+            self.muon_coefficient_type = self.muon_ns_coefficients
         if self.matrix_bias_mode not in ("fallback", "augmented_feature_sum"):
             raise ValueError("matrix_bias_mode must be one of: fallback, augmented_feature_sum")
         if self.matrix_optimizer == "none" and (

@@ -144,6 +144,16 @@ class MatrixFunctionOptimizer(torch.optim.Optimizer):
         self.feature_gram_process_groups = tuple(feature_gram_process_groups)
         self._matrix_step = 0
 
+    def state_dict(self):
+        state_dict = super().state_dict()
+        state_dict["matrix_step"] = self._matrix_step
+        return state_dict
+
+    def load_state_dict(self, state_dict):
+        matrix_step = state_dict.get("matrix_step", 0)
+        super().load_state_dict(state_dict)
+        self._matrix_step = int(matrix_step)
+
     def _model_param_for_factor(self, param: torch.nn.Parameter) -> torch.nn.Parameter:
         return getattr(param, "_matrix_update_model_param", param)
 

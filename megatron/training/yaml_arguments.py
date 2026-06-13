@@ -20,6 +20,7 @@ from megatron.core.parameterization import build_scaling_context, sync_legacy_mu
 from megatron.core.transformer import TransformerConfig, MLATransformerConfig
 from megatron.core.utils import get_torch_version, is_torch_min_version
 from megatron.training.arguments import (
+    normalize_matrix_and_emerging_optimizer_args,
     validate_depth_mup_optimizer_support,
     validate_muon_scalar_optimizer_support,
     warn_deprecated_mup_aliases,
@@ -375,6 +376,7 @@ def validate_yaml(args, defaults={}):
     #TODO: Added as much of the global initialization requires the model parallel arguments
     args = SimpleNamespace(**args.__dict__, **args.model_parallel.__dict__)
     args = SimpleNamespace(**args.__dict__, **args.language_model.__dict__)
+    normalize_matrix_and_emerging_optimizer_args(args)
     validate_depth_mup_optimizer_support(args)
     validate_muon_scalar_optimizer_support(args)
     warn_deprecated_mup_aliases(args)

@@ -485,6 +485,63 @@ def tuple_type(x):
     assert isinstance(x, str)
     return tuple(int(i) for i in x.strip('()').split(','))
 
+
+def normalize_matrix_and_emerging_optimizer_args(args):
+    """Normalize matrix/emerging optimizer ownership flags after parsing.
+
+    Matrix-owned parameters do not use standard DistributedOptimizer directly.
+    When users request distributed ownership for matrix/Muon optimizers, route
+    it through LayerWise ownership plus a fallback DistributedOptimizer for
+    non-matrix params. This helper is shared by CLI and YAML so both frontends
+    reach the same ``OptimizerConfig``.
+    """
+
+    args.use_layer_wise_distributed_optimizer = False
+    if getattr(args, 'matrix_optimizer', 'none') != 'none' and getattr(
+        args, 'use_distributed_optimizer', False
+    ):
+        args.use_layer_wise_distributed_optimizer = True
+        args.use_distributed_optimizer = False
+
+    if getattr(args, 'optimizer', 'adam') not in ('sgd', 'adam'):
+        if args.optimizer == 'dist_muon':
+            warn_rank_0(
+                "optimizer='dist_muon' is deprecated. "
+                "Use --optimizer muon --use-distributed-optimizer instead."
+            )
+            args.optimizer = 'muon'
+            args.use_layer_wise_distributed_optimizer = True
+
+        if getattr(args, 'use_distributed_optimizer', False):
+            args.use_layer_wise_distributed_optimizer = True
+            args.use_distributed_optimizer = False
+
+        assert not getattr(
+            args, 'use_torch_fsdp2', False
+        ), "Emerging optimizer does not support Torch-FSDP2 for now."
+        assert not getattr(
+            args, 'use_megatron_fsdp', False
+        ), "Emerging optimizer does not support Megatron-FSDP for now."
+        assert getattr(args, 'ckpt_format', 'torch') in [
+            "torch",
+            "torch_dist",
+        ], "Emerging optimizer supports torch and torch_dist checkpoint format."
+
+    if (
+        getattr(args, 'use_layer_wise_distributed_optimizer', False)
+        and not getattr(args, 'use_layer_wise_param_layout', True)
+        and (
+            getattr(args, 'matrix_optimizer', 'none') != 'none'
+            or getattr(args, 'optimizer', 'adam') in ('muon', 'adaptive_muon')
+        )
+    ):
+        raise ValueError(
+            "Matrix/Muon LayerWise + fallback DistributedOptimizer routing requires "
+            "the precomputed LayerWise param layout. Remove "
+            "--no-use-layer-wise-param-layout or disable the distributed split path."
+        )
+
+
 def validate_args(args, defaults={}):
 
     # Prep for checkpoint conversion.
@@ -1636,42 +1693,7 @@ def validate_args(args, defaults={}):
         )
         args.iterations_to_skip.extend(iterations_to_skip_from_file)
 
-    # emerging optimizer check
-    args.use_layer_wise_distributed_optimizer = False
-    if args.matrix_optimizer != 'none' and args.use_distributed_optimizer:
-        # Matrix optimizers use LayerWiseDistributedOptimizer ownership plus a
-        # fallback DistOpt for non-matrix params; this is not standard DistOpt
-        # ownership for the matrix params themselves.
-        args.use_layer_wise_distributed_optimizer = True
-        args.use_distributed_optimizer = False
-
-    if args.optimizer not in ('sgd', 'adam'):
-        if args.optimizer == 'dist_muon':
-            warn_rank_0(
-                "optimizer='dist_muon' is deprecated. "
-                "Use --optimizer muon --use-distributed-optimizer instead."
-            )
-            args.optimizer = 'muon'
-            args.use_layer_wise_distributed_optimizer = True
-
-        if args.use_distributed_optimizer:
-            args.use_layer_wise_distributed_optimizer = True
-            args.use_distributed_optimizer = False
-
-        assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
-        assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
-        assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
-
-    if (
-        args.use_layer_wise_distributed_optimizer
-        and not args.use_layer_wise_param_layout
-        and (args.matrix_optimizer != 'none' or args.optimizer in ('muon', 'adaptive_muon'))
-    ):
-        raise ValueError(
-            "Matrix/Muon LayerWise + fallback DistributedOptimizer routing requires "
-            "the precomputed LayerWise param layout. Remove "
-            "--no-use-layer-wise-param-layout or disable the distributed split path."
-        )
+    normalize_matrix_and_emerging_optimizer_args(args)
 
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
@@ -1816,7 +1838,7 @@ def validate_args(args, defaults={}):
                 or args.matrix_input_preconditioner_min_samples_per_feature is not None
                 or args.matrix_input_preconditioner_block_size != 128
                 or args.matrix_input_preconditioner_ridge != 0.0
-                or args.matrix_input_preconditioner_ema_beta is not None
+                or getattr(args, 'matrix_input_preconditioner_ema_beta', None) is not None
             )
             if inactive_non_default:
                 raise ValueError(
@@ -1833,19 +1855,19 @@ def validate_args(args, defaults={}):
                 or args.matrix_output_preconditioner_min_samples_per_feature is not None
                 or args.matrix_output_preconditioner_block_size != 128
                 or args.matrix_output_preconditioner_ridge != 0.0
-                or args.matrix_output_preconditioner_ema_beta is not None
+                or getattr(args, 'matrix_output_preconditioner_ema_beta', None) is not None
             )
             if inactive_non_default:
                 raise ValueError(
                     "matrix-output-preconditioner-specific options require "
                     "matrix-output-preconditioner=grad_gram"
                 )
-        if args.matrix_input_preconditioner_ema_beta is not None:
+        if getattr(args, 'matrix_input_preconditioner_ema_beta', None) is not None:
             raise ValueError(
                 "matrix-input-preconditioner-ema-beta requires persistent input preconditioner state; "
                 "use None in this checkout."
             )
-        if args.matrix_output_preconditioner_ema_beta is not None:
+        if getattr(args, 'matrix_output_preconditioner_ema_beta', None) is not None:
             raise ValueError(
                 "matrix-output-preconditioner-ema-beta requires persistent output preconditioner state; "
                 "use None in this checkout."
@@ -2534,7 +2556,7 @@ def _add_regularization_args(parser):
                        '--muon-scale-mode unit_rms_norm to use unit_rms_norm scaling, '
                        'or set --muon-scale-mode spectral to keep spectral scaling.')
     group.add_argument('--muon-fp32-matmul-prec', type=str, default='medium',
-                       choices=['low', 'medium', 'high'],
+                       choices=['highest', 'high', 'medium'],
                        help='FP32 matmul precision for Newton-Schulz iteration')
     group.add_argument('--muon-coefficient-type', type=str, default='quintic',
                        help='Newton-Schulz coefficient type for the Muon optimizer. '
@@ -2545,7 +2567,7 @@ def _add_regularization_args(parser):
                        help='Number of Newton-Schulz steps for Muon optimizer')
     group.add_argument('--muon-ns-coefficients', type=str, default='quintic',
                        choices=['simple', 'quintic', 'polar_express', 'cans', 'aol'],
-                       help='Coefficient set for Newton-Schulz iteration.')
+                       help='Deprecated alias for --muon-coefficient-type.')
     group.add_argument('--muon-tp-mode', type=str, default='blockwise',
                        choices=['blockwise', 'duplicated', 'distributed'],
                        help='How to perform NS calculation for tensor model parallel weights')
@@ -2610,15 +2632,11 @@ def _add_regularization_args(parser):
                        help='Default ridge for matrix optimizer rules consuming an input preconditioner.')
     group.add_argument('--matrix-output-preconditioner-ridge', type=float, default=0.0,
                        help='Default ridge for matrix optimizer rules consuming an output preconditioner.')
-    group.add_argument('--matrix-input-preconditioner-ema-beta', type=float, default=None,
-                       help='Optional EMA coefficient for persistent input preconditioner estimates.')
-    group.add_argument('--matrix-output-preconditioner-ema-beta', type=float, default=None,
-                       help='Optional EMA coefficient for persistent output preconditioner estimates.')
     group.add_argument('--matrix-tp-update-mode', type=str, default='allgather',
                        choices=['allgather', 'small_gram_polar', 'block_local'],
                        help='Tensor-parallel matrix update apply mode.')
     group.add_argument('--matrix-bias-mode', type=str, default='fallback',
-                       choices=['fallback', 'augmented_feature_sum'],
+                       choices=['fallback'],
                        help='Bias handling for matrix optimizers.')
 
     group.add_argument('--no-weight-decay-cond-type', type=str, choices=['apply_wd_to_qk_layernorm'],

@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -44,6 +46,7 @@ from megatron.core.optimizer.matrix_update import (
     set_linear_weight_info,
     set_matrix_optimizer_info,
 )
+from megatron.training.arguments import normalize_matrix_and_emerging_optimizer_args
 
 
 def _param_with_info(tp_layout="column_parallel", shape=(4, 3), logical_shape=None):
@@ -668,12 +671,13 @@ def test_matrix_optimizer_split_routes_fallback_to_standard_distopt(monkeypatch)
     param_group_calls = []
     fallback_calls = []
 
-    def fake_get_param_groups(model_chunks, config, config_overrides=None):
+    def fake_get_param_groups(model_chunks, config, config_overrides=None, param_filter=None):
         trainable = [
             param
             for model_chunk in model_chunks
-            for _, param in model_chunk.named_parameters()
+            for name, param in model_chunk.named_parameters()
             if param.requires_grad
+            and (param_filter is None or param_filter(name, param))
         ]
         param_group_calls.append(
             {
@@ -771,6 +775,38 @@ def test_matrix_optimizer_split_routes_fallback_to_standard_distopt(monkeypatch)
     assert config.matrix_optimizer == "muon"
     assert matrix_param.requires_grad
     assert fallback_param.requires_grad
+
+
+def test_matrix_function_optimizer_state_dict_preserves_refresh_cadence():
+    param = _param_with_info()
+
+    def update_rule(grad, feature_gram, grad_gram, model_param):
+        return -grad
+
+    opt = MatrixFunctionOptimizer([param], lr=0.1, update_rule=update_rule)
+    opt._matrix_step = 7
+
+    reloaded = MatrixFunctionOptimizer([param], lr=0.1, update_rule=update_rule)
+    reloaded.load_state_dict(opt.state_dict())
+
+    assert reloaded._matrix_step == 7
+
+
+def test_matrix_optimizer_normalization_matches_yaml_and_cli_path():
+    args = SimpleNamespace(
+        matrix_optimizer="muon",
+        optimizer="adam",
+        use_distributed_optimizer=True,
+        use_layer_wise_param_layout=True,
+        use_torch_fsdp2=False,
+        use_megatron_fsdp=False,
+        ckpt_format="torch_dist",
+    )
+
+    normalize_matrix_and_emerging_optimizer_args(args)
+
+    assert args.use_layer_wise_distributed_optimizer
+    assert not args.use_distributed_optimizer
 
 
 def test_fp8_dequant_source_fails_closed_in_native_collector():
@@ -1190,7 +1226,7 @@ def test_matrix_update_rule_small_gram_muon_honors_ns_config(monkeypatch):
         matrix_optimizer="muon",
         matrix_tp_update_mode="small_gram_polar",
         muon_num_ns_steps=7,
-        muon_ns_coefficients="polar_express",
+        muon_coefficient_type="polar_express",
         muon_scale_mode="unit_rms_norm",
     )
     calls = []
@@ -1394,7 +1430,7 @@ def test_matrix_inplace_update_rule_uses_diag_muon_for_local_matrix(monkeypatch)
         matrix_input_preconditioner_approximation="diag",
         matrix_input_preconditioner_ridge=1.0,
         muon_num_ns_steps=2,
-        muon_ns_coefficients="simple",
+        muon_coefficient_type="simple",
         muon_scale_mode="unit_rms_norm",
         muon_extra_scale_factor=0.5,
         muon_fp32_matmul_prec="highest",
@@ -1585,10 +1621,18 @@ def test_optimizer_config_rejects_unimplemented_active_matrix_options():
         OptimizerConfig(matrix_optimizer="muon", matrix_output_preconditioner="grad_gram", matrix_output_preconditioner_ema_beta=0.9)
 
 
-def test_optimizer_config_exposes_muon_ns_coefficients():
+def test_optimizer_config_maps_deprecated_muon_ns_coefficients_alias():
     config = OptimizerConfig(matrix_optimizer="muon", muon_ns_coefficients="simple")
 
     assert config.muon_ns_coefficients == "simple"
+    assert config.muon_coefficient_type == "simple"
+
+    with pytest.raises(ValueError, match="deprecated alias"):
+        OptimizerConfig(
+            matrix_optimizer="muon",
+            muon_coefficient_type="simple",
+            muon_ns_coefficients="polar_express",
+        )
 
 
 def test_matrix_update_family_rejects_optimizer_variants():
