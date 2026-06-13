@@ -554,8 +554,7 @@ def get_megatron_matrix_optimizer(
             pg_collection=pg_collection,
             skip_megatron_wrapping=False,
         )
-        if hasattr(fallback_optimizer, 'config'):
-            fallback_optimizer.config = config
+        setattr(fallback_optimizer, '_chained_optimizer_config', config)
     else:
         fallback_optimizer = _get_megatron_optimizer_based_on_param_groups(
             config=fallback_config,

@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +11,7 @@ from megatron.core.optimizer.matrix_function_optimizer import (
     MatrixFunctionOptimizer,
     default_matrix_apply_plan,
 )
+from megatron.core.optimizer.optimizer import ChainedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import tag_params_for_buffer_routing
 from megatron.core.optimizer.matrix_update import (
     MATRIX_OPTIMIZER_OWNER_FALLBACK,
@@ -804,9 +806,32 @@ def test_matrix_optimizer_split_routes_fallback_to_standard_distopt(monkeypatch)
     assert param_group_calls[1]["matrix_optimizer"] == "none"
     assert fallback_calls[0].use_distributed_optimizer
     assert not fallback_calls[0].use_layer_wise_distributed_optimizer
+    assert optimizer.chained_optimizers[1].config.matrix_optimizer == "none"
+    assert optimizer.chained_optimizers[1]._chained_optimizer_config is config
     assert config.matrix_optimizer == "muon"
     assert matrix_param.requires_grad
     assert fallback_param.requires_grad
+
+
+def test_chained_optimizer_uses_explicit_chain_config_without_mutating_child_configs():
+    top_config = OptimizerConfig(optimizer="adam", lr=1e-3, matrix_optimizer="muon")
+    child_config = copy.copy(top_config)
+    child_config.matrix_optimizer = "none"
+
+    class FakeOptimizer:
+        def __init__(self, config):
+            self.config = config
+            self._chained_optimizer_config = top_config
+
+    first = FakeOptimizer(top_config)
+    second = FakeOptimizer(child_config)
+
+    optimizer = ChainedOptimizer([first, second])
+
+    assert optimizer.config is top_config
+    assert first.config is top_config
+    assert second.config is child_config
+    assert second.config.matrix_optimizer == "none"
 
 
 def test_matrix_optimizer_split_rejects_expert_parallel_fallback(monkeypatch):

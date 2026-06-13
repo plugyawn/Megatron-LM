@@ -1140,13 +1140,20 @@ class ChainedOptimizer(MegatronOptimizer):
         # chained_optimizers would be empty in the case that a rank
         # has no trainable parameters
         if chained_optimizers:
-            self.config = getattr(chained_optimizers[0], 'config', None)
+            self.config = getattr(
+                chained_optimizers[0],
+                '_chained_optimizer_config',
+                getattr(chained_optimizers[0], 'config', None),
+            )
             for optimizer in chained_optimizers:
                 if hasattr(optimizer, 'model_chunks'):
                     for model_chunk in optimizer.model_chunks:
                         if model_chunk not in self.model_chunks:
                             self.model_chunks.append(model_chunk)
-                assert self.config == getattr(optimizer, 'config', None)
+                optimizer_chain_config = getattr(
+                    optimizer, '_chained_optimizer_config', getattr(optimizer, 'config', None)
+                )
+                assert self.config == optimizer_chain_config
             # If all optimizers are stub optimizers, the ChainedOptimizer is also a stub optimizer
             self.is_stub_optimizer = all(
                 getattr(optimizer, 'is_stub_optimizer', False) for optimizer in chained_optimizers

@@ -1038,11 +1038,7 @@ def _get_megatron_emerging_optimizer(
                     pg_collection=pg_collection,
                     skip_megatron_wrapping=False,
                 )
-                # TODO(deyuf): ChainedOptimizer currently asserts all sub-optimizers
-                # share the same config. Reset to the top-level config so the
-                # assertion holds when DistOpt+LayerWise are chained.
-                if hasattr(result, 'config'):
-                    result.config = config
+                setattr(result, '_chained_optimizer_config', config)
                 results.append(result)
             else:
                 # Legacy ping-pong layer-wise path (use_layer_wise=True) or the
@@ -1062,8 +1058,7 @@ def _get_megatron_emerging_optimizer(
                 if use_layer_wise:
                     layer_wise_base_results.append(result)
                 else:
-                    if hasattr(result, 'config'):
-                        result.config = config
+                    setattr(result, '_chained_optimizer_config', config)
                     results.append(result)
 
     if use_layer_wise:
