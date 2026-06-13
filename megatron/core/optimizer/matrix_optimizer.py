@@ -26,7 +26,6 @@ from megatron.core.matrix_update import (
     TPUpdateMode,
     configure_model_matrix_updates,
     get_matrix_optimizer_info,
-    get_matrix_optimizer_state_spec,
     get_matrix_shard_spec,
     matrix_update_family_from_optimizer_name,
     matrix_small_gram_side_for_spec,
@@ -328,13 +327,6 @@ class MegatronFSDPOptimizer(MegatronOptimizer):
         local_param = self._local_param_tensor(param)
         return torch.tensor(0.0, dtype=torch.float32, device=local_param.device)
 
-    def _matrix_state_placeholder_dtype(
-        self, param: torch.Tensor, state_name: str
-    ) -> Optional[torch.dtype]:
-        if state_name == "master_param":
-            return self.config.main_params_dtype
-        return self._local_param_tensor(param).dtype
-
     def _load_state_placeholders_for_param(self, param: torch.Tensor, group: dict) -> dict:
         placeholders = {}
         if "betas" in group:
@@ -351,16 +343,6 @@ class MegatronFSDPOptimizer(MegatronOptimizer):
                 )
         elif float(group.get("momentum", 0.0) or 0.0) != 0.0:
             placeholders["momentum_buffer"] = self._state_tensor_placeholder_like_param(param)
-
-        state_spec = get_matrix_optimizer_state_spec(param)
-        if state_spec is not None:
-            for state_name in state_spec.same_shard_state_names:
-                placeholders.setdefault(
-                    state_name,
-                    self._state_tensor_placeholder_like_param(
-                        param, dtype=self._matrix_state_placeholder_dtype(param, state_name)
-                    ),
-                )
         return placeholders
 
     def _add_load_state_placeholders(self, packed_state: dict) -> None:
