@@ -2007,10 +2007,27 @@ def setup_model_and_optimizer(
                 config_overrides = {**(config_overrides or {}), **scaling_overrides}
 
         if config.matrix_optimizer != 'none':
+            matrix_config_overrides = config_overrides
+            if scaling_policy.enabled:
+                matrix_scaling_policy = build_training_scaling_policy(
+                    model_config, optimizer_type=config.matrix_optimizer
+                )
+                matrix_config_overrides = get_standard_config_overrides(
+                    config=config, scaling_policy=matrix_scaling_policy
+                )
+                matrix_scaling_overrides = get_scaling_config_overrides(
+                    config=config, scaling_policy=matrix_scaling_policy
+                )
+                if matrix_scaling_overrides:
+                    matrix_config_overrides = {
+                        **(matrix_config_overrides or {}),
+                        **matrix_scaling_overrides,
+                    }
             optimizer = get_megatron_matrix_optimizer(
                 config,
                 model,
                 config_overrides=config_overrides,
+                matrix_config_overrides=matrix_config_overrides,
                 use_gloo_process_groups=args.use_gloo_process_groups,
             )
         else:

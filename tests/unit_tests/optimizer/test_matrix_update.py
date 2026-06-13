@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.optimizer import OptimizerConfig
+from megatron.core.optimizer import OptimizerConfig, ParamKey
 from megatron.core.optimizer.matrix_function_optimizer import (
     MatrixFunctionOptimizer,
     default_matrix_apply_plan,
@@ -683,6 +683,20 @@ def test_layerwise_routing_does_not_give_adaptive_muon_muon_state_contract():
     assert get_matrix_shard_spec(module.weight) is None
 
 
+def test_matrix_function_muon_metadata_counts_as_muon_managed_for_scaling():
+    from megatron.core.parameterization.roles import is_muon_managed_matrix_parameter
+
+    param = _param_with_info(shape=(6, 4))
+    set_matrix_optimizer_info(
+        param,
+        owner=MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
+        update_family="muon",
+        requires_layerwise_layout=False,
+    )
+
+    assert is_muon_managed_matrix_parameter(param, optimizer_type="muon")
+
+
 def test_matrix_optimizer_split_routes_fallback_to_standard_distopt(monkeypatch):
     import copy
     import types
@@ -740,6 +754,7 @@ def test_matrix_optimizer_split_routes_fallback_to_standard_distopt(monkeypatch)
                 "use_distributed_optimizer": config.use_distributed_optimizer,
                 "use_layer_wise_distributed_optimizer": config.use_layer_wise_distributed_optimizer,
                 "matrix_optimizer": config.matrix_optimizer,
+                "config_overrides": config_overrides,
             }
         )
         return [{"params": trainable}]
@@ -809,19 +824,25 @@ def test_matrix_optimizer_split_routes_fallback_to_standard_distopt(monkeypatch)
         use_distributed_optimizer=False,
         use_layer_wise_distributed_optimizer=True,
     )
+    fallback_overrides = {ParamKey(name="fallback"): {"max_lr": 1e-3}}
+    matrix_overrides = {ParamKey(name="matrix"): {"max_lr": 2e-3}}
     pg_collection = types.SimpleNamespace(dp_cp=object())
 
     optimizer = matrix_optimizer_module.get_megatron_matrix_optimizer(
         config,
         [DummyModel()],
+        config_overrides=fallback_overrides,
+        matrix_config_overrides=matrix_overrides,
         pg_collection=pg_collection,
     )
 
     assert isinstance(optimizer, FakeChainedOptimizer)
     assert param_group_calls[0]["params"] == [matrix_param]
     assert param_group_calls[0]["matrix_optimizer"] == "muon"
+    assert param_group_calls[0]["config_overrides"] is matrix_overrides
     assert param_group_calls[1]["params"] == [fallback_param]
     assert param_group_calls[1]["matrix_optimizer"] == "none"
+    assert param_group_calls[1]["config_overrides"] is fallback_overrides
     assert fallback_calls[0].use_distributed_optimizer
     assert not fallback_calls[0].use_layer_wise_distributed_optimizer
     assert optimizer.chained_optimizers[1].config.matrix_optimizer == "none"

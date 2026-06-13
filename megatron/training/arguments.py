@@ -313,6 +313,12 @@ def validate_depth_mup_optimizer_support(args) -> None:
             "SGD depth-mup requires explicit hidden-weight, hidden-bias, norm/vector, "
             "and input/output-bias rules and is intentionally out of scope for v1."
         )
+    if _resolve_validation_attr(args, 'matrix_optimizer') not in (None, 'none'):
+        raise ValueError(
+            "scaling_recipe='depth_mup' does not yet support matrix_optimizer. "
+            "Matrix-function update rules need explicit depth-scaling semantics before "
+            "this combination can be enabled."
+        )
 
     weight_decay = _resolve_validation_attr(args, 'weight_decay')
     decoupled_weight_decay = _resolve_validation_attr(args, 'decoupled_weight_decay')

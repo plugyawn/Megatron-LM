@@ -334,6 +334,18 @@ class TestMuPConfigValidation:
                 mtp_num_layers=1,
             )
 
+    def test_depth_mup_rejects_matrix_optimizer(self):
+        with pytest.raises(ValueError, match="matrix_optimizer"):
+            validate_depth_mup_optimizer_support(
+                SimpleNamespace(
+                    scaling_recipe='depth_mup',
+                    optimizer='adam',
+                    matrix_optimizer='muon',
+                    weight_decay=0.0,
+                    decoupled_weight_decay=True,
+                )
+            )
+
     def test_muon_scalar_optimizer_gate_rejects_invalid_yaml_value(self):
         with pytest.raises(ValueError, match='muon_scalar_optimizer'):
             validate_muon_scalar_optimizer_support(

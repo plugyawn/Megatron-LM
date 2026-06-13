@@ -427,6 +427,7 @@ def get_megatron_matrix_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
     config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = None,
+    matrix_config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = None,
     use_gloo_process_groups: bool = True,
     pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> MegatronOptimizer:
@@ -480,7 +481,10 @@ def get_megatron_matrix_optimizer(
         return id(param) not in matrix_param_ids
 
     matrix_param_groups = _get_param_groups(
-        model_chunks, config, config_overrides, param_filter=is_matrix_param
+        model_chunks,
+        config,
+        matrix_config_overrides if matrix_config_overrides is not None else config_overrides,
+        param_filter=is_matrix_param,
     )
 
     use_layer_wise = config.use_layer_wise_distributed_optimizer
