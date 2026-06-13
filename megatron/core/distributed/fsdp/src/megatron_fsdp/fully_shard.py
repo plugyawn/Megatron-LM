@@ -413,6 +413,61 @@ def _optimizer_param_state_indices(optimizer: torch.optim.Optimizer) -> dict:
     return param_state_idx
 
 
+def _megatron_fsdp_model_from_optimizer_params(
+    optimizer: torch.optim.Optimizer,
+) -> Optional[MegatronFSDP]:
+    """Return the single MegatronFSDP owner attached to optimizer parameters."""
+
+    mfsdp_model = None
+    for param_group in optimizer.param_groups:
+        for param in param_group.get("params", []):
+            candidate = getattr(param, "_megatron_fsdp_model", None)
+            if candidate is None:
+                continue
+            if mfsdp_model is not None and candidate is not mfsdp_model:
+                raise RuntimeError(
+                    "[MegatronFSDP] Optimizer state spans multiple MegatronFSDP "
+                    "owners; matrix optimizer checkpoint metadata requires a single "
+                    "owner for stable parameter identities."
+                )
+            mfsdp_model = candidate
+    return mfsdp_model
+
+
+def _matrix_optimizer_checkpoint_state_dict_for_validation(
+    optimizer: torch.optim.Optimizer,
+    state_dict: dict,
+    param_name_fn: Optional[Callable[[torch.nn.Parameter], str]] = None,
+) -> dict:
+    """Return an index-keyed state-dict view for matrix checkpoint validation.
+
+    Megatron's production FSDP-DTensor optimizer checkpoint stores tensor state
+    under stable parameter names, while PyTorch optimizer state dicts and the
+    matrix metadata block use optimizer param-order indices. This helper keeps
+    the checkpoint format unchanged and builds only the validation view needed
+    by ``_validate_matrix_optimizer_checkpoint_metadata``.
+    """
+
+    loaded_state = state_dict.get("state", {})
+    normalized_state = {}
+    param_state_indices = _optimizer_param_state_indices(optimizer)
+    for param_group in optimizer.param_groups:
+        for param in param_group["params"]:
+            param_idx = param_state_indices[id(param)]
+            candidate_keys = []
+            if param_name_fn is not None:
+                candidate_keys.append(param_name_fn(param))
+            candidate_keys.extend((param_idx, str(param_idx)))
+            for state_key in candidate_keys:
+                if state_key in loaded_state:
+                    normalized_state[param_idx] = loaded_state[state_key]
+                    break
+
+    validation_state_dict = dict(state_dict)
+    validation_state_dict["state"] = normalized_state
+    return validation_state_dict
+
+
 def _matrix_state_tensor_matches_param_shape(state_value: torch.Tensor, param: DTensor) -> bool:
     state_shape = tuple(state_value.shape)
     param_global_shape = tuple(param.shape)

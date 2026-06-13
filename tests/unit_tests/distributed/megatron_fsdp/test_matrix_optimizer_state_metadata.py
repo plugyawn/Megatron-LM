@@ -10,6 +10,7 @@ fully_shard_module = importlib.import_module(
     "megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard"
 )
 import megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer as param_buffer_module
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
     Bucket,
     BucketingPolicy,
@@ -71,6 +72,15 @@ def _fake_mfsdp_model():
     bucketing_policy = SimpleNamespace(data_parallel_sharding_strategy="optim")
     param_and_grad_buffer = SimpleNamespace(bucketing_policy=bucketing_policy, param_to_name={})
     return SimpleNamespace(param_and_grad_buffer=param_and_grad_buffer)
+
+
+def _fake_distributed_optimizer(param, optimizer):
+    distopt = object.__new__(DistributedOptimizer)
+    distopt.ddp_config = SimpleNamespace(use_megatron_fsdp=True)
+    distopt.optimizer = optimizer
+    distopt.model_chunks = []
+    distopt.param_to_name = {param: param.megatron_fsdp_param_name}
+    return distopt
 
 
 def _matrix_param(shape=(2, 3), name="layers.0.weight"):
@@ -502,6 +512,43 @@ def test_matrix_optimizer_checkpoint_metadata_records_master_param_state(monkeyp
     fully_shard_module._validate_matrix_optimizer_checkpoint_metadata(
         optimizer, _fake_mfsdp_model(), load_state_dict
     )
+
+
+def test_distributed_optimizer_fsdp_dtensor_state_records_matrix_metadata(monkeypatch):
+    monkeypatch.setattr(fully_shard_module, "DTensor", _FakeDTensor)
+    param = _matrix_param()
+    param._megatron_fsdp_model = _fake_mfsdp_model()
+    optimizer = torch.optim.SGD([param], lr=0.1)
+    optimizer.state[param]["momentum_buffer"] = _fake_dtensor_state()
+    distopt = _fake_distributed_optimizer(param, optimizer)
+
+    state_dict = distopt.sharded_param_state_fsdp_dtensor()
+
+    metadata_key = fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_KEY
+    assert "layers.0.weight" in state_dict["state"]
+    assert metadata_key in state_dict
+    metadata = state_dict[metadata_key]["params"]["0"]
+    assert metadata["param_identity"] == "layers.0.weight"
+    assert metadata["same_shard_state_names"] == ["momentum_buffer"]
+    assert metadata["declared_same_shard_state_names"] == [
+        "master_param",
+        "momentum_buffer",
+    ]
+
+
+def test_distributed_optimizer_fsdp_dtensor_load_validates_matrix_metadata(monkeypatch):
+    monkeypatch.setattr(fully_shard_module, "DTensor", _FakeDTensor)
+    param = _matrix_param()
+    param._megatron_fsdp_model = _fake_mfsdp_model()
+    optimizer = torch.optim.SGD([param], lr=0.1)
+    optimizer.state[param]["momentum_buffer"] = _fake_dtensor_state()
+    distopt = _fake_distributed_optimizer(param, optimizer)
+    state_dict = distopt.sharded_param_state_fsdp_dtensor()
+    metadata_key = fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_KEY
+    state_dict[metadata_key]["params"]["0"]["owner"] = "fallback"
+
+    with pytest.raises(RuntimeError, match="checkpoint owner does not match"):
+        distopt.load_state_dict(state_dict)
 
 
 def test_matrix_optimizer_checkpoint_rejects_shard_spec_mismatch(monkeypatch):

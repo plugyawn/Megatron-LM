@@ -874,6 +874,21 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.ddp_config.use_megatron_fsdp:
             # When using Megatron-FSDP, directly load the optimizer state
             # into the wrapped optimizer.
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
+                _matrix_optimizer_checkpoint_state_dict_for_validation,
+                _megatron_fsdp_model_from_optimizer_params,
+                _validate_matrix_optimizer_checkpoint_metadata,
+            )
+
+            mfsdp_model = _megatron_fsdp_model_from_optimizer_params(self.optimizer)
+            if mfsdp_model is not None:
+                _validate_matrix_optimizer_checkpoint_metadata(
+                    self.optimizer,
+                    mfsdp_model,
+                    _matrix_optimizer_checkpoint_state_dict_for_validation(
+                        self.optimizer, state_dict, self._param_name
+                    ),
+                )
             if "param_to_group_meta" in state_dict:
                 state_dict["param_groups"] = self._param2group_meta_to_param_groups(
                     state_dict["param_to_group_meta"], self.optimizer.param_groups
@@ -1586,6 +1601,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         }
 
         state_dict = {"state": packed_state, "param_to_group_meta": param_to_group_meta}
+        if not is_loading:
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
+                _add_matrix_optimizer_checkpoint_metadata,
+                _megatron_fsdp_model_from_optimizer_params,
+            )
+
+            mfsdp_model = _megatron_fsdp_model_from_optimizer_params(self.optimizer)
+            if mfsdp_model is not None:
+                _add_matrix_optimizer_checkpoint_metadata(self.optimizer, mfsdp_model, state_dict)
         return state_dict
 
     def sharded_param_state_dp_zero(
