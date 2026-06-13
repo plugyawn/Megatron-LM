@@ -1693,6 +1693,26 @@ class DataParallelBuffer:
         # corresponding to the process / rank of this buffer.
         return self.data[index.local_data_index : index.local_data_index + index.size]
 
+    def refresh_matrix_axis_params_from_bucket(self, bucket: Bucket) -> None:
+        """Refresh column-axis matrix parameter workspaces from an all-gathered bucket.
+
+        Row-axis matrix parameters are backed directly by row-major bucket views.
+        Column-axis matrix parameters require unpacking from the column-contiguous
+        gathered bucket into an owned row-major parameter workspace after the
+        all-gather has completed.
+        """
+
+        for item_id, param in enumerate(self.params):
+            matrix_shard_plan = self._get_matrix_fsdp_shard_plan_for_item(item_id)
+            if matrix_shard_plan is None or matrix_shard_plan.dp_shard_axis == 0:
+                continue
+            param_local = to_local_if_dtensor(param)
+            unpacked_item = self.get_item_from_bucket(bucket, item_id).view(param_local.shape)
+            if is_float8tensor(param_local):
+                fp8_get_raw_data(param_local, self.is_transpose_buffer).copy_(unpacked_item)
+            else:
+                param_local.data.copy_(unpacked_item)
+
 
 @dataclasses.dataclass
 class ParameterGroup:
@@ -4751,15 +4771,16 @@ class AllGatherPipeline:
             async_op=True,
         )
 
-        def get_closure(bucket_id, bwd):
+        def get_closure(bucket_id, bwd, wbuf, bucket):
             @torch.no_grad()
             def mark_bucket_ready_to_use():
+                wbuf.refresh_matrix_axis_params_from_bucket(bucket)
                 # Mark the bucket as ready to use - all NCCL operations are complete.
                 self.bucket_status[self.get_bucket_key(bucket_id, bwd)] = BucketStatus.READY_TO_USE
 
             return mark_bucket_ready_to_use
 
-        mark_bucket_ready_to_use = get_closure(bucket_id, bwd)
+        mark_bucket_ready_to_use = get_closure(bucket_id, bwd, wbuf, bucket)
 
         # Track the async all-gather operation for the bucket.
         self.param_gather_event_map[self.get_bucket_key(bucket_id, bwd)] = (
