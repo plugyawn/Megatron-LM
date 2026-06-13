@@ -40,6 +40,19 @@ class _ToyMatrixModel(torch.nn.Module):
         return self.linear(x)
 
 
+class _SGDWithMasterParamState(torch.optim.SGD):
+    """SGD test optimizer that materializes a same-shard master-param state."""
+
+    def step(self, *args, **kwargs):
+        result = super().step(*args, **kwargs)
+        for group in self.param_groups:
+            for param in group["params"]:
+                state = self.state.get(param)
+                if state is not None and "momentum_buffer" in state:
+                    state["master_param"] = param.detach().clone()
+        return result
+
+
 @pytest.fixture(scope="module")
 def distributed_cuda_setup():
     if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
@@ -101,7 +114,7 @@ def test_matrix_optimizer_owned_param_state_checkpoint_contract(distributed_cuda
         disable_bucketing=True,
     )
     optimizer = fully_shard_optimizer(
-        torch.optim.SGD(mfsdp_model.parameters(), lr=0.01, momentum=0.9)
+        _SGDWithMasterParamState(mfsdp_model.parameters(), lr=0.01, momentum=0.9)
     )
 
     matrix_params = [
@@ -125,8 +138,11 @@ def test_matrix_optimizer_owned_param_state_checkpoint_contract(distributed_cuda
 
     state = optimizer.state[matrix_param]
     assert isinstance(state["momentum_buffer"], DTensor)
+    assert isinstance(state["master_param"], DTensor)
     assert get_matrix_shard_spec(state["momentum_buffer"]) == matrix_spec
+    assert get_matrix_shard_spec(state["master_param"]) == matrix_spec
     saved_momentum_local = state["momentum_buffer"].to_local().detach().clone()
+    saved_master_param_local = state["master_param"].to_local().detach().clone()
 
     state_dict = optimizer.state_dict()
     metadata_block = state_dict[MATRIX_OPTIMIZER_STATE_METADATA_KEY]
@@ -134,17 +150,22 @@ def test_matrix_optimizer_owned_param_state_checkpoint_contract(distributed_cuda
     assert metadata["owner"] == "muon"
     assert metadata["update_family"] == "muon"
     assert metadata["matrix_shard_contract"]["dp_shard_axis"] == 0
-    assert metadata["same_shard_state_names"] == ["momentum_buffer"]
+    assert metadata["same_shard_state_names"] == ["master_param", "momentum_buffer"]
 
     reloaded_optimizer = fully_shard_optimizer(
-        torch.optim.SGD(mfsdp_model.parameters(), lr=0.01, momentum=0.9)
+        _SGDWithMasterParamState(mfsdp_model.parameters(), lr=0.01, momentum=0.9)
     )
     reloaded_optimizer.load_state_dict(state_dict)
     reloaded_state = reloaded_optimizer.state[matrix_param]
     assert isinstance(reloaded_state["momentum_buffer"], DTensor)
+    assert isinstance(reloaded_state["master_param"], DTensor)
     assert get_matrix_shard_spec(reloaded_state["momentum_buffer"]) == matrix_spec
+    assert get_matrix_shard_spec(reloaded_state["master_param"]) == matrix_spec
     torch.testing.assert_close(
         reloaded_state["momentum_buffer"].to_local(), saved_momentum_local
+    )
+    torch.testing.assert_close(
+        reloaded_state["master_param"].to_local(), saved_master_param_local
     )
     dist.barrier()
 
