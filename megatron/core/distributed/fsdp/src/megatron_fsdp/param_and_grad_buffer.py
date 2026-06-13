@@ -5271,12 +5271,12 @@ def make_fsdp_dtensor(
         stride=param.stride(),
     )
 
-    if run_check:
-        validate_uneven_dtensor(fsdp_tensor)
-
     # Update metadata if uneven sharding is expected
     if update_uneven_dtensor_chunk_meta:
         update_uneven_dtensor_chunk_metadata(fsdp_tensor)
+
+    if run_check:
+        validate_uneven_dtensor(fsdp_tensor)
 
     if HAVE_MCORE_MATRIX_UPDATE:
         matrix_optimizer_info = get_matrix_optimizer_info(orig_param)
