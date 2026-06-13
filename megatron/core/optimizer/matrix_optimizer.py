@@ -191,10 +191,13 @@ def _make_matrix_inplace_update_rule(
 ):
     """Return an optional fused in-place update rule for cheap diagonal cases.
 
-    Only diagonal input/output preconditioners are eligible for the EO fused
-    in-place/Triton helpers. Full and block-diagonal Grams intentionally fall
-    back to the generic update rule, where the cached factorized solve path
-    preserves the supported math without implying a Triton Gram-solve
+    For SGD-style matrix updates, diagonal input, output, and two-sided
+    preconditioners are eligible for the EO fused in-place/Triton helpers. For
+    Muon, only the diagonal input-side FEATURE_GRAM path uses the fused
+    Newton-Muon helper today; output-side or two-sided Muon preconditioning
+    intentionally falls back to the generic update rule. Full and block-diagonal
+    Grams also fall back to the generic rule, where the cached factorized solve
+    path preserves the supported math without implying a Triton Gram-solve
     implementation.
     """
 
