@@ -815,9 +815,12 @@ def create_updated_function_signature(original_function, **extended_kwargs: dict
     # Get the original function signature.
     params = list(inspect.signature(original_function).parameters.values())
 
-    # Add new keyword-only parameters
+    # Add new keyword-only parameters.  If the original signature already has
+    # **kwargs, keyword-only parameters must be inserted before it; appending
+    # after VAR_KEYWORD creates an invalid Python signature.
+    new_params = []
     for name, value in extended_kwargs.items():
-        params.append(
+        new_params.append(
             inspect.Parameter(
                 name,
                 kind=inspect.Parameter.KEYWORD_ONLY,
@@ -825,6 +828,18 @@ def create_updated_function_signature(original_function, **extended_kwargs: dict
                 annotation=(type(value) if value is not None else inspect.Parameter.empty),
             )
         )
+    var_keyword_index = next(
+        (
+            index
+            for index, param in enumerate(params)
+            if param.kind == inspect.Parameter.VAR_KEYWORD
+        ),
+        None,
+    )
+    if var_keyword_index is None:
+        params.extend(new_params)
+    else:
+        params[var_keyword_index:var_keyword_index] = new_params
 
     # Return the updated function signature.
     return inspect.Signature(params)
