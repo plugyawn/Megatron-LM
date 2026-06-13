@@ -588,6 +588,30 @@ def test_megatron_fsdp_optimizer_loading_schema_does_not_step(monkeypatch):
     assert "momentum_buffer" in state_dict["state"]["param0"]
 
 
+def test_distributed_optimizer_fsdp_dtensor_loading_schema_does_not_step():
+    class _StepCountingSGD(torch.optim.SGD):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.step_calls = 0
+
+        def step(self, *args, **kwargs):
+            self.step_calls += 1
+            return super().step(*args, **kwargs)
+
+    param = torch.nn.Parameter(torch.ones(2, 3))
+    param.megatron_fsdp_param_name = "param0"
+    optimizer = _StepCountingSGD([param], lr=0.1, momentum=0.9, weight_decay=0.1)
+    distopt = _fake_distributed_optimizer(param, optimizer)
+    param_before = param.detach().clone()
+
+    state_dict = distopt.sharded_param_state_fsdp_dtensor(is_loading=True)
+
+    assert optimizer.step_calls == 0
+    assert optimizer.state == {}
+    torch.testing.assert_close(param, param_before)
+    assert "momentum_buffer" in state_dict["state"]["param0"]
+
+
 def test_matrix_optimizer_checkpoint_metadata_records_master_param_state(monkeypatch):
     monkeypatch.setattr(fully_shard_module, "DTensor", _FakeDTensor)
     param = _matrix_param()

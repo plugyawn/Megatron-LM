@@ -1579,6 +1579,81 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             new_param_groups.append(new_group)
         return new_param_groups
 
+    def _local_param_tensor_for_fsdp_dtensor_state(self, param: torch.Tensor) -> torch.Tensor:
+        try:
+            from torch.distributed.tensor import DTensor
+        except ImportError:
+            DTensor = None
+        if DTensor is not None and isinstance(param, DTensor):
+            return param.to_local()
+        return getattr(param, "_local_tensor", param)
+
+    def _state_tensor_placeholder_like_fsdp_dtensor_param(
+        self, param: torch.Tensor, *, dtype: Optional[torch.dtype] = None
+    ) -> torch.Tensor:
+        try:
+            from torch.distributed.tensor import DTensor
+        except ImportError:
+            DTensor = None
+        local_param = self._local_param_tensor_for_fsdp_dtensor_state(param)
+        state_dtype = dtype if dtype is not None else local_param.dtype
+        local_placeholder = torch.empty_strided(
+            tuple(local_param.shape),
+            tuple(local_param.stride()),
+            dtype=state_dtype,
+            device=local_param.device,
+        )
+        if DTensor is not None and isinstance(param, DTensor):
+            return DTensor.from_local(
+                local_tensor=local_placeholder,
+                device_mesh=param.device_mesh,
+                placements=param.placements,
+                run_check=False,
+                shape=param.shape,
+                stride=param.stride(),
+            )
+        return local_placeholder
+
+    def _scalar_step_placeholder_for_fsdp_dtensor_param(self, param: torch.Tensor) -> torch.Tensor:
+        local_param = self._local_param_tensor_for_fsdp_dtensor_state(param)
+        return torch.tensor(0.0, dtype=torch.float32, device=local_param.device)
+
+    def _load_state_placeholders_for_fsdp_dtensor_param(
+        self, param: torch.Tensor, group: dict[str, Any]
+    ) -> dict[str, torch.Tensor]:
+        placeholders = {}
+        config = getattr(self, "config", None)
+        if "betas" in group:
+            placeholders["step"] = self._scalar_step_placeholder_for_fsdp_dtensor_param(param)
+            placeholders["exp_avg"] = self._state_tensor_placeholder_like_fsdp_dtensor_param(
+                param, dtype=getattr(config, "exp_avg_dtype", torch.float32)
+            )
+            placeholders["exp_avg_sq"] = self._state_tensor_placeholder_like_fsdp_dtensor_param(
+                param, dtype=getattr(config, "exp_avg_sq_dtype", torch.float32)
+            )
+            if group.get("amsgrad", False):
+                placeholders["max_exp_avg_sq"] = (
+                    self._state_tensor_placeholder_like_fsdp_dtensor_param(
+                        param, dtype=getattr(config, "exp_avg_sq_dtype", torch.float32)
+                    )
+                )
+        elif float(group.get("momentum", 0.0) or 0.0) != 0.0:
+            placeholders["momentum_buffer"] = self._state_tensor_placeholder_like_fsdp_dtensor_param(
+                param
+            )
+        return placeholders
+
+    def _add_load_state_placeholders_for_fsdp_dtensor(self, packed_state: dict[str, Any]) -> None:
+        for group in self.optimizer.param_groups:
+            for param in group["params"]:
+                param_state = packed_state.setdefault(self._param_name(param), {})
+                if not isinstance(param_state, dict):
+                    continue
+                for state_name, state_value in self._load_state_placeholders_for_fsdp_dtensor_param(
+                    param, group
+                ).items():
+                    param_state.setdefault(state_name, state_value)
+
     def sharded_param_state_fsdp_dtensor(self, is_loading: bool = False):
         """
         Sharded state dict where each parameter is a separate PyTorch DTensor.
@@ -1586,10 +1661,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         assert (
             self.ddp_config.use_megatron_fsdp
         ), "fsdp_dtensor sharding type is only supported with Megatron FSDP."
-
-        # Initialize optimizer states with dummy values if loading.
-        if is_loading:
-            self._init_optimizer_states_with_dummy_values()
 
         # Get the optimizer's parameter groups in distributed key value format.
         param_to_group_meta = self._param_groups_to_param2group_meta(self.optimizer.param_groups)
@@ -1599,6 +1670,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             (self._param_name(k) if isinstance(k, torch.Tensor) else k): v
             for k, v in self.state.items()
         }
+        if is_loading:
+            self._add_load_state_placeholders_for_fsdp_dtensor(packed_state)
 
         state_dict = {"state": packed_state, "param_to_group_meta": param_to_group_meta}
         if not is_loading:
