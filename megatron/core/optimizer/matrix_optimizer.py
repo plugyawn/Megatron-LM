@@ -42,7 +42,7 @@ try:
     from emerging_optimizers.matrix_tp_apply import (
         tp_allgather_logical_matrix_update,
         tp_block_local_approx,
-        tp_small_gram_polar_allreduce,
+        tp_small_gram_newton_schulz_allreduce,
     )
     from emerging_optimizers.matrix_update_rules import (
         apply_diag_newton_muon_update_,
@@ -174,8 +174,13 @@ def _make_matrix_update_rule(config: OptimizerConfig, pg_collection: ProcessGrou
                     group=tp_group,
                 )
             elif tp_update_mode == TPUpdateMode.TP_SMALL_GRAM_POLAR_ALLREDUCE:
-                update = tp_small_gram_polar_allreduce(
-                    preconditioned, tp_layout=tp_layout, group=tp_group
+                update = tp_small_gram_newton_schulz_allreduce(
+                    preconditioned,
+                    tp_layout=tp_layout,
+                    group=tp_group,
+                    steps=config.muon_num_ns_steps,
+                    coefficient_type=config.muon_ns_coefficients,
+                    use_syrk=False,
                 )
             elif tp_update_mode == TPUpdateMode.TP_BLOCK_LOCAL_APPROX:
                 update = tp_block_local_approx(

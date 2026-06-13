@@ -1028,6 +1028,49 @@ def test_matrix_update_rule_supports_plain_muon_without_input_preconditioner(mon
     torch.testing.assert_close(rule(grad, None, None, param), expected)
 
 
+def test_matrix_update_rule_small_gram_muon_honors_ns_config(monkeypatch):
+    from types import SimpleNamespace
+
+    import megatron.core.optimizer.matrix_optimizer as matrix_optimizer_module
+
+    if not matrix_optimizer_module.HAVE_EMERGING_MATRIX_OPTIMIZERS:
+        pytest.skip("emerging_optimizers is not installed")
+
+    param = _param_with_info(tp_layout="column_parallel", shape=(2, 2))
+    grad = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+    config = OptimizerConfig(
+        matrix_optimizer="muon",
+        matrix_tp_update_mode="small_gram_polar",
+        muon_num_ns_steps=7,
+        muon_ns_coefficients="polar_express",
+        muon_scale_mode="unit_rms_norm",
+    )
+    calls = []
+
+    def fake_small_gram(matrix, **kwargs):
+        calls.append((matrix, kwargs))
+        return matrix + 1.0
+
+    monkeypatch.setattr(
+        matrix_optimizer_module,
+        "tp_small_gram_newton_schulz_allreduce",
+        fake_small_gram,
+    )
+    rule = matrix_optimizer_module._make_matrix_update_rule(config, SimpleNamespace(tp=None))
+
+    update = rule(grad, None, None, param)
+
+    torch.testing.assert_close(update, -(grad + 1.0))
+    assert len(calls) == 1
+    seen_matrix, kwargs = calls[0]
+    torch.testing.assert_close(seen_matrix, grad)
+    assert kwargs["tp_layout"] == "column_parallel"
+    assert kwargs["group"] is None
+    assert kwargs["steps"] == 7
+    assert kwargs["coefficient_type"] == "polar_express"
+    assert not kwargs["use_syrk"]
+
+
 def test_matrix_function_optimizer_state_dict_does_not_serialize_update_rule():
     param = _param_with_info()
 
