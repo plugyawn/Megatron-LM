@@ -32,9 +32,9 @@ from megatron.core.matrix_update import (
 
 
 class _ToyMatrixModel(torch.nn.Module):
-    def __init__(self, device):
+    def __init__(self, device, in_features=3, out_features=4):
         super().__init__()
-        self.linear = torch.nn.Linear(3, 4, bias=False, device=device)
+        self.linear = torch.nn.Linear(in_features, out_features, bias=False, device=device)
 
     def forward(self, x):
         return self.linear(x)
@@ -133,6 +133,85 @@ def test_matrix_optimizer_owned_param_state_checkpoint_contract(distributed_cuda
     assert metadata["owner"] == "muon"
     assert metadata["update_family"] == "muon"
     assert metadata["matrix_shard_contract"]["dp_shard_axis"] == 0
+    assert metadata["same_shard_state_names"] == ["momentum_buffer"]
+
+    reloaded_optimizer = fully_shard_optimizer(
+        torch.optim.SGD(mfsdp_model.parameters(), lr=0.01, momentum=0.9)
+    )
+    reloaded_optimizer.load_state_dict(state_dict)
+    dist.barrier()
+
+
+@pytest.mark.distributed
+def test_matrix_optimizer_owned_column_axis_param_state_checkpoint_contract(
+    distributed_cuda_setup,
+):
+    setup = distributed_cuda_setup
+    if setup["world_size"] < 2:
+        pytest.skip("Matrix-sharded Megatron-FSDP smoke requires at least 2 ranks.")
+
+    device_mesh = init_device_mesh(
+        "cuda", mesh_shape=(setup["world_size"], 1), mesh_dim_names=("dp_shard", "tp")
+    )
+    toy_model = _ToyMatrixModel(setup["device"], in_features=5, out_features=3)
+    set_matrix_optimizer_info(
+        toy_model.linear.weight,
+        owner=MATRIX_OPTIMIZER_OWNER_MUON,
+        update_family="muon",
+        requires_layerwise_layout=True,
+    )
+    set_matrix_shard_spec(
+        toy_model.linear.weight,
+        MatrixShardSpec(
+            logical_shape=tuple(toy_model.linear.weight.shape),
+            local_shape=tuple(toy_model.linear.weight.shape),
+            tp_layout="none",
+        ),
+    )
+
+    mfsdp_model = fully_shard_model(
+        module=toy_model,
+        device_mesh=device_mesh,
+        dp_shard_dim="dp_shard",
+        tp_dim="tp",
+        zero_dp_strategy="optim_grads_params",
+        fsdp_unit_modules=[torch.nn.Linear],
+        disable_bucketing=True,
+    )
+    optimizer = fully_shard_optimizer(
+        torch.optim.SGD(mfsdp_model.parameters(), lr=0.01, momentum=0.9)
+    )
+
+    matrix_params = [
+        param
+        for group in optimizer.param_groups
+        for param in group["params"]
+        if get_matrix_shard_spec(param) is not None
+    ]
+    assert len(matrix_params) == 1
+    matrix_param = matrix_params[0]
+    matrix_spec = get_matrix_shard_spec(matrix_param)
+    assert matrix_spec.dp_shard_axis == 1
+    assert matrix_spec.small_gram_side == "left"
+
+    state = optimizer.state[matrix_param]
+    assert isinstance(state["momentum_buffer"], DTensor)
+    assert get_matrix_shard_spec(state["momentum_buffer"]) == matrix_spec
+
+    x = torch.randn(2, 5, device=setup["device"])
+    y = torch.randn(2, 3, device=setup["device"])
+    loss = mse_loss(mfsdp_model(x), y)
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+
+    state_dict = optimizer.state_dict()
+    metadata_block = state_dict[MATRIX_OPTIMIZER_STATE_METADATA_KEY]
+    metadata = metadata_block["params"]["0"]
+    assert metadata["owner"] == "muon"
+    assert metadata["update_family"] == "muon"
+    assert metadata["matrix_shard_contract"]["dp_shard_axis"] == 1
+    assert metadata["matrix_shard_contract"]["dp_shard_layout"] == "column_contiguous_flat_buffer"
     assert metadata["same_shard_state_names"] == ["momentum_buffer"]
 
     reloaded_optimizer = fully_shard_optimizer(
