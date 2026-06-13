@@ -667,6 +667,22 @@ def test_layerwise_muon_routing_synthesizes_matrix_shard_spec_for_plain_2d_param
     assert spec.tp_shard_axis is None
 
 
+def test_layerwise_routing_does_not_give_adaptive_muon_muon_state_contract():
+    module = torch.nn.Module()
+    module.weight = torch.nn.Parameter(torch.empty(6, 4))
+
+    tag_params_for_buffer_routing(
+        [module],
+        optimizer_type="adaptive_muon",
+        matrix_optimizer_type=None,
+        matrix_min_dim=2,
+        requires_layerwise_layout=True,
+    )
+
+    assert get_matrix_optimizer_info(module.weight) is None
+    assert get_matrix_shard_spec(module.weight) is None
+
+
 def test_matrix_optimizer_split_routes_fallback_to_standard_distopt(monkeypatch):
     import copy
     import types

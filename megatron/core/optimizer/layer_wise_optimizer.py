@@ -42,6 +42,18 @@ from .param_layout import (
 logger = logging.getLogger(__name__)
 
 
+def _is_canonical_muon_optimizer_type(optimizer_type: Optional[str]) -> bool:
+    """Return whether *optimizer_type* names canonical Muon.
+
+    Optimizer variants such as ``adaptive_muon`` may share implementation pieces,
+    but they do not automatically share Muon's matrix-owned FSDP state contract.
+    """
+
+    if optimizer_type is None:
+        return False
+    return optimizer_type.lower() in ("muon", "dist_muon")
+
+
 def is_managed_by_layer_wise_optimizer(param: torch.nn.Parameter) -> bool:
     """Whether a parameter is managed by :class:`LayerWiseDistributedOptimizer`.
 
@@ -128,8 +140,7 @@ def _resolve_layerwise_matrix_optimizer_info(
             ensure_shard_spec=is_matrix_param,
         )
         return
-    optimizer_type_lower = optimizer_type.lower() if optimizer_type else ""
-    if "muon" not in optimizer_type_lower:
+    if not _is_canonical_muon_optimizer_type(optimizer_type):
         return
     is_muon_matrix = param.dim() == 2 and not getattr(
         param, 'is_embedding_or_output_parameter', False
