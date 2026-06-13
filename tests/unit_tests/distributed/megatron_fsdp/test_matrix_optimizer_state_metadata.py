@@ -13,6 +13,7 @@ import megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer as
 from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
     BucketingPolicy,
     DataParallelBuffer,
+    _build_matrix_fsdp_shard_plan,
     _get_parameter_groups,
     build_data_parallel_buffer_index,
 )
@@ -232,6 +233,53 @@ def test_matrix_shard_checkpoint_spec_records_column_axis_range():
     assert metadata["dp_shard_axis"] == 1
     assert metadata["dp_local_start"] == 4
     assert metadata["dp_local_end"] == 6
+
+
+def test_matrix_shard_checkpoint_validates_column_axis_contract_and_spec():
+    spec = MatrixShardSpec(
+        logical_shape=(3, 8),
+        local_shape=(3, 2),
+        pre_dp_local_shape=(3, 8),
+        tp_layout="none",
+        dp_shard_axis=1,
+        dp_local_start=4,
+        dp_local_end=6,
+    )
+
+    spec_metadata = fully_shard_module._matrix_shard_spec_to_checkpoint_dict(spec)
+    contract_metadata = fully_shard_module._matrix_shard_global_contract_to_checkpoint_dict(
+        spec
+    )
+
+    assert spec_metadata["dp_shard_layout"] == "column_contiguous_flat_buffer"
+    assert contract_metadata["dp_shard_layout"] == "column_contiguous_flat_buffer"
+    assert spec_metadata["small_gram_side"] == "left"
+    assert contract_metadata["small_gram_side"] == "left"
+    fully_shard_module._validate_matrix_shard_spec_checkpoint_metadata(
+        spec_metadata, "0", "matrix_shard_spec"
+    )
+    fully_shard_module._validate_matrix_shard_contract_checkpoint_metadata(
+        contract_metadata, "0"
+    )
+
+
+def test_matrix_shard_checkpoint_rejects_column_axis_range_mismatch():
+    spec = MatrixShardSpec(
+        logical_shape=(3, 8),
+        local_shape=(3, 2),
+        pre_dp_local_shape=(3, 8),
+        tp_layout="none",
+        dp_shard_axis=1,
+        dp_local_start=4,
+        dp_local_end=6,
+    )
+    metadata = fully_shard_module._matrix_shard_spec_to_checkpoint_dict(spec)
+    metadata["local_shape"] = [3, 3]
+
+    with pytest.raises(RuntimeError, match="DP-axis size"):
+        fully_shard_module._validate_matrix_shard_spec_checkpoint_metadata(
+            metadata, "0", "matrix_shard_spec"
+        )
 
 
 def test_matrix_optimizer_checkpoint_rejects_local_same_shaped_state(monkeypatch):
@@ -513,7 +561,7 @@ def test_matrix_optimizer_checkpoint_rejects_full_shard_spec_range_mismatch(monk
     full_spec["dp_local_end"] = 1
     metadata = _metadata_for_param(param, matrix_shard_spec=full_spec)
 
-    with pytest.raises(RuntimeError, match="row count does not match"):
+    with pytest.raises(RuntimeError, match="DP-axis size does not match"):
         fully_shard_module._validate_matrix_optimizer_checkpoint_metadata(
             optimizer,
             _fake_mfsdp_model(),
@@ -848,6 +896,49 @@ def test_matrix_optimizer_owned_params_are_singleton_fsdp_buckets():
     assert all(len(group.params) == 1 for group in matrix_groups)
     assert all(group.matrix_dp_shard_axis == 0 for group in matrix_groups)
     assert all(group.chunk_size_factor == 3 for group in matrix_groups)
+
+
+def test_matrix_fsdp_shard_plan_row_axis_matches_flat_row_layout():
+    rank0_plan = _build_matrix_fsdp_shard_plan(
+        torch.Size([5, 3]), dp_shard_axis=0, dp_rank=0, dp_world_size=2
+    )
+    rank1_plan = _build_matrix_fsdp_shard_plan(
+        torch.Size([5, 3]), dp_shard_axis=0, dp_rank=1, dp_world_size=2
+    )
+
+    assert rank0_plan.dp_shard_layout == "row_contiguous_flat_buffer"
+    assert rank0_plan.local_axis_start == 0
+    assert rank0_plan.local_axis_end == 3
+    assert rank0_plan.local_shape == (3, 3)
+    assert rank0_plan.padded_local_shape == (3, 3)
+    assert rank0_plan.chunk_size_factor == 3
+    assert not rank0_plan.requires_matrix_axis_packing
+    assert rank1_plan.local_axis_start == 3
+    assert rank1_plan.local_axis_end == 5
+    assert rank1_plan.local_shape == (2, 3)
+    assert rank1_plan.padded_local_shape == (3, 3)
+
+
+def test_matrix_fsdp_shard_plan_column_axis_requires_column_packing():
+    rank0_plan = _build_matrix_fsdp_shard_plan(
+        torch.Size([3, 5]), dp_shard_axis=1, dp_rank=0, dp_world_size=2
+    )
+    rank1_plan = _build_matrix_fsdp_shard_plan(
+        torch.Size([3, 5]), dp_shard_axis=1, dp_rank=1, dp_world_size=2
+    )
+
+    assert rank0_plan.dp_shard_layout == "column_contiguous_flat_buffer"
+    assert rank0_plan.local_axis_start == 0
+    assert rank0_plan.local_axis_end == 3
+    assert rank0_plan.local_shape == (3, 3)
+    assert rank0_plan.padded_local_shape == (3, 3)
+    assert rank0_plan.chunk_size_factor == 3
+    assert rank0_plan.requires_matrix_axis_packing
+    assert rank1_plan.local_axis_start == 3
+    assert rank1_plan.local_axis_end == 5
+    assert rank1_plan.local_shape == (3, 2)
+    assert rank1_plan.padded_local_shape == (3, 3)
+    assert rank1_plan.requires_matrix_axis_packing
 
 
 def test_matrix_optimizer_axis1_fsdp_rejected_at_grouping():

@@ -60,6 +60,19 @@ MATRIX_OPTIMIZER_DP_SHARD_LAYOUT_ROW_CONTIGUOUS = "row_contiguous_flat_buffer"
 MATRIX_OPTIMIZER_DP_SHARD_LAYOUT_COLUMN_CONTIGUOUS = "column_contiguous_flat_buffer"
 
 
+def _matrix_dp_shard_layout_for_axis(dp_shard_axis: Optional[int]) -> Optional[str]:
+    if dp_shard_axis is None:
+        return None
+    if dp_shard_axis == 0:
+        return MATRIX_OPTIMIZER_DP_SHARD_LAYOUT_ROW_CONTIGUOUS
+    if dp_shard_axis == 1:
+        return MATRIX_OPTIMIZER_DP_SHARD_LAYOUT_COLUMN_CONTIGUOUS
+    raise RuntimeError(
+        "[MegatronFSDP] Matrix optimizer checkpoint metadata cannot represent "
+        f"unsupported DP matrix shard axis {dp_shard_axis}."
+    )
+
+
 def _is_matrix_optimizer_owned_param(param: torch.Tensor) -> bool:
     if not HAVE_MCORE_MATRIX_UPDATE:
         return False
@@ -172,6 +185,8 @@ def _validate_matrix_shard_spec_checkpoint_metadata(
             f"for optimizer state index {param_idx}: logical_shape={logical_shape}, "
             f"local_shape={local_shape}."
         )
+    dp_shard_axis = metadata.get("dp_shard_axis")
+    dp_shard_layout = metadata.get("dp_shard_layout")
     if pre_dp_local_shape is not None:
         if len(pre_dp_local_shape) != 2:
             raise RuntimeError(
@@ -179,28 +194,32 @@ def _validate_matrix_shard_spec_checkpoint_metadata(
                 f"must be 2D for optimizer state index {param_idx}: "
                 f"pre_dp_local_shape={pre_dp_local_shape}."
             )
-        if local_shape[0] > pre_dp_local_shape[0] or local_shape[1:] != pre_dp_local_shape[1:]:
+        if dp_shard_axis not in (0, 1):
+            raise RuntimeError(
+                "[MegatronFSDP] Matrix optimizer checkpoint metadata pre_dp_local_shape "
+                "requires DP matrix shard axis 0 or 1 for optimizer state index "
+                f"{param_idx}: dp_shard_axis={dp_shard_axis}."
+            )
+        non_dp_axis = 1 - dp_shard_axis
+        if (
+            local_shape[dp_shard_axis] > pre_dp_local_shape[dp_shard_axis]
+            or local_shape[non_dp_axis] != pre_dp_local_shape[non_dp_axis]
+        ):
             raise RuntimeError(
                 "[MegatronFSDP] Matrix optimizer checkpoint metadata local_shape is "
                 f"inconsistent with pre_dp_local_shape for optimizer state index {param_idx}: "
-                f"local_shape={local_shape}, pre_dp_local_shape={pre_dp_local_shape}."
+                f"local_shape={local_shape}, pre_dp_local_shape={pre_dp_local_shape}, "
+                f"dp_shard_axis={dp_shard_axis}."
             )
-    dp_shard_axis = metadata.get("dp_shard_axis")
-    dp_shard_layout = metadata.get("dp_shard_layout")
     if dp_shard_axis is None:
         if dp_shard_layout is not None:
             raise RuntimeError(
                 "[MegatronFSDP] Matrix optimizer checkpoint metadata has a DP shard "
                 f"layout without a DP shard axis for optimizer state index {param_idx}."
             )
-    elif dp_shard_axis == 0:
-        if dp_shard_layout != MATRIX_OPTIMIZER_DP_SHARD_LAYOUT_ROW_CONTIGUOUS:
-            raise RuntimeError(
-                "[MegatronFSDP] Matrix optimizer checkpoint metadata has unsupported "
-                f"DP shard layout {dp_shard_layout!r} for optimizer state index {param_idx}."
-            )
-    elif dp_shard_axis == 1:
-        if dp_shard_layout != MATRIX_OPTIMIZER_DP_SHARD_LAYOUT_COLUMN_CONTIGUOUS:
+    elif dp_shard_axis in (0, 1):
+        expected_layout = _matrix_dp_shard_layout_for_axis(dp_shard_axis)
+        if dp_shard_layout != expected_layout:
             raise RuntimeError(
                 "[MegatronFSDP] Matrix optimizer checkpoint metadata has unsupported "
                 f"DP shard layout {dp_shard_layout!r} for optimizer state index {param_idx}."
@@ -220,27 +239,28 @@ def _validate_matrix_shard_spec_checkpoint_metadata(
     if dp_local_start is not None:
         if not isinstance(dp_local_start, int) or not isinstance(dp_local_end, int):
             raise RuntimeError(
-                "[MegatronFSDP] Matrix optimizer checkpoint metadata DP local row "
+                "[MegatronFSDP] Matrix optimizer checkpoint metadata DP local axis "
                 f"range must use integer offsets for optimizer state index {param_idx}."
             )
-        if dp_shard_axis != 0 or dp_local_start < 0 or dp_local_end < dp_local_start:
+        if dp_shard_axis not in (0, 1) or dp_local_start < 0 or dp_local_end < dp_local_start:
             raise RuntimeError(
                 "[MegatronFSDP] Matrix optimizer checkpoint metadata has an invalid "
-                f"DP local row range for optimizer state index {param_idx}: "
+                f"DP local axis range for optimizer state index {param_idx}: "
                 f"axis={dp_shard_axis}, start={dp_local_start}, end={dp_local_end}."
             )
-        if local_shape[0] != dp_local_end - dp_local_start:
+        if local_shape[dp_shard_axis] != dp_local_end - dp_local_start:
             raise RuntimeError(
-                "[MegatronFSDP] Matrix optimizer checkpoint metadata local_shape row "
-                f"count does not match DP local row range for optimizer state index "
+                "[MegatronFSDP] Matrix optimizer checkpoint metadata local_shape DP-axis "
+                f"size does not match DP local range for optimizer state index "
                 f"{param_idx}: local_shape={local_shape}, start={dp_local_start}, "
-                f"end={dp_local_end}."
+                f"end={dp_local_end}, axis={dp_shard_axis}."
             )
-        if pre_dp_local_shape is not None and dp_local_end > pre_dp_local_shape[0]:
+        if pre_dp_local_shape is not None and dp_local_end > pre_dp_local_shape[dp_shard_axis]:
             raise RuntimeError(
-                "[MegatronFSDP] Matrix optimizer checkpoint metadata DP local row "
+                "[MegatronFSDP] Matrix optimizer checkpoint metadata DP local axis "
                 f"range exceeds pre_dp_local_shape for optimizer state index {param_idx}: "
-                f"end={dp_local_end}, pre_dp_local_shape={pre_dp_local_shape}."
+                f"end={dp_local_end}, pre_dp_local_shape={pre_dp_local_shape}, "
+                f"axis={dp_shard_axis}."
             )
 
 
@@ -281,8 +301,9 @@ def _validate_matrix_shard_contract_checkpoint_metadata(
                 "[MegatronFSDP] Matrix optimizer checkpoint metadata has a DP shard "
                 f"layout without a DP shard axis for optimizer state index {param_idx}."
             )
-    elif dp_shard_axis == 0:
-        if dp_shard_layout != MATRIX_OPTIMIZER_DP_SHARD_LAYOUT_ROW_CONTIGUOUS:
+    elif dp_shard_axis in (0, 1):
+        expected_layout = _matrix_dp_shard_layout_for_axis(dp_shard_axis)
+        if dp_shard_layout != expected_layout:
             raise RuntimeError(
                 "[MegatronFSDP] Matrix optimizer checkpoint metadata has unsupported "
                 f"DP shard layout {dp_shard_layout!r} for optimizer state index {param_idx}."
@@ -300,16 +321,7 @@ def _validate_matrix_shard_contract_checkpoint_metadata(
 
 
 def _matrix_dp_shard_layout_to_checkpoint_value(spec) -> Optional[str]:
-    if spec.dp_shard_axis is None:
-        return None
-    if spec.dp_shard_axis == 0:
-        return MATRIX_OPTIMIZER_DP_SHARD_LAYOUT_ROW_CONTIGUOUS
-    if spec.dp_shard_axis == 1:
-        return MATRIX_OPTIMIZER_DP_SHARD_LAYOUT_COLUMN_CONTIGUOUS
-    raise RuntimeError(
-        "[MegatronFSDP] Matrix optimizer checkpoint metadata cannot represent "
-        f"unsupported DP matrix shard axis {spec.dp_shard_axis}."
-    )
+    return _matrix_dp_shard_layout_for_axis(spec.dp_shard_axis)
 
 
 def _optimizer_param_state_indices(optimizer: torch.optim.Optimizer) -> dict:

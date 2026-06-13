@@ -206,6 +206,98 @@ ShardBucketIndex = namedtuple(
 )
 
 
+MATRIX_DP_SHARD_LAYOUT_ROW_CONTIGUOUS = "row_contiguous_flat_buffer"
+MATRIX_DP_SHARD_LAYOUT_COLUMN_CONTIGUOUS = "column_contiguous_flat_buffer"
+
+
+@dataclasses.dataclass(frozen=True)
+class MatrixFSDPShardPlan:
+    """Matrix-axis DP shard plan for matrix optimizer-owned parameters.
+
+    Row-axis shards can use Megatron-FSDP's existing row-major flat buffers when
+    the flat slice is row-aligned. Column-axis shards require an explicit
+    column-contiguous packing path; a row-major flat range is not a column shard.
+    """
+
+    dp_shard_axis: int
+    dp_shard_layout: str
+    dp_rank: int
+    dp_world_size: int
+    axis_size: int
+    padded_axis_size: int
+    local_axis_start: int
+    local_axis_end: int
+    local_shape: Tuple[int, int]
+    padded_local_shape: Tuple[int, int]
+    chunk_size_factor: int
+    requires_matrix_axis_packing: bool
+
+
+def _build_matrix_fsdp_shard_plan(
+    local_shape: torch.Size,
+    dp_shard_axis: int,
+    dp_rank: int,
+    dp_world_size: int,
+) -> MatrixFSDPShardPlan:
+    """Build the matrix-axis shard plan for one DP rank.
+
+    This is intentionally axis-based rather than flat-offset based. For axis 0,
+    the plan matches the existing row-major buffer layout. For axis 1, it
+    describes the column-contiguous layout that a future matrix-aware packing
+    path must materialize before the parameter can be exposed as ``Shard(1)``.
+    """
+
+    if len(local_shape) != 2:
+        raise RuntimeError(
+            "[Megatron-FSDP] Matrix optimizer-owned parameters require 2D local shapes "
+            f"for matrix-axis sharding, got {tuple(local_shape)}."
+        )
+    if dp_shard_axis not in (0, 1):
+        raise ValueError("dp_shard_axis must be 0 or 1 for matrix-axis FSDP sharding")
+    if dp_world_size <= 0:
+        raise ValueError("dp_world_size must be positive for matrix-axis FSDP sharding")
+    if dp_rank < 0 or dp_rank >= dp_world_size:
+        raise ValueError(
+            "dp_rank must be in [0, dp_world_size) for matrix-axis FSDP sharding: "
+            f"dp_rank={dp_rank}, dp_world_size={dp_world_size}."
+        )
+
+    shape = tuple(int(dim) for dim in local_shape)
+    axis_size = shape[dp_shard_axis]
+    padded_axis_size = _pad(axis_size, dp_world_size)
+    axis_chunk_size = padded_axis_size // dp_world_size
+    local_axis_start = min(dp_rank * axis_chunk_size, axis_size)
+    local_axis_end = min((dp_rank + 1) * axis_chunk_size, axis_size)
+    planned_local_shape = list(shape)
+    planned_local_shape[dp_shard_axis] = local_axis_end - local_axis_start
+    padded_local_shape = list(shape)
+    padded_local_shape[dp_shard_axis] = axis_chunk_size
+
+    if dp_shard_axis == 0:
+        dp_shard_layout = MATRIX_DP_SHARD_LAYOUT_ROW_CONTIGUOUS
+        chunk_size_factor = shape[1]
+        requires_matrix_axis_packing = False
+    else:
+        dp_shard_layout = MATRIX_DP_SHARD_LAYOUT_COLUMN_CONTIGUOUS
+        chunk_size_factor = shape[0]
+        requires_matrix_axis_packing = True
+
+    return MatrixFSDPShardPlan(
+        dp_shard_axis=dp_shard_axis,
+        dp_shard_layout=dp_shard_layout,
+        dp_rank=dp_rank,
+        dp_world_size=dp_world_size,
+        axis_size=axis_size,
+        padded_axis_size=padded_axis_size,
+        local_axis_start=local_axis_start,
+        local_axis_end=local_axis_end,
+        local_shape=cast(Tuple[int, int], tuple(planned_local_shape)),
+        padded_local_shape=cast(Tuple[int, int], tuple(padded_local_shape)),
+        chunk_size_factor=chunk_size_factor,
+        requires_matrix_axis_packing=requires_matrix_axis_packing,
+    )
+
+
 class MultiGroupUBRAllocator:
     """
     A custom allocator class that registers a single memory pool with multiple different
@@ -990,21 +1082,28 @@ class DataParallelBuffer:
                     "MatrixShardSpec metadata. Configure matrix metadata before FSDP sharding."
             )
             dp_shard_axis = matrix_fsdp_shard_axis_for_spec(matrix_shard_spec)
-            if dp_shard_axis != 0:
-                raise NotImplementedError(
-                    "[Megatron-FSDP] Matrix optimizer-owned parameters that require "
-                    f"FSDP sharding on matrix axis {dp_shard_axis} are not supported by "
-                    "the current flat row-contiguous buffer planner. Supporting this "
-                    "requires an explicit matrix-axis packing path; silently using the "
-                    "flat buffer shard would violate the small-Gram Muon contract."
-                )
-
             local_shape = to_local_if_dtensor(param).shape
             if len(local_shape) < 2:
                 raise RuntimeError(
                     "[Megatron-FSDP] Matrix optimizer-owned parameter must have a 2D local "
                     f"shape, got {tuple(local_shape)}."
                 )
+            matrix_shard_plan = _build_matrix_fsdp_shard_plan(
+                local_shape,
+                dp_shard_axis=dp_shard_axis,
+                dp_rank=self.dp_rank,
+                dp_world_size=self.dp_world_size,
+            )
+            if dp_shard_axis != 0:
+                raise NotImplementedError(
+                    "[Megatron-FSDP] Matrix optimizer-owned parameters that require "
+                    f"FSDP sharding on matrix axis {dp_shard_axis} are not supported by "
+                    "the current flat row-contiguous buffer planner. Supporting this "
+                    f"requires an explicit {matrix_shard_plan.dp_shard_layout} packing "
+                    "path; silently using the flat buffer shard would violate the "
+                    "small-Gram Muon contract."
+                )
+
             row_stride = local_shape[1:].numel()
             slice_start, slice_end = self._get_item_slice_in_shard(item_id)
             if slice_start % row_stride != 0 or slice_end % row_stride != 0:
@@ -1642,11 +1741,18 @@ def _get_parameter_groups(
                     "[Megatron-FSDP] Matrix optimizer-owned parameter must have a 2D "
                     f"local shape, got {tuple(param_shape)}."
                 )
+            matrix_shard_plan = _build_matrix_fsdp_shard_plan(
+                param_shape,
+                dp_shard_axis=group.matrix_dp_shard_axis,
+                dp_rank=0,
+                dp_world_size=1,
+            )
             if group.matrix_dp_shard_axis != 0:
                 raise NotImplementedError(
                     "[Megatron-FSDP] Matrix optimizer-owned parameters that require "
                     f"FSDP sharding on matrix axis {group.matrix_dp_shard_axis} are not "
-                    "supported by the current row-contiguous buffer planner."
+                    "supported by the current row-contiguous buffer planner. Supporting "
+                    f"this requires {matrix_shard_plan.dp_shard_layout} packing."
                 )
             new_bucket_groups.append(
                 ParameterGroup(
@@ -1657,7 +1763,7 @@ def _get_parameter_groups(
                     matrix_dp_shard_axis=group.matrix_dp_shard_axis,
                     requires_grad=group.requires_grad,
                     fsdp_unit_id=group.fsdp_unit_id,
-                    chunk_size_factor=param_shape[1:].numel(),
+                    chunk_size_factor=matrix_shard_plan.chunk_size_factor,
                 )
             )
             continue
