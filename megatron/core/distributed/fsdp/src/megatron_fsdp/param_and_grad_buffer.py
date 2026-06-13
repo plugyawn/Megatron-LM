@@ -298,6 +298,67 @@ def _build_matrix_fsdp_shard_plan(
     )
 
 
+def _pack_matrix_fsdp_local_shard(
+    local_matrix: torch.Tensor, matrix_shard_plan: MatrixFSDPShardPlan
+) -> torch.Tensor:
+    """Pack one matrix-axis shard into the padded local FSDP buffer layout."""
+
+    if local_matrix.dim() != 2:
+        raise RuntimeError(
+            "[Megatron-FSDP] Matrix-axis FSDP packing requires a 2D tensor, got "
+            f"{tuple(local_matrix.shape)}."
+        )
+    if local_matrix.shape[matrix_shard_plan.dp_shard_axis] != matrix_shard_plan.axis_size:
+        raise RuntimeError(
+            "[Megatron-FSDP] Matrix-axis FSDP packing got a tensor whose sharded-axis "
+            "size does not match the plan: "
+            f"shape={tuple(local_matrix.shape)}, axis={matrix_shard_plan.dp_shard_axis}, "
+            f"expected_axis_size={matrix_shard_plan.axis_size}."
+        )
+    non_sharded_axis = 1 - matrix_shard_plan.dp_shard_axis
+    if (
+        local_matrix.shape[non_sharded_axis]
+        != matrix_shard_plan.padded_local_shape[non_sharded_axis]
+    ):
+        raise RuntimeError(
+            "[Megatron-FSDP] Matrix-axis FSDP packing got a tensor whose non-sharded "
+            "axis does not match the plan: "
+            f"shape={tuple(local_matrix.shape)}, axis={matrix_shard_plan.dp_shard_axis}, "
+            f"padded_local_shape={matrix_shard_plan.padded_local_shape}."
+        )
+
+    padded_shard = local_matrix.new_zeros(matrix_shard_plan.padded_local_shape)
+    if matrix_shard_plan.dp_shard_axis == 0:
+        matrix_slice = local_matrix[
+            matrix_shard_plan.local_axis_start : matrix_shard_plan.local_axis_end, :
+        ]
+        padded_shard[: matrix_slice.shape[0], :] = matrix_slice
+    else:
+        matrix_slice = local_matrix[
+            :, matrix_shard_plan.local_axis_start : matrix_shard_plan.local_axis_end
+        ]
+        padded_shard[:, : matrix_slice.shape[1]] = matrix_slice
+    return padded_shard.reshape(-1)
+
+
+def _unpack_matrix_fsdp_local_shard(
+    local_buffer: torch.Tensor, matrix_shard_plan: MatrixFSDPShardPlan
+) -> torch.Tensor:
+    """Return the unpadded local matrix-axis shard from a packed FSDP buffer."""
+
+    expected_numel = math.prod(matrix_shard_plan.padded_local_shape)
+    if local_buffer.numel() != expected_numel:
+        raise RuntimeError(
+            "[Megatron-FSDP] Matrix-axis FSDP unpacking got a buffer with the wrong "
+            f"number of elements: got={local_buffer.numel()}, expected={expected_numel}, "
+            f"padded_local_shape={matrix_shard_plan.padded_local_shape}."
+        )
+    padded_shard = local_buffer.view(matrix_shard_plan.padded_local_shape)
+    if matrix_shard_plan.dp_shard_axis == 0:
+        return padded_shard[: matrix_shard_plan.local_shape[0], :]
+    return padded_shard[:, : matrix_shard_plan.local_shape[1]]
+
+
 class MultiGroupUBRAllocator:
     """
     A custom allocator class that registers a single memory pool with multiple different
@@ -4752,11 +4813,20 @@ def to_local_if_dtensor(tensor):
 
 
 def _get_fsdp_tensor_spec(
-    param, dist_index: FSDPDistributedIndex, is_sharded_param, is_expert_param
+    param,
+    dist_index: FSDPDistributedIndex,
+    is_sharded_param,
+    is_expert_param,
+    fsdp_shard_axis: int = 0,
 ):
     """
     Get the DeviceMesh for the parameter and modify the placement for Megatron-FSDP.
     """
+    if fsdp_shard_axis not in (0, 1):
+        raise ValueError(
+            "[Megatron-FSDP] FSDP tensor shard axis must be 0 or 1, got "
+            f"{fsdp_shard_axis}."
+        )
     # Check if the parameter is a DTensor and has more than one shard (TP enabled).
     if isinstance(param, DTensor) and cast(DTensor, param)._spec.num_shards > 1:
         # Retrieve original DTensorSpec (for TP).
@@ -4786,13 +4856,13 @@ def _get_fsdp_tensor_spec(
         elif dist_index.use_hybrid_fsdp:
             if dist_index.hsdp_outer_dp_shard:
                 # If the parameter is sharded in hybrid FSDP, we need to add the HS-DP dimension.
-                placements = [Shard(0), Shard(0), dtensor_placement]
+                placements = [Shard(fsdp_shard_axis), Shard(fsdp_shard_axis), dtensor_placement]
                 shard_order = [2, 1, 0]
             else:
-                placements = [Replicate(), Shard(0), dtensor_placement]
+                placements = [Replicate(), Shard(fsdp_shard_axis), dtensor_placement]
                 shard_order = [2, 1, 0]
         else:
-            placements = [Shard(0), dtensor_placement]
+            placements = [Shard(fsdp_shard_axis), dtensor_placement]
             shard_order = [1, 0]
 
         device_mesh = dist_index.get_submesh(mesh_dim_names, is_expert_parallel=is_expert_param)
@@ -4813,12 +4883,12 @@ def _get_fsdp_tensor_spec(
     elif dist_index.use_hybrid_fsdp:
         # If the parameter is sharded in hybrid FSDP, we need to add the HS-DP dimension.
         if dist_index.hsdp_outer_dp_shard:
-            placements = [Shard(0), Shard(0)]
+            placements = [Shard(fsdp_shard_axis), Shard(fsdp_shard_axis)]
             shard_order = [1, 0]
         else:
-            placements = [Replicate(), Shard(0)]
+            placements = [Replicate(), Shard(fsdp_shard_axis)]
     else:
-        placements = [Shard(0)]
+        placements = [Shard(fsdp_shard_axis)]
 
     device_mesh = dist_index.get_submesh(mesh_dim_names, is_expert_parallel=is_expert_param)
     if shard_order is not None:
@@ -4912,6 +4982,7 @@ def make_fsdp_dtensor(
 
     # Save original parameter for later use
     orig_param = param
+    fsdp_shard_axis = 0
 
     if HAVE_MCORE_MATRIX_UPDATE and is_sharded_param:
         matrix_optimizer_info = get_matrix_optimizer_info(orig_param)
@@ -4925,14 +4996,7 @@ def make_fsdp_dtensor(
                     "MatrixShardSpec metadata. Configure matrix metadata before FSDP sharding."
                 )
             dp_shard_axis = matrix_fsdp_shard_axis_for_spec(matrix_shard_spec)
-            if dp_shard_axis != 0:
-                raise NotImplementedError(
-                    "[Megatron-FSDP] Matrix optimizer-owned parameters that require "
-                    f"FSDP sharding on matrix axis {dp_shard_axis} are not supported yet. "
-                    "Current Megatron-FSDP parameter buffers shard local tensors with "
-                    "Shard(0); using that for this parameter would create 2D TP/FSDP "
-                    "patches and break the small-Gram Muon contract."
-                )
+            fsdp_shard_axis = dp_shard_axis
             if matrix_shard_spec.dp_shard_axis is None:
                 matrix_shard_spec = matrix_shard_spec_with_dp_axis(
                     matrix_shard_spec, dp_shard_axis=dp_shard_axis
@@ -4991,12 +5055,19 @@ def make_fsdp_dtensor(
 
     # Get FSDP-configured mesh and placements from provided param
     device_mesh, placements = _get_fsdp_tensor_spec(
-        param, dist_index, is_sharded_param=is_sharded_param, is_expert_param=is_expert_param
+        param,
+        dist_index,
+        is_sharded_param=is_sharded_param,
+        is_expert_param=is_expert_param,
+        fsdp_shard_axis=fsdp_shard_axis,
     )
 
     # Reshape local tensor for sharded layouts beyond 1D
     if len(orig_param.shape) > 1:
-        local_shape = (-1, *orig_param.shape[1:])
+        if fsdp_shard_axis == 0:
+            local_shape = (-1, *orig_param.shape[1:])
+        else:
+            local_shape = (*orig_param.shape[:1], -1)
     else:
         local_shape = (-1,)
 

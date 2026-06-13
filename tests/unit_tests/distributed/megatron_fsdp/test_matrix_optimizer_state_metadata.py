@@ -15,6 +15,8 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer impo
     DataParallelBuffer,
     _build_matrix_fsdp_shard_plan,
     _get_parameter_groups,
+    _pack_matrix_fsdp_local_shard,
+    _unpack_matrix_fsdp_local_shard,
     build_data_parallel_buffer_index,
 )
 from megatron.core.matrix_update import (
@@ -41,8 +43,10 @@ class _FakeFSDPDTensor:
         shape=None,
         stride=None,
     ):
-        del device_mesh, placements, run_check, stride
+        del run_check, stride
         result = torch.nn.Parameter(local_tensor.new_empty(tuple(shape)), requires_grad=False)
+        result.device_mesh = device_mesh
+        result.placements = placements
         result._local_tensor = local_tensor
         return result
 
@@ -941,6 +945,36 @@ def test_matrix_fsdp_shard_plan_column_axis_requires_column_packing():
     assert rank1_plan.requires_matrix_axis_packing
 
 
+def test_matrix_fsdp_pack_unpack_row_axis_local_shard():
+    matrix = torch.arange(15, dtype=torch.float32).view(5, 3)
+    plan = _build_matrix_fsdp_shard_plan(
+        torch.Size([5, 3]), dp_shard_axis=0, dp_rank=1, dp_world_size=2
+    )
+
+    packed = _pack_matrix_fsdp_local_shard(matrix, plan)
+
+    expected_padded = torch.tensor(
+        [[9.0, 10.0, 11.0], [12.0, 13.0, 14.0], [0.0, 0.0, 0.0]]
+    )
+    assert torch.equal(packed, expected_padded.reshape(-1))
+    assert torch.equal(_unpack_matrix_fsdp_local_shard(packed, plan), matrix[3:5, :])
+
+
+def test_matrix_fsdp_pack_unpack_column_axis_local_shard():
+    matrix = torch.arange(15, dtype=torch.float32).view(3, 5)
+    plan = _build_matrix_fsdp_shard_plan(
+        torch.Size([3, 5]), dp_shard_axis=1, dp_rank=1, dp_world_size=2
+    )
+
+    packed = _pack_matrix_fsdp_local_shard(matrix, plan)
+
+    expected_padded = torch.tensor(
+        [[3.0, 4.0, 0.0], [8.0, 9.0, 0.0], [13.0, 14.0, 0.0]]
+    )
+    assert torch.equal(packed, expected_padded.reshape(-1))
+    assert torch.equal(_unpack_matrix_fsdp_local_shard(packed, plan), matrix[:, 3:5])
+
+
 def test_matrix_optimizer_axis1_fsdp_rejected_at_grouping():
     module = torch.nn.Module()
     module.matrix = _tag_muon_matrix_param_with_axis1_fsdp(
@@ -991,6 +1025,49 @@ def test_make_fsdp_dtensor_preserves_matrix_metadata(monkeypatch):
     assert get_matrix_shard_spec(fsdp_param) == get_matrix_shard_spec(param)
     assert get_matrix_shard_spec(fsdp_param).dp_shard_axis == 0
     assert get_matrix_shard_spec(fsdp_param).small_gram_side == "right"
+
+
+def test_make_fsdp_dtensor_accepts_packed_matrix_axis1_local_tensor(monkeypatch):
+    monkeypatch.setattr(param_buffer_module, "DTensor", _FakeFSDPDTensor)
+    monkeypatch.setattr(param_buffer_module, "using_tensor_parallel", lambda *args, **kwargs: False)
+    param = torch.nn.Parameter(torch.zeros(3, 5))
+    set_matrix_optimizer_info(
+        param,
+        owner=MATRIX_OPTIMIZER_OWNER_MUON,
+        update_family="muon",
+        requires_layerwise_layout=True,
+    )
+    set_matrix_shard_spec(
+        param,
+        MatrixShardSpec(
+            logical_shape=(3, 5),
+            local_shape=(3, 2),
+            pre_dp_local_shape=(3, 5),
+            tp_layout="none",
+            dp_shard_axis=1,
+            dp_local_start=3,
+            dp_local_end=5,
+        ),
+    )
+    matrix = torch.arange(15, dtype=torch.float32).view(3, 5)
+    shard_plan = _build_matrix_fsdp_shard_plan(
+        torch.Size([3, 5]), dp_shard_axis=1, dp_rank=1, dp_world_size=2
+    )
+    packed = _pack_matrix_fsdp_local_shard(matrix, shard_plan)
+
+    fsdp_param = param_buffer_module.make_fsdp_dtensor(
+        local_tensor=packed,
+        param=param,
+        dist_index=_FakeDistIndex(),
+        is_sharded_param=True,
+    )
+
+    assert fsdp_param._local_tensor.shape == torch.Size([3, 3])
+    assert torch.equal(fsdp_param._local_tensor, packed.view(3, 3))
+    assert fsdp_param.placements[0].dim == 1
+    assert get_matrix_optimizer_info(fsdp_param) == get_matrix_optimizer_info(param)
+    assert get_matrix_shard_spec(fsdp_param) == get_matrix_shard_spec(param)
+    assert get_matrix_shard_spec(fsdp_param).small_gram_side == "left"
 
 
 def test_matrix_optimizer_wide_unsharded_matrix_rejected_at_grouping():
