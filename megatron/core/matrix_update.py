@@ -330,6 +330,35 @@ def get_matrix_shard_spec(param: torch.nn.Parameter) -> Optional[MatrixShardSpec
     return getattr(param, MATRIX_SHARD_SPEC_ATTR, None)
 
 
+def ensure_matrix_shard_spec(param: torch.nn.Parameter) -> MatrixShardSpec:
+    """Attach and return a MatrixShardSpec for a matrix-owned parameter.
+
+    Affine weights should normally already carry LinearWeightInfo, which records
+    TP layout and logical shape. Plain 2D Muon parameters do not necessarily have
+    that metadata, so they get a conservative unsharded local matrix contract.
+    """
+
+    spec = get_matrix_shard_spec(param)
+    if spec is not None:
+        return spec
+    info = getattr(param, "_mcore_linear_weight_info", None)
+    if info is not None:
+        spec = matrix_shard_spec_from_linear_weight_info(info)
+    else:
+        if param.dim() != 2:
+            raise ValueError(
+                "MatrixShardSpec can only be synthesized for 2D parameters, got "
+                f"shape={tuple(param.shape)}."
+            )
+        spec = MatrixShardSpec(
+            logical_shape=tuple(param.shape),
+            local_shape=tuple(param.shape),
+            tp_layout="none",
+        )
+    set_matrix_shard_spec(param, spec)
+    return spec
+
+
 def matrix_fsdp_shard_axis_for_spec(spec: MatrixShardSpec) -> int:
     """Return the DP/FSDP matrix axis required by the small-Gram Muon contract.
 

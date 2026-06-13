@@ -602,6 +602,28 @@ def test_layerwise_buffer_routing_preserves_parameterization_role():
     assert not module.output_weight.is_managed_by_layer_wise_optimizer
 
 
+def test_layerwise_muon_routing_synthesizes_matrix_shard_spec_for_plain_2d_param():
+    module = torch.nn.Module()
+    module.weight = torch.nn.Parameter(torch.empty(6, 4))
+
+    tag_params_for_buffer_routing(
+        [module],
+        optimizer_type="muon",
+        matrix_optimizer_type=None,
+        matrix_min_dim=2,
+        requires_layerwise_layout=True,
+    )
+
+    info = get_matrix_optimizer_info(module.weight)
+    spec = get_matrix_shard_spec(module.weight)
+    assert info.owner == MATRIX_OPTIMIZER_OWNER_MUON
+    assert info.update_family == "muon"
+    assert spec.logical_shape == (6, 4)
+    assert spec.local_shape == (6, 4)
+    assert spec.tp_layout == "none"
+    assert spec.tp_shard_axis is None
+
+
 def test_fp8_dequant_source_fails_closed_in_native_collector():
     param = _param_with_info()
     recipe = _recipe()

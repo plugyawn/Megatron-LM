@@ -14,6 +14,7 @@ from megatron.core.matrix_update import (
     MATRIX_OPTIMIZER_OWNER_FALLBACK,
     MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
     MATRIX_OPTIMIZER_OWNER_MUON,
+    ensure_matrix_shard_spec,
     get_matrix_optimizer_info,
     is_matrix_update_eligible,
     matrix_update_family_from_optimizer_name,
@@ -134,6 +135,8 @@ def _resolve_layerwise_matrix_optimizer_info(
         update_family=update_family,
         requires_layerwise_layout=requires_layerwise_layout and is_muon_matrix,
     )
+    if is_muon_matrix:
+        ensure_matrix_shard_spec(param)
 
 
 def tag_params_for_buffer_routing(

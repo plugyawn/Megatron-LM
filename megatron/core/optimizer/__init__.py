@@ -844,6 +844,7 @@ def _get_megatron_emerging_optimizer(
     from megatron.core.matrix_update import (
         MATRIX_OPTIMIZER_OWNER_FALLBACK,
         MATRIX_OPTIMIZER_OWNER_MUON,
+        ensure_matrix_shard_spec,
         set_matrix_optimizer_info,
     )
 
@@ -874,6 +875,8 @@ def _get_megatron_emerging_optimizer(
                     update_family='muon' if is_muon_matrix else 'none',
                     requires_layerwise_layout=use_layer_wise and is_muon_matrix,
                 )
+                if is_muon_matrix:
+                    ensure_matrix_shard_spec(param)
 
     # Apply optimizer-specific param overrides (e.g. muon: non-linear -> scalar optimizer).
     entry = _EMERGING_OPTIMIZERS[eopt_name]
