@@ -174,48 +174,52 @@ class MatrixShardSpec:
                     "MatrixShardSpec pre_dp_local_shape must be 2D, got "
                     f"{self.pre_dp_local_shape}."
                 )
-            if self.dp_shard_axis != 0:
+            if self.dp_shard_axis not in (0, 1):
                 raise ValueError(
-                    "MatrixShardSpec pre_dp_local_shape is only valid for row-axis DP shards."
+                    "MatrixShardSpec pre_dp_local_shape requires dp_shard_axis 0 or 1."
                 )
-            if self.local_shape[0] > self.pre_dp_local_shape[0]:
+            dp_axis = self.dp_shard_axis
+            other_axis = 1 - dp_axis
+            if self.local_shape[dp_axis] > self.pre_dp_local_shape[dp_axis]:
                 raise ValueError(
-                    "MatrixShardSpec local_shape cannot have more rows than "
+                    "MatrixShardSpec local_shape cannot be larger than "
                     f"pre_dp_local_shape: local_shape={self.local_shape}, "
-                    f"pre_dp_local_shape={self.pre_dp_local_shape}."
+                    f"pre_dp_local_shape={self.pre_dp_local_shape}, dp_shard_axis={dp_axis}."
                 )
-            if self.local_shape[1:] != self.pre_dp_local_shape[1:]:
+            if self.local_shape[other_axis] != self.pre_dp_local_shape[other_axis]:
                 raise ValueError(
-                    "MatrixShardSpec local_shape trailing dimensions must match "
+                    "MatrixShardSpec local_shape non-DP dimension must match "
                     f"pre_dp_local_shape: local_shape={self.local_shape}, "
-                    f"pre_dp_local_shape={self.pre_dp_local_shape}."
+                    f"pre_dp_local_shape={self.pre_dp_local_shape}, dp_shard_axis={dp_axis}."
                 )
         if (self.dp_local_start is None) != (self.dp_local_end is None):
             raise ValueError("MatrixShardSpec dp_local_start and dp_local_end must be set together.")
         if self.dp_local_start is not None:
-            if self.dp_shard_axis != 0:
+            if self.dp_shard_axis not in (0, 1):
                 raise ValueError(
-                    "MatrixShardSpec DP local row ranges are only valid for row-axis DP shards."
+                    "MatrixShardSpec DP local ranges require dp_shard_axis 0 or 1."
                 )
+            dp_axis = self.dp_shard_axis
             if self.dp_local_start < 0 or self.dp_local_end < self.dp_local_start:
                 raise ValueError(
-                    "MatrixShardSpec has an invalid DP local row range: "
+                    "MatrixShardSpec has an invalid DP local range: "
                     f"start={self.dp_local_start}, end={self.dp_local_end}."
                 )
             if (
                 self.pre_dp_local_shape is not None
-                and self.dp_local_end > self.pre_dp_local_shape[0]
+                and self.dp_local_end > self.pre_dp_local_shape[dp_axis]
             ):
                 raise ValueError(
-                    "MatrixShardSpec DP local row range exceeds the pre-DP local shape: "
-                    f"end={self.dp_local_end}, pre_dp_local_shape={self.pre_dp_local_shape}."
+                    "MatrixShardSpec DP local range exceeds the pre-DP local shape: "
+                    f"end={self.dp_local_end}, pre_dp_local_shape={self.pre_dp_local_shape}, "
+                    f"dp_shard_axis={dp_axis}."
                 )
-            expected_rows = self.dp_local_end - self.dp_local_start
-            if self.local_shape[0] != expected_rows:
+            expected_axis_size = self.dp_local_end - self.dp_local_start
+            if self.local_shape[dp_axis] != expected_axis_size:
                 raise ValueError(
-                    "MatrixShardSpec local_shape row count must match the DP local row range: "
+                    "MatrixShardSpec local_shape DP-axis size must match the DP local range: "
                     f"local_shape={self.local_shape}, start={self.dp_local_start}, "
-                    f"end={self.dp_local_end}."
+                    f"end={self.dp_local_end}, dp_shard_axis={dp_axis}."
                 )
 
     @property
@@ -401,19 +405,17 @@ def matrix_shard_spec_with_dp_axis(
             raise ValueError("dp_local_start and dp_local_end must be provided together.")
         if dp_local_start < 0 or dp_local_end < dp_local_start:
             raise ValueError(
-                f"Invalid DP local row range: start={dp_local_start}, end={dp_local_end}."
-            )
-        if dp_shard_axis != 0:
-            raise ValueError(
-                "DP local range metadata is only supported for row-axis matrix shards."
+                f"Invalid DP local range: start={dp_local_start}, end={dp_local_end}."
             )
         pre_dp_local_shape = spec.pre_dp_local_shape or spec.local_shape
-        if dp_local_end > pre_dp_local_shape[0]:
+        if dp_local_end > pre_dp_local_shape[dp_shard_axis]:
             raise ValueError(
-                "DP local row range exceeds the pre-DP local matrix shape: "
+                "DP local range exceeds the pre-DP local matrix shape: "
                 f"end={dp_local_end}, pre_dp_local_shape={pre_dp_local_shape}."
             )
-        local_shape = (dp_local_end - dp_local_start, *pre_dp_local_shape[1:])
+        local_shape_list = list(pre_dp_local_shape)
+        local_shape_list[dp_shard_axis] = dp_local_end - dp_local_start
+        local_shape = tuple(local_shape_list)
     else:
         pre_dp_local_shape = spec.pre_dp_local_shape
     return MatrixShardSpec(

@@ -374,7 +374,7 @@ def test_matrix_shard_spec_dp_row_range_uses_pre_dp_shape_when_present():
 
 
 def test_matrix_shard_spec_rejects_inconsistent_pre_dp_shape():
-    with pytest.raises(ValueError, match="cannot have more rows"):
+    with pytest.raises(ValueError, match="cannot be larger than"):
         MatrixShardSpec(
             logical_shape=(8, 3),
             local_shape=(9, 3),
@@ -396,7 +396,7 @@ def test_matrix_shard_spec_direct_constructor_rejects_partial_dp_range():
 
 
 def test_matrix_shard_spec_direct_constructor_rejects_row_range_shape_mismatch():
-    with pytest.raises(ValueError, match="row count must match"):
+    with pytest.raises(ValueError, match="DP-axis size must match"):
         MatrixShardSpec(
             logical_shape=(8, 3),
             local_shape=(3, 3),
@@ -460,6 +460,53 @@ def test_matrix_shard_spec_dp_row_range_rejects_out_of_bounds_range():
             dp_shard_axis=0,
             dp_local_start=7,
             dp_local_end=9,
+        )
+
+
+def test_matrix_shard_spec_dp_column_range_updates_local_shape():
+    param = _param_with_info(tp_layout="none", shape=(3, 8), logical_shape=(3, 8))
+    spec = matrix_shard_spec_with_dp_axis(
+        get_matrix_shard_spec(param),
+        dp_shard_axis=1,
+        dp_local_start=2,
+        dp_local_end=5,
+    )
+
+    assert spec.local_shape == (3, 3)
+    assert spec.pre_dp_local_shape == (3, 8)
+    assert spec.dp_local_start == 2
+    assert spec.dp_local_end == 5
+    assert spec.small_gram_side == "left"
+
+
+def test_matrix_shard_spec_direct_constructor_allows_column_range():
+    spec = MatrixShardSpec(
+        logical_shape=(3, 8),
+        local_shape=(3, 2),
+        tp_layout="none",
+        dp_shard_axis=1,
+        dp_local_start=6,
+        dp_local_end=8,
+        pre_dp_local_shape=(3, 8),
+    )
+
+    assert spec.local_shape == (3, 2)
+    assert spec.pre_dp_local_shape == (3, 8)
+    assert spec.dp_local_start == 6
+    assert spec.dp_local_end == 8
+    assert spec.small_gram_side == "left"
+
+
+def test_matrix_shard_spec_direct_constructor_rejects_column_range_shape_mismatch():
+    with pytest.raises(ValueError, match="DP-axis size must match"):
+        MatrixShardSpec(
+            logical_shape=(3, 8),
+            local_shape=(3, 3),
+            tp_layout="none",
+            dp_shard_axis=1,
+            dp_local_start=6,
+            dp_local_end=8,
+            pre_dp_local_shape=(3, 8),
         )
 
 

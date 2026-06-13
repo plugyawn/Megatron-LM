@@ -57,6 +57,7 @@ MATRIX_OPTIMIZER_STATE_METADATA_KEY = "_mcore_matrix_optimizer_state"
 MATRIX_OPTIMIZER_STATE_METADATA_VERSION = 6
 MATRIX_OPTIMIZER_SAME_SHARD_STATE_LAYOUT = "same_as_param"
 MATRIX_OPTIMIZER_DP_SHARD_LAYOUT_ROW_CONTIGUOUS = "row_contiguous_flat_buffer"
+MATRIX_OPTIMIZER_DP_SHARD_LAYOUT_COLUMN_CONTIGUOUS = "column_contiguous_flat_buffer"
 
 
 def _is_matrix_optimizer_owned_param(param: torch.Tensor) -> bool:
@@ -198,6 +199,12 @@ def _validate_matrix_shard_spec_checkpoint_metadata(
                 "[MegatronFSDP] Matrix optimizer checkpoint metadata has unsupported "
                 f"DP shard layout {dp_shard_layout!r} for optimizer state index {param_idx}."
             )
+    elif dp_shard_axis == 1:
+        if dp_shard_layout != MATRIX_OPTIMIZER_DP_SHARD_LAYOUT_COLUMN_CONTIGUOUS:
+            raise RuntimeError(
+                "[MegatronFSDP] Matrix optimizer checkpoint metadata has unsupported "
+                f"DP shard layout {dp_shard_layout!r} for optimizer state index {param_idx}."
+            )
     else:
         raise RuntimeError(
             "[MegatronFSDP] Matrix optimizer checkpoint metadata has unsupported DP "
@@ -297,6 +304,8 @@ def _matrix_dp_shard_layout_to_checkpoint_value(spec) -> Optional[str]:
         return None
     if spec.dp_shard_axis == 0:
         return MATRIX_OPTIMIZER_DP_SHARD_LAYOUT_ROW_CONTIGUOUS
+    if spec.dp_shard_axis == 1:
+        return MATRIX_OPTIMIZER_DP_SHARD_LAYOUT_COLUMN_CONTIGUOUS
     raise RuntimeError(
         "[MegatronFSDP] Matrix optimizer checkpoint metadata cannot represent "
         f"unsupported DP matrix shard axis {spec.dp_shard_axis}."

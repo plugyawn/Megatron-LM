@@ -214,6 +214,26 @@ def test_matrix_shard_checkpoint_spec_records_pre_dp_local_shape():
     assert metadata["dp_local_end"] == 4
 
 
+def test_matrix_shard_checkpoint_spec_records_column_axis_range():
+    spec = MatrixShardSpec(
+        logical_shape=(3, 8),
+        local_shape=(3, 2),
+        pre_dp_local_shape=(3, 8),
+        tp_layout="none",
+        dp_shard_axis=1,
+        dp_local_start=4,
+        dp_local_end=6,
+    )
+
+    metadata = fully_shard_module._matrix_shard_spec_to_checkpoint_dict(spec)
+
+    assert metadata["local_shape"] == [3, 2]
+    assert metadata["pre_dp_local_shape"] == [3, 8]
+    assert metadata["dp_shard_axis"] == 1
+    assert metadata["dp_local_start"] == 4
+    assert metadata["dp_local_end"] == 6
+
+
 def test_matrix_optimizer_checkpoint_rejects_local_same_shaped_state(monkeypatch):
     monkeypatch.setattr(fully_shard_module, "DTensor", _FakeDTensor)
     param = _matrix_param()
