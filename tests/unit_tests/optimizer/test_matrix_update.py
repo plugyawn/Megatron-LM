@@ -704,6 +704,46 @@ def test_matrix_function_optimizer_respects_feature_gram_refresh_interval():
     assert param._feature_gram_generation == first_generation + 1
 
 
+def test_matrix_function_optimizer_respects_grad_gram_refresh_interval():
+    param = _param_with_info()
+    param.data = torch.zeros_like(param.data)
+    param.main_grad = torch.ones_like(param.data)
+    recipe = _output_recipe(
+        normalization=MatrixPreconditionerNormalization.MEAN, refresh_interval=2
+    )
+    configure_matrix_update_param(param, output_recipe=recipe)
+    seen = []
+
+    def update_rule(grad, feature_gram, grad_gram, model_param):
+        seen.append(grad_gram.clone())
+        return -grad
+
+    opt = MatrixFunctionOptimizer([param], lr=0.1, update_rule=update_rule)
+    dy0 = torch.tensor([[1.0, 0.0, 0.0, 0.0], [0.0, 2.0, 0.0, 0.0]])
+    dy1 = torch.tensor([[3.0, 0.0, 0.0, 0.0]])
+    dy2 = torch.tensor([[0.0, 0.0, 4.0, 0.0]])
+
+    opt.zero_grad()
+    maybe_accumulate_grad_gram(param, dy0)
+    opt.step()
+    first_generation = param._grad_gram_generation
+
+    opt.zero_grad()
+    assert not param._grad_gram_active
+    maybe_accumulate_grad_gram(param, dy1)
+    opt.step()
+
+    opt.zero_grad()
+    assert param._grad_gram_active
+    maybe_accumulate_grad_gram(param, dy2)
+    opt.step()
+
+    torch.testing.assert_close(seen[0], dy0.t().matmul(dy0) / dy0.shape[0])
+    torch.testing.assert_close(seen[1], seen[0])
+    torch.testing.assert_close(seen[2], dy2.t().matmul(dy2) / dy2.shape[0])
+    assert param._grad_gram_generation == first_generation + 1
+
+
 def test_matrix_update_rule_caches_factorization_by_feature_gram_generation(monkeypatch):
     from types import SimpleNamespace
 
