@@ -2277,12 +2277,16 @@ def test_first_sweep_matrix_optimizer_modes_configure_owned_matrix_params(
     module = torch.nn.Module()
     module.weight = _param_with_info(shape=(4, 3), logical_shape=(4, 3))
     module.bias = torch.nn.Parameter(torch.empty(4))
-    config = OptimizerConfig(
+    config_kwargs = dict(
         matrix_optimizer=matrix_optimizer,
         matrix_input_preconditioner=input_preconditioner,
-        matrix_input_preconditioner_approximation="diag",
-        matrix_input_preconditioner_ridge=1e-4,
     )
+    if input_preconditioner == "feature_gram":
+        config_kwargs.update(
+            matrix_input_preconditioner_approximation="diag",
+            matrix_input_preconditioner_ridge=1e-4,
+        )
+    config = OptimizerConfig(**config_kwargs)
 
     configured_params = configure_model_matrix_updates([module], config)
 
