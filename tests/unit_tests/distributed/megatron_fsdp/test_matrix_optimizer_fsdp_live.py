@@ -126,6 +126,7 @@ def test_matrix_optimizer_owned_param_state_checkpoint_contract(distributed_cuda
     state = optimizer.state[matrix_param]
     assert isinstance(state["momentum_buffer"], DTensor)
     assert get_matrix_shard_spec(state["momentum_buffer"]) == matrix_spec
+    saved_momentum_local = state["momentum_buffer"].to_local().detach().clone()
 
     state_dict = optimizer.state_dict()
     metadata_block = state_dict[MATRIX_OPTIMIZER_STATE_METADATA_KEY]
@@ -139,6 +140,12 @@ def test_matrix_optimizer_owned_param_state_checkpoint_contract(distributed_cuda
         torch.optim.SGD(mfsdp_model.parameters(), lr=0.01, momentum=0.9)
     )
     reloaded_optimizer.load_state_dict(state_dict)
+    reloaded_state = reloaded_optimizer.state[matrix_param]
+    assert isinstance(reloaded_state["momentum_buffer"], DTensor)
+    assert get_matrix_shard_spec(reloaded_state["momentum_buffer"]) == matrix_spec
+    torch.testing.assert_close(
+        reloaded_state["momentum_buffer"].to_local(), saved_momentum_local
+    )
     dist.barrier()
 
 
@@ -204,6 +211,7 @@ def test_matrix_optimizer_owned_column_axis_param_state_checkpoint_contract(
     state = optimizer.state[matrix_param]
     assert isinstance(state["momentum_buffer"], DTensor)
     assert get_matrix_shard_spec(state["momentum_buffer"]) == matrix_spec
+    saved_momentum_local = state["momentum_buffer"].to_local().detach().clone()
 
     state_dict = optimizer.state_dict()
     metadata_block = state_dict[MATRIX_OPTIMIZER_STATE_METADATA_KEY]
@@ -218,4 +226,10 @@ def test_matrix_optimizer_owned_column_axis_param_state_checkpoint_contract(
         torch.optim.SGD(mfsdp_model.parameters(), lr=0.01, momentum=0.9)
     )
     reloaded_optimizer.load_state_dict(state_dict)
+    reloaded_state = reloaded_optimizer.state[matrix_param]
+    assert isinstance(reloaded_state["momentum_buffer"], DTensor)
+    assert get_matrix_shard_spec(reloaded_state["momentum_buffer"]) == matrix_spec
+    torch.testing.assert_close(
+        reloaded_state["momentum_buffer"].to_local(), saved_momentum_local
+    )
     dist.barrier()
