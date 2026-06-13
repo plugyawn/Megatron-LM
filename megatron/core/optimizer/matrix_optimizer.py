@@ -30,9 +30,10 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
 
 from . import (
-    _distributed_optimizer_instance_id_from_process_groups,
     _get_megatron_optimizer_based_on_param_groups,
     _get_param_groups,
+    _model_chunks_use_distributed_optimizer_buffers,
+    _setup_layerwise_fallback_distopt_routing,
 )
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer
 from .matrix_function_optimizer import MatrixFunctionOptimizer
@@ -481,11 +482,9 @@ def get_megatron_matrix_optimizer(
     )
 
     use_layer_wise = config.use_layer_wise_distributed_optimizer
-    ddp_uses_distributed_optimizer = (
-        bool(getattr(model_chunks[0], 'ddp_config', None))
-        and model_chunks[0].ddp_config.use_distributed_optimizer
+    use_separate_distributed_optimizer = (
+        use_layer_wise and _model_chunks_use_distributed_optimizer_buffers(model_chunks)
     )
-    use_separate_distributed_optimizer = use_layer_wise and ddp_uses_distributed_optimizer
 
     matrix_optimizer = MatrixFunctionOptimizer(
         matrix_param_groups,
@@ -536,24 +535,11 @@ def get_megatron_matrix_optimizer(
             "combination."
         )
     if use_separate_distributed_optimizer:
-        distopt_process_groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
-            pg_collection, model_chunks, use_gloo_process_groups=False
-        )
-        distopt_distributed_optimizer_instance_id = (
-            _distributed_optimizer_instance_id_from_process_groups(distopt_process_groups)
-        )
-        distopt_per_model_buffers = {}
-        for model_chunk_idx, model_chunk in enumerate(model_chunks):
-            if not hasattr(model_chunk, 'buffers'):
-                continue
-            non_layer_wise_buffers = [
-                buffer
-                for buffer in model_chunk.buffers
-                if buffer.params
-                and not getattr(buffer.params[0], 'is_managed_by_layer_wise_optimizer', False)
-            ]
-            if non_layer_wise_buffers:
-                distopt_per_model_buffers[model_chunk_idx] = non_layer_wise_buffers
+        (
+            distopt_process_groups,
+            distopt_distributed_optimizer_instance_id,
+            distopt_per_model_buffers,
+        ) = _setup_layerwise_fallback_distopt_routing(pg_collection, model_chunks)
         fallback_optimizer = _get_megatron_optimizer_based_on_param_groups(
             config=fallback_config,
             model_chunks=model_chunks,

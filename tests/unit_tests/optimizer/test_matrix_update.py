@@ -763,21 +763,18 @@ def test_matrix_optimizer_split_routes_fallback_to_standard_distopt(monkeypatch)
         lambda optimizer: None,
     )
     monkeypatch.setattr(
-        matrix_optimizer_module.ProcessGroupCollection,
-        "setup_process_groups_for_optimizer",
-        staticmethod(
-            lambda pg_collection, model_chunks, use_gloo_process_groups=False: {
+        matrix_optimizer_module,
+        "_setup_layerwise_fallback_distopt_routing",
+        lambda pg_collection, model_chunks: (
+            {
                 "mp_group": object(),
                 "intra_dp_cp_group": object(),
                 "intra_dp_cp_group_gloo": object(),
                 "intra_dist_opt_group": object(),
-            }
+            },
+            0,
+            {},
         ),
-    )
-    monkeypatch.setattr(
-        matrix_optimizer_module,
-        "_distributed_optimizer_instance_id_from_process_groups",
-        lambda process_groups: 0,
     )
     monkeypatch.setattr(
         matrix_optimizer_module,

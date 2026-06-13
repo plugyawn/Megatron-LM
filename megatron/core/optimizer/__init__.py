@@ -802,6 +802,52 @@ def _distributed_optimizer_instance_id_from_process_groups(process_groups_dict: 
     return 0
 
 
+def _model_chunks_use_distributed_optimizer_buffers(model_chunks: List[MegatronModule]) -> bool:
+    """Whether DDP wrapping built DistributedOptimizer-compatible buffers."""
+
+    return (
+        bool(model_chunks)
+        and bool(getattr(model_chunks[0], 'ddp_config', None))
+        and model_chunks[0].ddp_config.use_distributed_optimizer
+    )
+
+
+def _get_non_layer_wise_per_model_buffers(model_chunks: List[MegatronModule]) -> Dict[int, list]:
+    """Return DDP buffers owned by fallback DistributedOptimizer, not LayerWise."""
+
+    per_model_buffers = {}
+    for model_chunk_idx, model_chunk in enumerate(model_chunks):
+        if not hasattr(model_chunk, 'buffers'):
+            continue
+        non_layer_wise_buffers = [
+            buffer
+            for buffer in model_chunk.buffers
+            if buffer.params
+            and not getattr(buffer.params[0], 'is_managed_by_layer_wise_optimizer', False)
+        ]
+        if non_layer_wise_buffers:
+            per_model_buffers[model_chunk_idx] = non_layer_wise_buffers
+    return per_model_buffers
+
+
+def _setup_layerwise_fallback_distopt_routing(
+    pg_collection: ProcessGroupCollection,
+    model_chunks: List[MegatronModule],
+) -> tuple[Dict, int, Dict[int, list]]:
+    """Set up process groups and buffers for fallback DistOpt beside LayerWise."""
+
+    # ``setup_process_groups_for_optimizer`` rejects Gloo groups whenever an explicit
+    # ``pg_collection`` is supplied, so the only legal value here is False.
+    process_groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
+        pg_collection, model_chunks, use_gloo_process_groups=False
+    )
+    distributed_optimizer_instance_id = _distributed_optimizer_instance_id_from_process_groups(
+        process_groups
+    )
+    per_model_buffers = _get_non_layer_wise_per_model_buffers(model_chunks)
+    return process_groups, distributed_optimizer_instance_id, per_model_buffers
+
+
 def _get_megatron_emerging_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
@@ -911,43 +957,22 @@ def _get_megatron_emerging_optimizer(
     # with ``use_distributed_optimizer=True`` (i.e. the layout-based path); in
     # legacy ping-pong mode all params share one unpadded DDP buffer that
     # DistOpt cannot manage, so we keep non-Muon params inside LayerWise.
-    ddp_uses_distributed_optimizer = (
-        bool(getattr(model_chunks[0], 'ddp_config', None))
-        and model_chunks[0].ddp_config.use_distributed_optimizer
-    )
     distopt_process_groups = None
     distopt_per_model_buffers = None
     distopt_distributed_optimizer_instance_id = 0
-    use_separate_distributed_optimizer = ddp_uses_distributed_optimizer and use_layer_wise
+    use_separate_distributed_optimizer = (
+        _model_chunks_use_distributed_optimizer_buffers(model_chunks) and use_layer_wise
+    )
     if use_separate_distributed_optimizer and any(
         opt_name not in _EMERGING_OPTIMIZERS
         for (opt_name, _), groups in grouped_param_groups.items()
         if groups
     ):
-        # ``setup_process_groups_for_optimizer`` rejects Gloo groups whenever
-        # an explicit ``pg_collection`` is supplied, so the only legal value
-        # here is False.
-        distopt_process_groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
-            pg_collection, model_chunks, use_gloo_process_groups=False
-        )
-        distopt_distributed_optimizer_instance_id = (
-            _distributed_optimizer_instance_id_from_process_groups(distopt_process_groups)
-        )
-        # DistOpt should only manage non-LayerWise buffers (those holding
-        # embeddings, biases, layernorm, etc.). Filter out the LayerWise
-        # shard-aligned buffers that the LayerWiseDistributedOptimizer owns.
-        distopt_per_model_buffers = {}
-        for model_chunk_idx, model_chunk in enumerate(model_chunks):
-            if not hasattr(model_chunk, 'buffers'):
-                continue
-            non_layer_wise_buffers = [
-                buffer
-                for buffer in model_chunk.buffers
-                if buffer.params
-                and not getattr(buffer.params[0], 'is_managed_by_layer_wise_optimizer', False)
-            ]
-            if non_layer_wise_buffers:
-                distopt_per_model_buffers[model_chunk_idx] = non_layer_wise_buffers
+        (
+            distopt_process_groups,
+            distopt_distributed_optimizer_instance_id,
+            distopt_per_model_buffers,
+        ) = _setup_layerwise_fallback_distopt_routing(pg_collection, model_chunks)
 
     # Build an optimizer for each (optimizer_name, is_expert) bucket and combine.
     # In layer-wise mode, emerging-optimizer (Muon) groups feed into LayerWise,
