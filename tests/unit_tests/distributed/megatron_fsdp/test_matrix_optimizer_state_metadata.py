@@ -16,6 +16,8 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer impo
     _build_matrix_fsdp_shard_plan,
     _get_parameter_groups,
     _pack_matrix_fsdp_local_shard,
+    _pack_matrix_fsdp_global_bucket,
+    _unpack_matrix_fsdp_global_bucket,
     _unpack_matrix_fsdp_local_shard,
     build_data_parallel_buffer_index,
 )
@@ -973,6 +975,82 @@ def test_matrix_fsdp_pack_unpack_column_axis_local_shard():
     )
     assert torch.equal(packed, expected_padded.reshape(-1))
     assert torch.equal(_unpack_matrix_fsdp_local_shard(packed, plan), matrix[:, 3:5])
+
+
+def test_matrix_fsdp_global_bucket_round_trips_row_axis():
+    matrix = torch.arange(15, dtype=torch.float32).view(5, 3)
+
+    packed = _pack_matrix_fsdp_global_bucket(
+        matrix, dp_shard_axis=0, dp_world_size=2
+    )
+
+    expected = torch.tensor(
+        [
+            0.0,
+            1.0,
+            2.0,
+            3.0,
+            4.0,
+            5.0,
+            6.0,
+            7.0,
+            8.0,
+            9.0,
+            10.0,
+            11.0,
+            12.0,
+            13.0,
+            14.0,
+            0.0,
+            0.0,
+            0.0,
+        ]
+    )
+    assert torch.equal(packed, expected)
+    assert torch.equal(
+        _unpack_matrix_fsdp_global_bucket(
+            packed, torch.Size([5, 3]), dp_shard_axis=0, dp_world_size=2
+        ),
+        matrix,
+    )
+
+
+def test_matrix_fsdp_global_bucket_round_trips_column_axis():
+    matrix = torch.arange(15, dtype=torch.float32).view(3, 5)
+
+    packed = _pack_matrix_fsdp_global_bucket(
+        matrix, dp_shard_axis=1, dp_world_size=2
+    )
+
+    expected = torch.tensor(
+        [
+            0.0,
+            1.0,
+            2.0,
+            5.0,
+            6.0,
+            7.0,
+            10.0,
+            11.0,
+            12.0,
+            3.0,
+            4.0,
+            0.0,
+            8.0,
+            9.0,
+            0.0,
+            13.0,
+            14.0,
+            0.0,
+        ]
+    )
+    assert torch.equal(packed, expected)
+    assert torch.equal(
+        _unpack_matrix_fsdp_global_bucket(
+            packed, torch.Size([3, 5]), dp_shard_axis=1, dp_world_size=2
+        ),
+        matrix,
+    )
 
 
 def test_matrix_optimizer_axis1_fsdp_rejected_at_grouping():

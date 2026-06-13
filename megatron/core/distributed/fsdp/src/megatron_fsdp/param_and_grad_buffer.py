@@ -359,6 +359,83 @@ def _unpack_matrix_fsdp_local_shard(
     return padded_shard[:, : matrix_shard_plan.local_shape[1]]
 
 
+def _pack_matrix_fsdp_global_bucket(
+    matrix: torch.Tensor, dp_shard_axis: int, dp_world_size: int
+) -> torch.Tensor:
+    """Pack a full matrix into concatenated per-rank matrix-axis FSDP shards."""
+
+    if matrix.dim() != 2:
+        raise RuntimeError(
+            "[Megatron-FSDP] Matrix-axis FSDP global packing requires a 2D tensor, "
+            f"got {tuple(matrix.shape)}."
+        )
+    packed_shards = []
+    matrix_shape = torch.Size(matrix.shape)
+    for dp_rank in range(dp_world_size):
+        plan = _build_matrix_fsdp_shard_plan(
+            matrix_shape,
+            dp_shard_axis=dp_shard_axis,
+            dp_rank=dp_rank,
+            dp_world_size=dp_world_size,
+        )
+        packed_shards.append(_pack_matrix_fsdp_local_shard(matrix, plan))
+    return torch.cat(packed_shards)
+
+
+def _unpack_matrix_fsdp_global_bucket(
+    packed_bucket: torch.Tensor,
+    matrix_shape: torch.Size,
+    dp_shard_axis: int,
+    dp_world_size: int,
+) -> torch.Tensor:
+    """Unpack concatenated per-rank matrix-axis shards into a full matrix."""
+
+    if len(matrix_shape) != 2:
+        raise RuntimeError(
+            "[Megatron-FSDP] Matrix-axis FSDP global unpacking requires a 2D "
+            f"matrix shape, got {tuple(matrix_shape)}."
+        )
+    if dp_shard_axis not in (0, 1):
+        raise ValueError(
+            "[Megatron-FSDP] Matrix-axis FSDP global unpacking requires shard axis "
+            f"0 or 1, got {dp_shard_axis}."
+        )
+    rank0_plan = _build_matrix_fsdp_shard_plan(
+        matrix_shape,
+        dp_shard_axis=dp_shard_axis,
+        dp_rank=0,
+        dp_world_size=dp_world_size,
+    )
+    shard_numel = math.prod(rank0_plan.padded_local_shape)
+    expected_numel = shard_numel * dp_world_size
+    if packed_bucket.numel() != expected_numel:
+        raise RuntimeError(
+            "[Megatron-FSDP] Matrix-axis FSDP global unpacking got a bucket with "
+            f"the wrong number of elements: got={packed_bucket.numel()}, "
+            f"expected={expected_numel}, matrix_shape={tuple(matrix_shape)}, "
+            f"axis={dp_shard_axis}, dp_world_size={dp_world_size}."
+        )
+
+    matrix = packed_bucket.new_empty(tuple(matrix_shape))
+    for dp_rank in range(dp_world_size):
+        plan = _build_matrix_fsdp_shard_plan(
+            matrix_shape,
+            dp_shard_axis=dp_shard_axis,
+            dp_rank=dp_rank,
+            dp_world_size=dp_world_size,
+        )
+        shard_start = dp_rank * shard_numel
+        shard_end = shard_start + shard_numel
+        local_shard = _unpack_matrix_fsdp_local_shard(
+            packed_bucket[shard_start:shard_end], plan
+        )
+        if dp_shard_axis == 0:
+            matrix[plan.local_axis_start : plan.local_axis_end, :] = local_shard
+        else:
+            matrix[:, plan.local_axis_start : plan.local_axis_end] = local_shard
+    return matrix
+
+
 def _fsdp_local_view_shape(param_shape: torch.Size, fsdp_shard_axis: int) -> Tuple[int, ...]:
     """Return the local tensor view shape for a flat FSDP shard."""
 
