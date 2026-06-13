@@ -163,6 +163,46 @@ def test_diag_grad_gram_accumulates_diagonal_only():
     torch.testing.assert_close(param.main_grad_grad_gram, (dy * dy).sum(dim=0))
 
 
+def test_diag_grad_gram_cuda_route_uses_output_reducer(monkeypatch):
+    import sys
+    import types
+
+    import megatron.core.matrix_update as matrix_update_module
+
+    calls = []
+
+    def fake_diag_grad_gram_reduce(dy, *, out, accumulate):
+        calls.append((dy, out, accumulate))
+        return out
+
+    emerging_pkg = types.ModuleType("emerging_optimizers")
+    emerging_pkg.__path__ = []
+    kernels_pkg = types.ModuleType("emerging_optimizers.triton_kernels")
+    kernels_pkg.__path__ = []
+    feature_gram_module = types.ModuleType(
+        "emerging_optimizers.triton_kernels.feature_gram"
+    )
+    feature_gram_module.diag_grad_gram_reduce = fake_diag_grad_gram_reduce
+    monkeypatch.setitem(sys.modules, "emerging_optimizers", emerging_pkg)
+    monkeypatch.setitem(sys.modules, "emerging_optimizers.triton_kernels", kernels_pkg)
+    monkeypatch.setitem(
+        sys.modules, "emerging_optimizers.triton_kernels.feature_gram", feature_gram_module
+    )
+
+    class FakeCudaTensor:
+        is_cuda = True
+
+        def __mul__(self, other):
+            raise AssertionError("fallback path should not run")
+
+    gram = FakeCudaTensor()
+    dy = FakeCudaTensor()
+
+    matrix_update_module._accumulate_diag_grad_gram(gram, dy)
+
+    assert calls == [(dy, gram, True)]
+
+
 def test_block_diag_grad_gram_accumulates_padded_blocks():
     param = _param_with_info()
     recipe = _output_recipe(approximation=MatrixPreconditionerApproximation.BLOCK_DIAG)
