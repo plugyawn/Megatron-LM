@@ -189,7 +189,14 @@ def _make_matrix_update_rule(config: OptimizerConfig, pg_collection: ProcessGrou
 def _make_matrix_inplace_update_rule(
     config: OptimizerConfig, pg_collection: ProcessGroupCollection
 ):
-    """Return an optional fused in-place update rule for cheap diagonal cases."""
+    """Return an optional fused in-place update rule for cheap diagonal cases.
+
+    Only diagonal input/output preconditioners are eligible for the EO fused
+    in-place/Triton helpers. Full and block-diagonal Grams intentionally fall
+    back to the generic update rule, where the cached factorized solve path
+    preserves the supported math without implying a Triton Gram-solve
+    implementation.
+    """
 
     if config.matrix_optimizer not in ("sgd", "muon"):
         return None
