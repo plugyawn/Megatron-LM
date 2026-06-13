@@ -2029,6 +2029,7 @@ def setup_model_and_optimizer(
                 config_overrides=config_overrides,
                 matrix_config_overrides=matrix_config_overrides,
                 use_gloo_process_groups=args.use_gloo_process_groups,
+                pg_collection=get_attr_wrapped_model(model[0], "pg_collection"),
             )
         else:
             optimizer = get_megatron_optimizer(
