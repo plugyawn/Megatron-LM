@@ -340,13 +340,26 @@ def validate_matrix_optimizer_fsdp_support(args) -> None:
     if _resolve_validation_attr(args, 'matrix_optimizer') in (None, 'none'):
         return
 
-    if _resolve_validation_attr(args, 'use_torch_fsdp2') or _resolve_validation_attr(
-        args, 'use_megatron_fsdp'
+    if _resolve_validation_attr(args, 'use_torch_fsdp2'):
+        raise ValueError(
+            "matrix-optimizer does not support Torch FSDP2 yet. It requires "
+            "matrix-axis-aware FSDP sharding for matrix-owned params, "
+            "momentum/master params, and checkpoint state."
+        )
+    matrix_input_preconditioner = (
+        _resolve_validation_attr(args, 'matrix_input_preconditioner') or 'none'
+    )
+    matrix_output_preconditioner = (
+        _resolve_validation_attr(args, 'matrix_output_preconditioner') or 'none'
+    )
+    if _resolve_validation_attr(args, 'use_megatron_fsdp') and (
+        matrix_input_preconditioner != 'none'
+        or matrix_output_preconditioner != 'none'
     ):
         raise ValueError(
-            "matrix-optimizer does not support FSDP yet. It requires matrix-axis-aware "
-            "FSDP sharding for matrix-owned params, momentum/master params, and "
-            "checkpoint state."
+            "matrix-optimizer with Megatron-FSDP currently supports no-sidecar "
+            "matrix updates only. FEATURE_GRAM and GRAD_GRAM collection under FSDP "
+            "need explicit sidecar buffer routing."
         )
 
 
@@ -522,7 +535,8 @@ def normalize_matrix_and_emerging_optimizer_args(args):
         args, 'use_distributed_optimizer', False
     ):
         args.use_layer_wise_distributed_optimizer = True
-        args.use_distributed_optimizer = False
+        if not getattr(args, 'use_megatron_fsdp', False):
+            args.use_distributed_optimizer = False
 
     if getattr(args, 'optimizer', 'adam') not in ('sgd', 'adam'):
         if args.optimizer == 'dist_muon':
@@ -1821,7 +1835,7 @@ def validate_args(args, defaults={}):
         if 'muon' in args.optimizer:
             raise ValueError("--matrix-optimizer cannot be combined with --optimizer muon/dist_muon.")
         validate_matrix_optimizer_fsdp_support(args)
-        if args.use_distributed_optimizer:
+        if args.use_distributed_optimizer and not args.use_megatron_fsdp:
             raise ValueError(
                 "Matrix optimizers do not support standard DistributedOptimizer until logical "
                 "matrix gather/apply/scatter views exist."

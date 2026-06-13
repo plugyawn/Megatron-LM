@@ -406,8 +406,12 @@ class OptimizerConfig:
     use_layer_wise_distributed_optimizer: bool = False
     """Use :class:`LayerWiseDistributedOptimizer` for emerging optimizers (e.g. Muon).
     When set via ``--use-distributed-optimizer`` with an emerging optimizer, the training
-    arguments layer sets this flag and resets ``use_distributed_optimizer`` to False so
-    that the standard distributed-optimizer path is not triggered."""
+    arguments layer sets this flag. For the standard DDP path it also resets
+    ``use_distributed_optimizer`` to False so that the standard distributed-optimizer path is not
+    triggered; Megatron-FSDP keeps ``use_distributed_optimizer`` true for fallback parameters."""
+
+    use_megatron_fsdp: bool = False
+    """Whether the optimizer is being constructed for Megatron-FSDP."""
 
     overlap_param_gather: bool = False
     """If true, overlap param all-gather with forward compute. 
@@ -656,12 +660,29 @@ class OptimizerConfig:
                 )
         if self.matrix_optimizer != "none" and "muon" in self.optimizer:
             raise ValueError("matrix_optimizer cannot be combined with optimizer=muon/dist_muon.")
-        if self.matrix_optimizer != "none" and self.use_distributed_optimizer:
+        if (
+            self.matrix_optimizer != "none"
+            and self.use_distributed_optimizer
+            and not self.use_megatron_fsdp
+        ):
             raise ValueError(
                 "Matrix optimizers do not support standard DistributedOptimizer yet; "
                 "the arguments layer rewrites this combination to "
                 "LayerWiseDistributedOptimizer ownership. Disable "
                 "--use-distributed-optimizer to use a local matrix optimizer path."
+            )
+        if (
+            self.matrix_optimizer != "none"
+            and self.use_megatron_fsdp
+            and (
+                self.matrix_input_preconditioner != "none"
+                or self.matrix_output_preconditioner != "none"
+            )
+        ):
+            raise ValueError(
+                "Megatron-FSDP matrix optimizers currently support no-sidecar matrix "
+                "updates only. FEATURE_GRAM and GRAD_GRAM collection under FSDP need "
+                "explicit sidecar buffer routing."
             )
         if self.matrix_input_preconditioner == "feature_gram" and self.matrix_input_preconditioner_ema_beta is not None:
             raise ValueError(
