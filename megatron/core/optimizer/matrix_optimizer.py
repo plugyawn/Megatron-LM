@@ -1024,7 +1024,7 @@ def get_megatron_matrix_optimizer(
             )
             fallback_optimizer = MegatronFSDPOptimizer(
                 megatron_fsdp_fully_shard_optimizer(fallback_torch_optimizer),
-                fallback_config,
+                config,
                 pg_collection,
             )
         elif use_separate_distributed_optimizer:
