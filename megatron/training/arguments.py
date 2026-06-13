@@ -335,6 +335,21 @@ def validate_depth_mup_optimizer_support(args) -> None:
         )
 
 
+def validate_matrix_optimizer_fsdp_support(args) -> None:
+    """Enforce the public FSDP support surface for matrix optimizers."""
+    if _resolve_validation_attr(args, 'matrix_optimizer') in (None, 'none'):
+        return
+
+    if _resolve_validation_attr(args, 'use_torch_fsdp2') or _resolve_validation_attr(
+        args, 'use_megatron_fsdp'
+    ):
+        raise ValueError(
+            "matrix-optimizer does not support FSDP yet. It requires matrix-axis-aware "
+            "FSDP sharding for matrix-owned params, momentum/master params, and "
+            "checkpoint state."
+        )
+
+
 def validate_muon_scalar_optimizer_support(args) -> None:
     """Keep CLI and YAML validation aligned for Muon scalar optimizer selection."""
     muon_scalar_optimizer = _resolve_validation_attr(args, 'muon_scalar_optimizer')
@@ -1805,12 +1820,7 @@ def validate_args(args, defaults={}):
     if args.matrix_optimizer != 'none':
         if 'muon' in args.optimizer:
             raise ValueError("--matrix-optimizer cannot be combined with --optimizer muon/dist_muon.")
-        if args.use_torch_fsdp2 or args.use_megatron_fsdp:
-            raise ValueError(
-                "matrix-optimizer does not support FSDP yet. It requires matrix-axis-aware "
-                "FSDP sharding for matrix-owned params, momentum/master params, and "
-                "checkpoint state."
-            )
+        validate_matrix_optimizer_fsdp_support(args)
         if args.use_distributed_optimizer:
             raise ValueError(
                 "Matrix optimizers do not support standard DistributedOptimizer until logical "

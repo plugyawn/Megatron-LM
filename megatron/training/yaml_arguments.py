@@ -22,6 +22,7 @@ from megatron.core.utils import get_torch_version, is_torch_min_version
 from megatron.training.arguments import (
     normalize_matrix_and_emerging_optimizer_args,
     validate_depth_mup_optimizer_support,
+    validate_matrix_optimizer_fsdp_support,
     validate_muon_scalar_optimizer_support,
     warn_deprecated_mup_aliases,
 )
@@ -378,6 +379,7 @@ def validate_yaml(args, defaults={}):
     args = SimpleNamespace(**args.__dict__, **args.language_model.__dict__)
     normalize_matrix_and_emerging_optimizer_args(args)
     validate_depth_mup_optimizer_support(args)
+    validate_matrix_optimizer_fsdp_support(args)
     validate_muon_scalar_optimizer_support(args)
     warn_deprecated_mup_aliases(args)
     sync_legacy_mup_fields(args, build_scaling_context(args))
