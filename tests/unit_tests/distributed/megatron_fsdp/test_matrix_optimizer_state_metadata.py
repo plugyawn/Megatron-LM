@@ -400,6 +400,7 @@ def test_matrix_optimizer_checkpoint_metadata_records_master_param_state(monkeyp
 
     metadata_block = state_dict[fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_KEY]
     metadata = metadata_block["params"]["0"]
+    assert metadata["declared_same_shard_state_names"] == ["master_param", "momentum_buffer"]
     assert metadata["same_shard_state_names"] == ["master_param", "momentum_buffer"]
     assert metadata["same_shard_state_shapes"] == {
         "master_param": [2, 3],

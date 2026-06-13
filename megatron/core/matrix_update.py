@@ -72,6 +72,7 @@ class TPUpdateMode(enum.Enum):
 
 MATRIX_OPTIMIZER_INFO_ATTR = "_mcore_matrix_optimizer_info"
 MATRIX_SHARD_SPEC_ATTR = "_mcore_matrix_shard_spec"
+MATRIX_OPTIMIZER_STATE_SPEC_ATTR = "_mcore_matrix_optimizer_state_spec"
 
 MATRIX_OPTIMIZER_OWNER_NONE = "none"
 MATRIX_OPTIMIZER_OWNER_MUON = "muon"
@@ -141,6 +142,20 @@ class MatrixOptimizerInfo:
     owner: Literal["none", "muon", "matrix_function", "fallback"]
     update_family: Literal["none", "sgd", "muon"]
     requires_layerwise_layout: bool = False
+
+
+@dataclass(frozen=True)
+class MatrixOptimizerStateSpec:
+    """Internal optimizer-state sharding contract for matrix-owned params.
+
+    ``same_shard_state_names`` names optimizer state tensors that, when present,
+    must have the same matrix shape and shard layout as the parameter. The names
+    are optional because optimizer state is usually materialized by the first
+    real ``optimizer.step()`` or by checkpoint load.
+    """
+
+    same_shard_state_names: tuple[str, ...] = ()
+    allow_discovered_same_shard_state: bool = True
 
 
 @dataclass(frozen=True)
@@ -503,11 +518,45 @@ def set_matrix_optimizer_info(
         requires_layerwise_layout=requires_layerwise_layout,
     )
     setattr(param, MATRIX_OPTIMIZER_INFO_ATTR, info)
+    set_matrix_optimizer_state_spec(
+        param, matrix_optimizer_state_spec_from_info(info)
+    )
     return info
 
 
 def get_matrix_optimizer_info(param: torch.nn.Parameter) -> Optional[MatrixOptimizerInfo]:
     return getattr(param, MATRIX_OPTIMIZER_INFO_ATTR, None)
+
+
+def matrix_optimizer_state_spec_from_info(
+    info: MatrixOptimizerInfo,
+) -> MatrixOptimizerStateSpec:
+    if info.owner == MATRIX_OPTIMIZER_OWNER_MUON or info.update_family == "muon":
+        return MatrixOptimizerStateSpec(
+            same_shard_state_names=("master_param", "momentum_buffer"),
+            allow_discovered_same_shard_state=True,
+        )
+    return MatrixOptimizerStateSpec()
+
+
+def set_matrix_optimizer_state_spec(
+    param: torch.nn.Parameter, spec: MatrixOptimizerStateSpec
+) -> None:
+    setattr(param, MATRIX_OPTIMIZER_STATE_SPEC_ATTR, spec)
+
+
+def get_matrix_optimizer_state_spec(
+    param: torch.nn.Parameter,
+) -> Optional[MatrixOptimizerStateSpec]:
+    spec = getattr(param, MATRIX_OPTIMIZER_STATE_SPEC_ATTR, None)
+    if spec is not None:
+        return spec
+    info = get_matrix_optimizer_info(param)
+    if info is None:
+        return None
+    spec = matrix_optimizer_state_spec_from_info(info)
+    set_matrix_optimizer_state_spec(param, spec)
+    return spec
 
 
 def get_matrix_optimizer_owner(param: torch.nn.Parameter) -> str:
@@ -590,6 +639,9 @@ def copy_matrix_optimizer_registration(
             info.owner in (MATRIX_OPTIMIZER_OWNER_MUON, MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION)
             and info.requires_layerwise_layout
         )
+        state_spec = get_matrix_optimizer_state_spec(src_param)
+        if state_spec is not None:
+            set_matrix_optimizer_state_spec(dst_param, state_spec)
     spec = shard_spec if shard_spec is not None else get_matrix_shard_spec(src_param)
     if spec is not None:
         set_matrix_shard_spec(dst_param, spec)

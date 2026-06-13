@@ -42,6 +42,7 @@ try:
         MATRIX_OPTIMIZER_OWNER_MUON,
         get_matrix_optimizer_info,
         get_matrix_shard_spec,
+        get_matrix_optimizer_state_spec,
         matrix_small_gram_side_for_spec,
         set_matrix_shard_spec,
     )
@@ -375,10 +376,25 @@ def _matrix_state_names_sharded_like_param(state: dict, param: DTensor) -> list[
     )
 
 
+def _matrix_declared_same_shard_state_names(param: DTensor) -> list[str]:
+    state_spec = get_matrix_optimizer_state_spec(param)
+    if state_spec is None:
+        return []
+    return sorted(state_spec.same_shard_state_names)
+
+
 def _matrix_same_shard_state_metadata(state: dict, param: DTensor) -> tuple[list[str], dict]:
     state_names = []
+    declared_state_names = set(_matrix_declared_same_shard_state_names(param))
     for state_name, state_value in state.items():
         _raise_if_uncontracted_matrix_state_sidecar(state_name, state_value, param)
+        if (
+            state_name in declared_state_names
+            and isinstance(state_value, torch.Tensor)
+            and state_value.numel() > 1
+            and not _matrix_state_tensor_matches_param_shape(state_value, param)
+        ):
+            _raise_unsupported_matrix_sidecar_state(state_name, state_value)
         if _is_same_shard_matrix_state_tensor(state_value, param):
             state_names.append(state_name)
     state_names = sorted(state_names)
@@ -503,6 +519,7 @@ def _matrix_optimizer_checkpoint_metadata(
                 ),
                 "matrix_shard_spec": _matrix_shard_spec_to_checkpoint_dict(matrix_shard_spec),
                 "same_shard_state_layout": MATRIX_OPTIMIZER_SAME_SHARD_STATE_LAYOUT,
+                "declared_same_shard_state_names": _matrix_declared_same_shard_state_names(param),
                 "same_shard_state_names": sorted(state_names),
                 "same_shard_state_shapes": state_shapes,
             }

@@ -28,6 +28,7 @@ from megatron.core.optimizer.matrix_update import (
     get_feature_gram_for_optimizer,
     get_grad_gram_for_optimizer,
     get_matrix_optimizer_info,
+    get_matrix_optimizer_state_spec,
     get_matrix_shard_spec,
     input_preconditioner_scope_for,
     is_matrix_update_eligible,
@@ -1419,6 +1420,8 @@ def test_matrix_optimizer_info_owner_family_invariants():
         owner=MATRIX_OPTIMIZER_OWNER_MUON,
         update_family="muon",
     )
+    state_spec = get_matrix_optimizer_state_spec(param)
+    assert state_spec.same_shard_state_names == ("master_param", "momentum_buffer")
 
     with pytest.raises(ValueError, match="owner 'muon' requires update_family='muon'"):
         set_matrix_optimizer_info(
