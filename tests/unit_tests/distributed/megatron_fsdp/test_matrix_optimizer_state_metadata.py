@@ -1309,38 +1309,50 @@ def test_matrix_fsdp_buffer_packs_column_axis_grad_workspace(monkeypatch):
     )
 
 
-def test_matrix_optimizer_axis1_fsdp_rejected_at_grouping():
+def test_matrix_optimizer_axis1_fsdp_grouping_uses_column_packing():
     module = torch.nn.Module()
     module.matrix = _tag_muon_matrix_param_with_axis1_fsdp(
         torch.nn.Parameter(torch.zeros(4, 3))
     )
 
-    with pytest.raises(NotImplementedError, match="matrix axis 1"):
-        _get_parameter_groups(
-            module,
-            BucketingPolicy(
-                suggested_bucket_size=None,
-                data_parallel_sharding_strategy="optim",
-            ),
-            meta_device_init_fp8_params={},
-        )
+    groups, _, _ = _get_parameter_groups(
+        module,
+        BucketingPolicy(
+            suggested_bucket_size=None,
+            data_parallel_sharding_strategy="optim",
+        ),
+        meta_device_init_fp8_params={},
+    )
+
+    matrix_groups = [group for group in groups if group.matrix_optimizer_owned]
+    assert len(matrix_groups) == 1
+    assert matrix_groups[0].matrix_dp_shard_axis == 1
+    assert matrix_groups[0].chunk_size_factor == 4
 
 
-def test_matrix_optimizer_axis1_fsdp_rejected_by_buffer_planner(monkeypatch):
+def test_matrix_optimizer_axis1_fsdp_buffer_planner_sets_column_spec(monkeypatch):
     monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
     param = _tag_muon_matrix_param_with_axis1_fsdp(
         torch.nn.Parameter(torch.zeros(4, 3))
     )
 
-    with pytest.raises(NotImplementedError, match="matrix axis 1"):
-        DataParallelBuffer(
-            ddp_config=SimpleNamespace(data_parallel_sharding_strategy="optim"),
-            params=[param],
-            is_data_distributed=True,
-            bucket_id=0,
-            data_parallel_group=None,
-        )
+    DataParallelBuffer(
+        ddp_config=SimpleNamespace(data_parallel_sharding_strategy="optim"),
+        params=[param],
+        is_data_distributed=True,
+        bucket_id=0,
+        data_parallel_group=None,
+        chunk_size_factor=4,
+    )
+
+    matrix_shard_spec = get_matrix_shard_spec(param)
+    assert matrix_shard_spec.dp_shard_axis == 1
+    assert matrix_shard_spec.dp_local_start == 0
+    assert matrix_shard_spec.dp_local_end == 2
+    assert matrix_shard_spec.local_shape == (4, 2)
+    assert matrix_shard_spec.pre_dp_local_shape == (4, 3)
+    assert matrix_shard_spec.small_gram_side == "left"
 
 
 def test_make_fsdp_dtensor_preserves_matrix_metadata(monkeypatch):
@@ -1404,19 +1416,23 @@ def test_make_fsdp_dtensor_accepts_packed_matrix_axis1_local_tensor(monkeypatch)
     assert get_matrix_shard_spec(fsdp_param).small_gram_side == "left"
 
 
-def test_matrix_optimizer_wide_unsharded_matrix_rejected_at_grouping():
+def test_matrix_optimizer_wide_unsharded_matrix_groups_for_column_packing():
     module = torch.nn.Module()
     module.matrix = _tag_muon_matrix_param(torch.nn.Parameter(torch.zeros(3, 8)))
 
-    with pytest.raises(NotImplementedError, match="matrix axis 1"):
-        _get_parameter_groups(
-            module,
-            BucketingPolicy(
-                suggested_bucket_size=None,
-                data_parallel_sharding_strategy="optim",
-            ),
-            meta_device_init_fp8_params={},
-        )
+    groups, _, _ = _get_parameter_groups(
+        module,
+        BucketingPolicy(
+            suggested_bucket_size=None,
+            data_parallel_sharding_strategy="optim",
+        ),
+        meta_device_init_fp8_params={},
+    )
+
+    matrix_groups = [group for group in groups if group.matrix_optimizer_owned]
+    assert len(matrix_groups) == 1
+    assert matrix_groups[0].matrix_dp_shard_axis == 1
+    assert matrix_groups[0].chunk_size_factor == 3
 
 
 def test_matrix_singleton_bucket_uneven_rows_remain_row_aligned():

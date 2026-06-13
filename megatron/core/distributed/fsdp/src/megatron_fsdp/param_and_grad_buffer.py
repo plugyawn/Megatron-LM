@@ -1252,32 +1252,29 @@ class DataParallelBuffer:
                 dp_rank=self.dp_rank,
                 dp_world_size=self.dp_world_size,
             )
-            if dp_shard_axis != 0:
-                raise NotImplementedError(
-                    "[Megatron-FSDP] Matrix optimizer-owned parameters that require "
-                    f"FSDP sharding on matrix axis {dp_shard_axis} are not supported by "
-                    "the current flat row-contiguous buffer planner. Supporting this "
-                    f"requires an explicit {matrix_shard_plan.dp_shard_layout} packing "
-                    "path; silently using the flat buffer shard would violate the "
-                    "small-Gram Muon contract."
-                )
-
-            row_stride = local_shape[1:].numel()
-            slice_start, slice_end = self._get_item_slice_in_shard(item_id)
-            if slice_start % row_stride != 0 or slice_end % row_stride != 0:
-                raise RuntimeError(
-                    "[Megatron-FSDP] Matrix optimizer-owned parameter shard is not row-aligned: "
-                    f"bucket_id={self.bucket_id}, item_id={item_id}, local_shape={tuple(local_shape)}, "
-                    f"slice=({slice_start}, {slice_end}), row_stride={row_stride}. "
-                    "Matrix-aware FSDP must shard this parameter on complete matrix rows."
-                )
+            if dp_shard_axis == 0:
+                row_stride = local_shape[1:].numel()
+                slice_start, slice_end = self._get_item_slice_in_shard(item_id)
+                if slice_start % row_stride != 0 or slice_end % row_stride != 0:
+                    raise RuntimeError(
+                        "[Megatron-FSDP] Matrix optimizer-owned parameter shard is not row-aligned: "
+                        f"bucket_id={self.bucket_id}, item_id={item_id}, "
+                        f"local_shape={tuple(local_shape)}, slice=({slice_start}, {slice_end}), "
+                        f"row_stride={row_stride}. Matrix-aware FSDP must shard this "
+                        "parameter on complete matrix rows."
+                    )
+                dp_local_start = slice_start // row_stride
+                dp_local_end = slice_end // row_stride
+            else:
+                dp_local_start = matrix_shard_plan.local_axis_start
+                dp_local_end = matrix_shard_plan.local_axis_end
             set_matrix_shard_spec(
                 param,
                 matrix_shard_spec_with_dp_axis(
                     matrix_shard_spec,
                     dp_shard_axis=dp_shard_axis,
-                    dp_local_start=slice_start // row_stride,
-                    dp_local_end=slice_end // row_stride,
+                    dp_local_start=dp_local_start,
+                    dp_local_end=dp_local_end,
                 ),
             )
 
@@ -1901,12 +1898,6 @@ def _get_parameter_groups(
                     "[Megatron-FSDP] Matrix optimizer-owned parameter is missing "
                     f"MatrixShardSpec metadata before FSDP grouping: {name}."
                 )
-            if matrix_dp_shard_axis != 0:
-                raise NotImplementedError(
-                    "[Megatron-FSDP] Matrix optimizer-owned parameters that require "
-                    f"FSDP sharding on matrix axis {matrix_dp_shard_axis} are not "
-                    f"supported by the current row-sharded FSDP buffer planner: {name}."
-                )
         param_attrs = dict(
             dtype="float8" if (is_fp8 or is_fp8_meta_device_init) else param.dtype,
             is_expert_param=is_expert_parameter(name, param),
@@ -2016,13 +2007,6 @@ def _get_parameter_groups(
                 dp_rank=0,
                 dp_world_size=1,
             )
-            if group.matrix_dp_shard_axis != 0:
-                raise NotImplementedError(
-                    "[Megatron-FSDP] Matrix optimizer-owned parameters that require "
-                    f"FSDP sharding on matrix axis {group.matrix_dp_shard_axis} are not "
-                    "supported by the current row-contiguous buffer planner. Supporting "
-                    f"this requires {matrix_shard_plan.dp_shard_layout} packing."
-                )
             new_bucket_groups.append(
                 ParameterGroup(
                     group.params,
