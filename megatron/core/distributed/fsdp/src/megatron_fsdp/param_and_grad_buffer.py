@@ -1656,7 +1656,7 @@ class DataParallelBuffer:
         Get Tensor item data from the given bucket specified by the item ID.
         """
         matrix_shard_plan = self._get_matrix_fsdp_shard_plan_for_item(item_id)
-        if matrix_shard_plan is not None:
+        if matrix_shard_plan is not None and matrix_shard_plan.dp_shard_axis == 1:
             item_index = self.item_index_map[item_id]
             matrix = _unpack_matrix_fsdp_global_bucket(
                 bucket.data,
