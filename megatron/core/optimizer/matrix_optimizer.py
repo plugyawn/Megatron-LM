@@ -27,7 +27,12 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
 
-from . import _get_megatron_optimizer_based_on_param_groups, _get_param_groups, get_megatron_optimizer
+from . import (
+    _distributed_optimizer_instance_id_from_process_groups,
+    _get_megatron_optimizer_based_on_param_groups,
+    _get_param_groups,
+    get_megatron_optimizer,
+)
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer
 from .matrix_function_optimizer import MatrixFunctionOptimizer
 from .optimizer import ChainedOptimizer, Float16OptimizerWithFloat16Params, FP32Optimizer, MegatronOptimizer
@@ -419,6 +424,9 @@ def get_megatron_matrix_optimizer(
             distopt_process_groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
                 pg_collection, model_chunks, use_gloo_process_groups=False
             )
+            distopt_distributed_optimizer_instance_id = (
+                _distributed_optimizer_instance_id_from_process_groups(distopt_process_groups)
+            )
             distopt_per_model_buffers = {}
             for model_chunk_idx, model_chunk in enumerate(model_chunks):
                 if not hasattr(model_chunk, 'buffers'):
@@ -441,7 +449,7 @@ def get_megatron_matrix_optimizer(
                 data_parallel_group_gloo=distopt_process_groups['intra_dp_cp_group_gloo'],
                 data_parallel_group_idx=get_pg_rank(distopt_process_groups['mp_group']),
                 intra_dist_opt_group=distopt_process_groups['intra_dist_opt_group'],
-                distributed_optimizer_instance_id=0,
+                distributed_optimizer_instance_id=distopt_distributed_optimizer_instance_id,
                 pg_collection=pg_collection,
                 skip_megatron_wrapping=False,
             )

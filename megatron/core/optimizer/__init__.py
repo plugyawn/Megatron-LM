@@ -789,6 +789,16 @@ def check_config_overrides_consistency(
     return True
 
 
+def _distributed_optimizer_instance_id_from_process_groups(process_groups_dict: Dict) -> int:
+    """Return the standard DistributedOptimizer instance id for optimizer process groups."""
+
+    dp_cp_group = process_groups_dict['dp_cp_group']
+    intra_dp_cp_group = process_groups_dict['intra_dp_cp_group']
+    if get_pg_size(dp_cp_group) > get_pg_size(intra_dp_cp_group):
+        return get_pg_rank(process_groups_dict['inter_dist_opt_group'])
+    return 0
+
+
 def _get_megatron_emerging_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
@@ -904,15 +914,8 @@ def _get_megatron_emerging_optimizer(
     )
     distopt_process_groups = None
     distopt_per_model_buffers = None
+    distopt_distributed_optimizer_instance_id = 0
     use_separate_distributed_optimizer = ddp_uses_distributed_optimizer and use_layer_wise
-    if use_separate_distributed_optimizer:
-        ddp_config = model_chunks[0].ddp_config
-        assert ddp_config.num_distributed_optimizer_instances == 1, (
-            "Layer-wise + DistributedOptimizer split path does not yet support "
-            "num_distributed_optimizer_instances > 1: distributed_optimizer_instance_id "
-            "is hardcoded to 0 in this path. Disable use_layer_wise_param_layout to "
-            "fall back to the legacy LayerWise ping-pong path."
-        )
     if use_separate_distributed_optimizer and any(
         opt_name not in _EMERGING_OPTIMIZERS
         for (opt_name, _), groups in grouped_param_groups.items()
@@ -923,6 +926,9 @@ def _get_megatron_emerging_optimizer(
         # here is False.
         distopt_process_groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
             pg_collection, model_chunks, use_gloo_process_groups=False
+        )
+        distopt_distributed_optimizer_instance_id = (
+            _distributed_optimizer_instance_id_from_process_groups(distopt_process_groups)
         )
         # DistOpt should only manage non-LayerWise buffers (those holding
         # embeddings, biases, layernorm, etc.). Filter out the LayerWise
@@ -1000,7 +1006,7 @@ def _get_megatron_emerging_optimizer(
                     data_parallel_group_gloo=distopt_process_groups['intra_dp_cp_group_gloo'],
                     data_parallel_group_idx=get_pg_rank(distopt_process_groups['mp_group']),
                     intra_dist_opt_group=distopt_process_groups['intra_dist_opt_group'],
-                    distributed_optimizer_instance_id=0,
+                    distributed_optimizer_instance_id=distopt_distributed_optimizer_instance_id,
                     pg_collection=pg_collection,
                     skip_megatron_wrapping=False,
                 )
@@ -1128,11 +1134,9 @@ def get_megatron_optimizer(
 
     model_parallel_rank = get_pg_rank(mp_group)
 
-    if get_pg_size(dp_cp_group) > get_pg_size(intra_dp_cp_group):
-        inter_dist_opt_group = process_groups_dict['inter_dist_opt_group']
-        distributed_optimizer_instance_id = get_pg_rank(inter_dist_opt_group)
-    else:
-        distributed_optimizer_instance_id = 0
+    distributed_optimizer_instance_id = _distributed_optimizer_instance_id_from_process_groups(
+        process_groups_dict
+    )
 
     optimizers = []
     model_chunk_offset = 0
