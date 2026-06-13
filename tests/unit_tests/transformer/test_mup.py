@@ -28,7 +28,7 @@ from megatron.core.optimizer import (
 )
 from megatron.core.matrix_update import (
     MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
-    set_matrix_optimizer_info,
+    register_matrix_optimizer_param,
 )
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.optimizer_param_scheduler import combine_param_group_overrides
@@ -1696,7 +1696,7 @@ class TestMuPOptimizerTypeHandling:
 
         param = torch.nn.Parameter(torch.zeros(10, 10))
         set_parameterization_metadata(param, role=ROLE_HIDDEN_MATRIX)
-        set_matrix_optimizer_info(
+        register_matrix_optimizer_param(
             param,
             owner=MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
             update_family='muon',

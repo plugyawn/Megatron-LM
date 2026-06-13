@@ -37,6 +37,7 @@ from megatron.core.optimizer.matrix_update import (
     input_preconditioner_scope_for,
     is_matrix_update_eligible,
     matrix_fsdp_shard_axis_for_spec,
+    matrix_shard_spec_from_linear_weight_info,
     matrix_shard_spec_with_dp_axis,
     matrix_small_gram_side_for_spec,
     matrix_update_family_from_optimizer_name,
@@ -46,8 +47,8 @@ from megatron.core.optimizer.matrix_update import (
     set_feature_gram_finalization_required,
     set_grad_gram_finalization_required,
     set_linear_weight_info,
-    set_matrix_optimizer_info,
-    set_matrix_shard_spec,
+    register_matrix_optimizer_param,
+    update_matrix_shard_spec,
 )
 from megatron.training.arguments import normalize_matrix_and_emerging_optimizer_args
 
@@ -65,6 +66,10 @@ def _param_with_info(tp_layout="column_parallel", shape=(4, 3), logical_shape=No
         has_bias=True,
     )
     return param
+
+
+def _spec_from_info(param):
+    return matrix_shard_spec_from_linear_weight_info(param._mcore_linear_weight_info)
 
 
 def _recipe(
@@ -358,7 +363,7 @@ def test_lm_head_marker_excludes_matrix_update_eligibility():
 def test_matrix_shard_spec_records_actual_tp_shard_axis():
     param = _param_with_info(tp_layout="column_parallel", shape=(2, 3), logical_shape=(4, 3))
 
-    spec = get_matrix_shard_spec(param)
+    spec = _spec_from_info(param)
 
     assert spec.logical_shape == (4, 3)
     assert spec.local_shape == (2, 3)
@@ -369,7 +374,7 @@ def test_matrix_shard_spec_records_actual_tp_shard_axis():
 def test_matrix_shard_spec_does_not_infer_shard_axis_from_tp1_layout_label():
     param = _param_with_info(tp_layout="column_parallel", shape=(4, 3), logical_shape=(4, 3))
 
-    spec = get_matrix_shard_spec(param)
+    spec = _spec_from_info(param)
 
     assert spec.tp_shard_axis is None
 
@@ -384,10 +389,10 @@ def test_matrix_fsdp_shard_axis_aligns_with_tp_axis():
     unsharded = _param_with_info(tp_layout="column_parallel", shape=(4, 3), logical_shape=(4, 3))
     wide_unsharded = _param_with_info(tp_layout="none", shape=(3, 8), logical_shape=(3, 8))
 
-    assert matrix_fsdp_shard_axis_for_spec(get_matrix_shard_spec(row_sharded)) == 0
-    assert matrix_fsdp_shard_axis_for_spec(get_matrix_shard_spec(col_sharded)) == 1
-    assert matrix_fsdp_shard_axis_for_spec(get_matrix_shard_spec(unsharded)) == 0
-    assert matrix_fsdp_shard_axis_for_spec(get_matrix_shard_spec(wide_unsharded)) == 1
+    assert matrix_fsdp_shard_axis_for_spec(_spec_from_info(row_sharded)) == 0
+    assert matrix_fsdp_shard_axis_for_spec(_spec_from_info(col_sharded)) == 1
+    assert matrix_fsdp_shard_axis_for_spec(_spec_from_info(unsharded)) == 0
+    assert matrix_fsdp_shard_axis_for_spec(_spec_from_info(wide_unsharded)) == 1
 
 
 def test_matrix_shard_spec_small_gram_side():
@@ -400,18 +405,18 @@ def test_matrix_shard_spec_small_gram_side():
     tall_unsharded = _param_with_info(tp_layout="none", shape=(8, 3), logical_shape=(8, 3))
     wide_unsharded = _param_with_info(tp_layout="none", shape=(3, 8), logical_shape=(3, 8))
 
-    assert matrix_small_gram_side_for_spec(get_matrix_shard_spec(row_sharded)) == "right"
-    assert matrix_small_gram_side_for_spec(get_matrix_shard_spec(col_sharded)) == "left"
-    assert matrix_small_gram_side_for_spec(get_matrix_shard_spec(tall_unsharded)) == "right"
-    assert matrix_small_gram_side_for_spec(get_matrix_shard_spec(wide_unsharded)) == "left"
-    assert get_matrix_shard_spec(row_sharded).small_gram_side == "right"
+    assert matrix_small_gram_side_for_spec(_spec_from_info(row_sharded)) == "right"
+    assert matrix_small_gram_side_for_spec(_spec_from_info(col_sharded)) == "left"
+    assert matrix_small_gram_side_for_spec(_spec_from_info(tall_unsharded)) == "right"
+    assert matrix_small_gram_side_for_spec(_spec_from_info(wide_unsharded)) == "left"
+    assert _spec_from_info(row_sharded).small_gram_side == "right"
 
 
 def test_matrix_shard_spec_rejects_conflicting_tp_dp_axes():
     col_sharded = _param_with_info(
         tp_layout="row_parallel", shape=(4, 2), logical_shape=(4, 4)
     )
-    spec = get_matrix_shard_spec(col_sharded)
+    spec = _spec_from_info(col_sharded)
 
     with pytest.raises(ValueError, match="differs from the TP shard axis"):
         matrix_shard_spec_with_dp_axis(spec, dp_shard_axis=0)
@@ -420,7 +425,7 @@ def test_matrix_shard_spec_rejects_conflicting_tp_dp_axes():
 def test_matrix_shard_spec_dp_row_range_updates_local_shape():
     param = _param_with_info(tp_layout="none", shape=(8, 3), logical_shape=(8, 3))
     spec = matrix_shard_spec_with_dp_axis(
-        get_matrix_shard_spec(param),
+        _spec_from_info(param),
         dp_shard_axis=0,
         dp_local_start=2,
         dp_local_end=5,
@@ -436,7 +441,7 @@ def test_matrix_shard_spec_dp_row_range_updates_local_shape():
 def test_matrix_shard_spec_dp_row_range_uses_pre_dp_shape_when_present():
     param = _param_with_info(tp_layout="none", shape=(8, 3), logical_shape=(8, 3))
     spec = matrix_shard_spec_with_dp_axis(
-        get_matrix_shard_spec(param),
+        _spec_from_info(param),
         dp_shard_axis=0,
         dp_local_start=2,
         dp_local_end=5,
@@ -508,7 +513,7 @@ def test_matrix_shard_spec_direct_constructor_allows_dp_local_shape_without_pre_
 def test_matrix_shard_spec_dp_empty_row_range_is_valid():
     param = _param_with_info(tp_layout="none", shape=(8, 3), logical_shape=(8, 3))
     spec = matrix_shard_spec_with_dp_axis(
-        get_matrix_shard_spec(param),
+        _spec_from_info(param),
         dp_shard_axis=0,
         dp_local_start=4,
         dp_local_end=4,
@@ -526,7 +531,7 @@ def test_matrix_shard_spec_dp_row_range_requires_complete_range():
 
     with pytest.raises(ValueError, match="provided together"):
         matrix_shard_spec_with_dp_axis(
-            get_matrix_shard_spec(param),
+            _spec_from_info(param),
             dp_shard_axis=0,
             dp_local_start=2,
         )
@@ -537,7 +542,7 @@ def test_matrix_shard_spec_dp_row_range_rejects_out_of_bounds_range():
 
     with pytest.raises(ValueError, match="exceeds the pre-DP local matrix shape"):
         matrix_shard_spec_with_dp_axis(
-            get_matrix_shard_spec(param),
+            _spec_from_info(param),
             dp_shard_axis=0,
             dp_local_start=7,
             dp_local_end=9,
@@ -547,7 +552,7 @@ def test_matrix_shard_spec_dp_row_range_rejects_out_of_bounds_range():
 def test_matrix_shard_spec_dp_column_range_updates_local_shape():
     param = _param_with_info(tp_layout="none", shape=(3, 8), logical_shape=(3, 8))
     spec = matrix_shard_spec_with_dp_axis(
-        get_matrix_shard_spec(param),
+        _spec_from_info(param),
         dp_shard_axis=1,
         dp_local_start=2,
         dp_local_end=5,
@@ -687,7 +692,7 @@ def test_matrix_function_muon_metadata_counts_as_muon_managed_for_scaling():
     from megatron.core.parameterization.roles import is_muon_managed_matrix_parameter
 
     param = _param_with_info(shape=(6, 4))
-    set_matrix_optimizer_info(
+    register_matrix_optimizer_param(
         param,
         owner=MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
         update_family="muon",
@@ -1585,7 +1590,13 @@ def test_matrix_update_rule_uses_fsdp_small_gram_and_logical_scale(monkeypatch):
     import megatron.core.optimizer.matrix_optimizer as matrix_optimizer_module
 
     param = _param_with_info(tp_layout="none", shape=(2, 2), logical_shape=(4, 2))
-    set_matrix_shard_spec(
+    register_matrix_optimizer_param(
+        param,
+        owner=MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
+        update_family="muon",
+        requires_layerwise_layout=True,
+    )
+    update_matrix_shard_spec(
         param,
         matrix_shard_spec_with_dp_axis(
             MatrixShardSpec(logical_shape=(4, 2), local_shape=(4, 2), tp_layout="none"),
@@ -2052,7 +2063,7 @@ def test_matrix_update_family_rejects_optimizer_variants():
 def test_matrix_optimizer_info_owner_family_invariants():
     param = torch.nn.Parameter(torch.empty(2, 2))
 
-    set_matrix_optimizer_info(
+    register_matrix_optimizer_param(
         param,
         owner=MATRIX_OPTIMIZER_OWNER_MUON,
         update_family="muon",
@@ -2061,21 +2072,21 @@ def test_matrix_optimizer_info_owner_family_invariants():
     assert state_spec.same_shard_state_names == ("master_param", "momentum_buffer")
 
     with pytest.raises(ValueError, match="owner 'muon' requires update_family='muon'"):
-        set_matrix_optimizer_info(
+        register_matrix_optimizer_param(
             param,
             owner=MATRIX_OPTIMIZER_OWNER_MUON,
             update_family="sgd",
         )
 
     with pytest.raises(ValueError, match="owner 'fallback' requires update_family='none'"):
-        set_matrix_optimizer_info(
+        register_matrix_optimizer_param(
             param,
             owner=MATRIX_OPTIMIZER_OWNER_FALLBACK,
             update_family="muon",
         )
 
     with pytest.raises(ValueError, match="owner 'matrix_function' requires an active"):
-        set_matrix_optimizer_info(
+        register_matrix_optimizer_param(
             param,
             owner=MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
             update_family="none",

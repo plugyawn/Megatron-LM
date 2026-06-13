@@ -26,8 +26,8 @@ from megatron.core.matrix_update import (
     MATRIX_OPTIMIZER_OWNER_MUON,
     MatrixShardSpec,
     get_matrix_shard_spec,
-    set_matrix_optimizer_info,
-    set_matrix_shard_spec,
+    register_matrix_optimizer_param,
+    update_matrix_shard_spec,
 )
 
 
@@ -89,13 +89,13 @@ def test_matrix_optimizer_owned_param_state_checkpoint_contract(distributed_cuda
         "cuda", mesh_shape=(setup["world_size"], 1), mesh_dim_names=("dp_shard", "tp")
     )
     toy_model = _ToyMatrixModel(setup["device"])
-    set_matrix_optimizer_info(
+    register_matrix_optimizer_param(
         toy_model.linear.weight,
         owner=MATRIX_OPTIMIZER_OWNER_MUON,
         update_family="muon",
         requires_layerwise_layout=True,
     )
-    set_matrix_shard_spec(
+    update_matrix_shard_spec(
         toy_model.linear.weight,
         MatrixShardSpec(
             logical_shape=tuple(toy_model.linear.weight.shape),
@@ -182,13 +182,13 @@ def test_matrix_optimizer_owned_column_axis_param_state_checkpoint_contract(
         "cuda", mesh_shape=(setup["world_size"], 1), mesh_dim_names=("dp_shard", "tp")
     )
     toy_model = _ToyMatrixModel(setup["device"], in_features=5, out_features=3)
-    set_matrix_optimizer_info(
+    register_matrix_optimizer_param(
         toy_model.linear.weight,
         owner=MATRIX_OPTIMIZER_OWNER_MUON,
         update_family="muon",
         requires_layerwise_layout=True,
     )
-    set_matrix_shard_spec(
+    update_matrix_shard_spec(
         toy_model.linear.weight,
         MatrixShardSpec(
             logical_shape=tuple(toy_model.linear.weight.shape),

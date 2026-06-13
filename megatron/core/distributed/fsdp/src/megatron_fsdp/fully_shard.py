@@ -43,7 +43,7 @@ try:
         get_matrix_optimizer_state_spec,
         is_matrix_optimizer_owned_parameter,
         matrix_small_gram_side_for_spec,
-        set_matrix_shard_spec,
+        update_matrix_shard_spec,
     )
 
     HAVE_MCORE_MATRIX_UPDATE = True
@@ -602,7 +602,7 @@ def _validate_matrix_optimizer_state_sharding(
                         f"state placements={state_value.placements}, "
                         f"param placements={param.placements}."
                     )
-                set_matrix_shard_spec(state_value, matrix_shard_spec)
+                update_matrix_shard_spec(state_value, matrix_shard_spec)
 
 
 def _matrix_optimizer_checkpoint_metadata(

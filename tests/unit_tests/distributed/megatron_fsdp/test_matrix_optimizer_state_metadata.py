@@ -31,9 +31,9 @@ from megatron.core.matrix_update import (
     MatrixShardSpec,
     get_matrix_optimizer_info,
     get_matrix_shard_spec,
-    set_matrix_optimizer_info,
-    set_matrix_optimizer_state_spec,
-    set_matrix_shard_spec,
+    register_matrix_optimizer_param,
+    update_matrix_optimizer_state_spec,
+    update_matrix_shard_spec,
 )
 
 
@@ -93,13 +93,13 @@ def _matrix_param(shape=(2, 3), name="layers.0.weight"):
     param.device_mesh = _fake_mesh()
     param.placements = ("shard0",)
     param.megatron_fsdp_param_name = name
-    set_matrix_optimizer_info(
+    register_matrix_optimizer_param(
         param,
         owner=MATRIX_OPTIMIZER_OWNER_MUON,
         update_family="muon",
         requires_layerwise_layout=True,
     )
-    set_matrix_shard_spec(
+    update_matrix_shard_spec(
         param,
         MatrixShardSpec(
             logical_shape=shape,
@@ -115,13 +115,13 @@ def _matrix_param(shape=(2, 3), name="layers.0.weight"):
 
 
 def _tag_muon_matrix_param(param):
-    set_matrix_optimizer_info(
+    register_matrix_optimizer_param(
         param,
         owner=MATRIX_OPTIMIZER_OWNER_MUON,
         update_family="muon",
         requires_layerwise_layout=True,
     )
-    set_matrix_shard_spec(
+    update_matrix_shard_spec(
         param,
         MatrixShardSpec(
             logical_shape=tuple(param.shape),
@@ -137,7 +137,7 @@ class _TinyMatrixFsdpModule(torch.nn.Module):
         super().__init__()
         self.linear = torch.nn.Linear(3, 5, bias=True, device=device)
         _tag_muon_matrix_param(self.linear.weight)
-        set_matrix_optimizer_state_spec(
+        update_matrix_optimizer_state_spec(
             self.linear.weight,
             MatrixOptimizerStateSpec(("momentum_buffer", "master_param")),
         )
@@ -190,13 +190,13 @@ def _real_fsdp_matrix_distopt_state(seed):
 
 
 def _tag_muon_matrix_param_with_axis1_fsdp(param):
-    set_matrix_optimizer_info(
+    register_matrix_optimizer_param(
         param,
         owner=MATRIX_OPTIMIZER_OWNER_MUON,
         update_family="muon",
         requires_layerwise_layout=True,
     )
-    set_matrix_shard_spec(
+    update_matrix_shard_spec(
         param,
         MatrixShardSpec(
             logical_shape=(param.shape[0], param.shape[1] * 2),
@@ -1413,13 +1413,13 @@ def test_matrix_fsdp_buffer_set_get_row_axis_packed_item(monkeypatch):
         chunk_size_factor=3,
     )
     buffer.init_data(torch.full((buffer.data_size,), -1.0))
-    set_matrix_optimizer_info(
+    register_matrix_optimizer_param(
         param,
         owner=MATRIX_OPTIMIZER_OWNER_MUON,
         update_family="muon",
         requires_layerwise_layout=True,
     )
-    set_matrix_shard_spec(
+    update_matrix_shard_spec(
         param,
         MatrixShardSpec(
             logical_shape=(5, 3),
@@ -1452,13 +1452,13 @@ def test_matrix_fsdp_buffer_set_get_column_axis_packed_item(monkeypatch):
         chunk_size_factor=3,
     )
     buffer.init_data(torch.full((buffer.data_size,), -1.0))
-    set_matrix_optimizer_info(
+    register_matrix_optimizer_param(
         param,
         owner=MATRIX_OPTIMIZER_OWNER_MUON,
         update_family="muon",
         requires_layerwise_layout=True,
     )
-    set_matrix_shard_spec(
+    update_matrix_shard_spec(
         param,
         MatrixShardSpec(
             logical_shape=(3, 5),
@@ -1491,13 +1491,13 @@ def test_matrix_fsdp_buffer_unpacks_global_bucket_to_row_major_item(monkeypatch)
         chunk_size_factor=3,
     )
     buffer.init_data(torch.empty(buffer.data_size))
-    set_matrix_optimizer_info(
+    register_matrix_optimizer_param(
         param,
         owner=MATRIX_OPTIMIZER_OWNER_MUON,
         update_family="muon",
         requires_layerwise_layout=True,
     )
-    set_matrix_shard_spec(
+    update_matrix_shard_spec(
         param,
         MatrixShardSpec(
             logical_shape=(3, 5),
@@ -1534,13 +1534,13 @@ def test_matrix_fsdp_buffer_row_axis_global_bucket_item_stays_bucket_view(monkey
         chunk_size_factor=3,
     )
     buffer.init_data(torch.empty(buffer.data_size))
-    set_matrix_optimizer_info(
+    register_matrix_optimizer_param(
         param,
         owner=MATRIX_OPTIMIZER_OWNER_MUON,
         update_family="muon",
         requires_layerwise_layout=True,
     )
-    set_matrix_shard_spec(
+    update_matrix_shard_spec(
         param,
         MatrixShardSpec(
             logical_shape=(5, 3),
@@ -1579,13 +1579,13 @@ def test_matrix_fsdp_buffer_refreshes_column_axis_param_workspace(monkeypatch):
         chunk_size_factor=3,
     )
     buffer.init_data(torch.empty(buffer.data_size))
-    set_matrix_optimizer_info(
+    register_matrix_optimizer_param(
         param,
         owner=MATRIX_OPTIMIZER_OWNER_MUON,
         update_family="muon",
         requires_layerwise_layout=True,
     )
-    set_matrix_shard_spec(
+    update_matrix_shard_spec(
         param,
         MatrixShardSpec(
             logical_shape=(3, 5),
@@ -1622,13 +1622,13 @@ def test_matrix_fsdp_buffer_packs_column_axis_grad_workspace(monkeypatch):
         chunk_size_factor=3,
     )
     buffer.init_data(torch.empty(buffer.data_size))
-    set_matrix_optimizer_info(
+    register_matrix_optimizer_param(
         param,
         owner=MATRIX_OPTIMIZER_OWNER_MUON,
         update_family="muon",
         requires_layerwise_layout=True,
     )
-    set_matrix_shard_spec(
+    update_matrix_shard_spec(
         param,
         MatrixShardSpec(
             logical_shape=(3, 5),
@@ -1668,13 +1668,13 @@ def test_matrix_fsdp_column_axis_grad_workspace_survives_fresh_bucket_wrapper(mo
         chunk_size_factor=3,
     )
     buffer.init_data(torch.empty(buffer.data_size))
-    set_matrix_optimizer_info(
+    register_matrix_optimizer_param(
         param,
         owner=MATRIX_OPTIMIZER_OWNER_MUON,
         update_family="muon",
         requires_layerwise_layout=True,
     )
-    set_matrix_shard_spec(
+    update_matrix_shard_spec(
         param,
         MatrixShardSpec(
             logical_shape=(3, 5),
@@ -1810,7 +1810,7 @@ def test_make_fsdp_dtensor_preserves_matrix_metadata(monkeypatch):
     monkeypatch.setattr(param_buffer_module, "DTensor", _FakeFSDPDTensor)
     monkeypatch.setattr(param_buffer_module, "using_tensor_parallel", lambda *args, **kwargs: False)
     param = _tag_muon_matrix_param(torch.nn.Parameter(torch.zeros(4, 3)))
-    set_matrix_shard_spec(
+    update_matrix_shard_spec(
         param,
         param_buffer_module.matrix_shard_spec_with_dp_axis(
             get_matrix_shard_spec(param),
@@ -1851,13 +1851,13 @@ def test_make_fsdp_dtensor_accepts_packed_matrix_axis1_local_tensor(monkeypatch)
     monkeypatch.setattr(param_buffer_module, "DTensor", _FakeFSDPDTensor)
     monkeypatch.setattr(param_buffer_module, "using_tensor_parallel", lambda *args, **kwargs: False)
     param = torch.nn.Parameter(torch.zeros(3, 5))
-    set_matrix_optimizer_info(
+    register_matrix_optimizer_param(
         param,
         owner=MATRIX_OPTIMIZER_OWNER_MUON,
         update_family="muon",
         requires_layerwise_layout=True,
     )
-    set_matrix_shard_spec(
+    update_matrix_shard_spec(
         param,
         MatrixShardSpec(
             logical_shape=(3, 5),

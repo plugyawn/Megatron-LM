@@ -10,8 +10,8 @@ optionally left-preconditions it with ``C_out = dY.T @ dY``.
 
 from __future__ import annotations
 
-import copy
 import logging
+from dataclasses import replace
 from typing import Dict, List, Optional
 
 import torch
@@ -525,11 +525,13 @@ def get_megatron_matrix_optimizer(
         matrix_optimizer = FP32Optimizer(matrix_optimizer, config, matrix_init_state_fn)
     _set_matrix_optimizer_process_groups(matrix_optimizer, pg_collection)
 
-    fallback_config = copy.copy(config)
-    fallback_config.matrix_optimizer = "none"
-    fallback_config.use_layer_wise_distributed_optimizer = False
+    fallback_config = replace(
+        config,
+        matrix_optimizer="none",
+        use_layer_wise_distributed_optimizer=False,
+    )
     if use_separate_distributed_optimizer:
-        fallback_config.use_distributed_optimizer = True
+        fallback_config = replace(fallback_config, use_distributed_optimizer=True)
     fallback_param_groups = _get_param_groups(
         model_chunks, fallback_config, config_overrides, param_filter=is_fallback_param
     )

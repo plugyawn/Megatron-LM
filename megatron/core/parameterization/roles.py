@@ -149,7 +149,12 @@ def is_hidden_matrix_parameter(param: Any, param_name: Optional[str] = None) -> 
 def is_muon_update_family_matrix_parameter(param: Any, *, optimizer_type: str) -> bool:
     """Return whether matrix-update scaling should be owned by Muon semantics."""
 
-    matrix_optimizer_info = getattr(param, '_mcore_matrix_optimizer_info', None)
+    try:
+        from megatron.core.matrix_update import get_matrix_optimizer_info
+
+        matrix_optimizer_info = get_matrix_optimizer_info(param)
+    except ImportError:
+        matrix_optimizer_info = getattr(param, '_mcore_matrix_optimizer_info', None)
     if matrix_optimizer_info is not None:
         return (
             getattr(matrix_optimizer_info, 'owner', None) == 'muon'

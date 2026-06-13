@@ -338,8 +338,21 @@ def matrix_shard_spec_from_linear_weight_info(info: LinearWeightInfo) -> MatrixS
     )
 
 
-def set_matrix_shard_spec(param: torch.nn.Parameter, spec: MatrixShardSpec) -> None:
+def _set_matrix_shard_spec(param: torch.nn.Parameter, spec: MatrixShardSpec) -> None:
     setattr(param, MATRIX_SHARD_SPEC_ATTR, spec)
+
+
+def update_matrix_shard_spec(param: torch.nn.Parameter, spec: MatrixShardSpec) -> None:
+    """Attach planner-produced matrix shard metadata to a tensor.
+
+    Optimizer ownership must be registered through
+    ``register_matrix_optimizer_param``. This helper is for layout transitions
+    that replace or shard an already-registered matrix tensor, and for
+    validated same-shard optimizer state tensors that inherit the parameter's
+    matrix layout.
+    """
+
+    _set_matrix_shard_spec(param, spec)
 
 
 def get_matrix_shard_spec(param: torch.nn.Parameter) -> Optional[MatrixShardSpec]:
@@ -371,7 +384,7 @@ def _ensure_matrix_shard_spec(param: torch.nn.Parameter) -> MatrixShardSpec:
             local_shape=tuple(param.shape),
             tp_layout="none",
         )
-    set_matrix_shard_spec(param, spec)
+    _set_matrix_shard_spec(param, spec)
     return spec
 
 
@@ -469,7 +482,7 @@ def matrix_shard_spec_with_dp_axis(
     )
 
 
-def set_matrix_optimizer_info(
+def _set_matrix_optimizer_info(
     param: torch.nn.Parameter,
     *,
     owner: Literal["none", "muon", "matrix_function", "fallback"],
@@ -510,7 +523,7 @@ def set_matrix_optimizer_info(
         requires_layerwise_layout=requires_layerwise_layout,
     )
     setattr(param, MATRIX_OPTIMIZER_INFO_ATTR, info)
-    set_matrix_optimizer_state_spec(
+    _set_matrix_optimizer_state_spec(
         param, matrix_optimizer_state_spec_from_info(info)
     )
     return info
@@ -531,10 +544,23 @@ def matrix_optimizer_state_spec_from_info(
     return MatrixOptimizerStateSpec()
 
 
-def set_matrix_optimizer_state_spec(
+def _set_matrix_optimizer_state_spec(
     param: torch.nn.Parameter, spec: MatrixOptimizerStateSpec
 ) -> None:
     setattr(param, MATRIX_OPTIMIZER_STATE_SPEC_ATTR, spec)
+
+
+def update_matrix_optimizer_state_spec(
+    param: torch.nn.Parameter, spec: MatrixOptimizerStateSpec
+) -> None:
+    """Override optimizer-state shard metadata for explicit checkpoint tests/planners."""
+
+    if get_matrix_optimizer_info(param) is None:
+        raise RuntimeError(
+            "Matrix optimizer state metadata can only be overridden after "
+            "register_matrix_optimizer_param() has established ownership."
+        )
+    _set_matrix_optimizer_state_spec(param, spec)
 
 
 def get_matrix_optimizer_state_spec(
@@ -547,7 +573,7 @@ def get_matrix_optimizer_state_spec(
     if info is None:
         return None
     spec = matrix_optimizer_state_spec_from_info(info)
-    set_matrix_optimizer_state_spec(param, spec)
+    _set_matrix_optimizer_state_spec(param, spec)
     return spec
 
 
@@ -595,7 +621,7 @@ def register_matrix_optimizer_param(
     and tag LayerWise routing; those invariants must move together.
     """
 
-    info = set_matrix_optimizer_info(
+    info = _set_matrix_optimizer_info(
         param,
         owner=owner,
         update_family=update_family,
@@ -621,22 +647,19 @@ def copy_matrix_optimizer_registration(
     info = get_matrix_optimizer_info(src_param)
     copied_info = None
     if info is not None:
-        copied_info = set_matrix_optimizer_info(
+        copied_info = register_matrix_optimizer_param(
             dst_param,
             owner=info.owner,
             update_family=info.update_family,
             requires_layerwise_layout=info.requires_layerwise_layout,
-        )
-        dst_param.is_managed_by_layer_wise_optimizer = (
-            info.owner in (MATRIX_OPTIMIZER_OWNER_MUON, MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION)
-            and info.requires_layerwise_layout
+            ensure_shard_spec=False,
         )
         state_spec = get_matrix_optimizer_state_spec(src_param)
         if state_spec is not None:
-            set_matrix_optimizer_state_spec(dst_param, state_spec)
+            _set_matrix_optimizer_state_spec(dst_param, state_spec)
     spec = shard_spec if shard_spec is not None else get_matrix_shard_spec(src_param)
     if spec is not None:
-        set_matrix_shard_spec(dst_param, spec)
+        update_matrix_shard_spec(dst_param, spec)
     return copied_info
 
 
@@ -720,7 +743,6 @@ def set_linear_weight_info(
         "_mcore_linear_weight_info",
         info,
     )
-    set_matrix_shard_spec(param, matrix_shard_spec_from_linear_weight_info(info))
     setattr(param, "_feature_gram_collector", collector)
 
 

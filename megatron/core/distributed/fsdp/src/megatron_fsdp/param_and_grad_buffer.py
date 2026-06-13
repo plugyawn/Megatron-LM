@@ -67,7 +67,7 @@ try:
         is_matrix_optimizer_owned_parameter,
         matrix_fsdp_shard_axis_for_spec,
         matrix_shard_spec_with_dp_axis,
-        set_matrix_shard_spec,
+        update_matrix_shard_spec,
     )
 
     HAVE_MCORE_MATRIX_UPDATE = True
@@ -1274,7 +1274,7 @@ class DataParallelBuffer:
             else:
                 dp_local_start = matrix_shard_plan.local_axis_start
                 dp_local_end = matrix_shard_plan.local_axis_end
-            set_matrix_shard_spec(
+            update_matrix_shard_spec(
                 param,
                 matrix_shard_spec_with_dp_axis(
                     matrix_shard_spec,
