@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from megatron.core.optimizer import OptimizerConfig, ParamKey
+from megatron.core.optimizer.emerging_optimizers import _is_nonlinear_or_embedding
 from megatron.core.optimizer.matrix_function_optimizer import (
     MatrixFunctionOptimizer,
     default_matrix_apply_plan,
@@ -50,6 +51,7 @@ from megatron.core.optimizer.matrix_update import (
     register_matrix_optimizer_param,
     update_matrix_shard_spec,
 )
+from megatron.core.parameterization.roles import ROLE_OUTPUT, set_parameterization_metadata
 from megatron.training.arguments import normalize_matrix_and_emerging_optimizer_args
 
 
@@ -150,6 +152,13 @@ def test_block_diag_feature_gram_accumulates_padded_blocks():
     padded_last = torch.nn.functional.pad(x[:, 2:], (0, 1))
     expected[1] = padded_last.t().matmul(padded_last)
     torch.testing.assert_close(param.main_grad_feature_gram, expected)
+
+
+def test_emerging_muon_scalar_override_honors_role_only_output_parameter():
+    param = torch.nn.Parameter(torch.empty(4, 3))
+    set_parameterization_metadata(param, role=ROLE_OUTPUT)
+
+    assert _is_nonlinear_or_embedding(param)
 
 
 def test_full_grad_gram_accumulates_raw_sum():

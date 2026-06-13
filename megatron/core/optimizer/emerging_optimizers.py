@@ -21,6 +21,7 @@ from megatron.core.matrix_update import (
     MATRIX_OPTIMIZER_OWNER_NONE,
     get_matrix_optimizer_owner,
 )
+from megatron.core.parameterization.roles import is_embedding_or_output_parameter
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_pg_size, log_single_rank
 
@@ -148,7 +149,7 @@ def _is_nonlinear_or_embedding(param):
     matrix_optimizer_owner = get_matrix_optimizer_owner(param)
     if matrix_optimizer_owner != MATRIX_OPTIMIZER_OWNER_NONE:
         return matrix_optimizer_owner != MATRIX_OPTIMIZER_OWNER_MUON
-    return getattr(param, 'is_embedding_or_output_parameter', False) or len(param.shape) != 2
+    return is_embedding_or_output_parameter(param) or len(param.shape) != 2
 
 
 def _get_qkv_split_shapes(model_cfg) -> List[int]:
