@@ -38,11 +38,10 @@ except ImportError:
 
 try:
     from megatron.core.matrix_update import (
-        MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
-        MATRIX_OPTIMIZER_OWNER_MUON,
         get_matrix_optimizer_info,
         get_matrix_shard_spec,
         get_matrix_optimizer_state_spec,
+        is_matrix_optimizer_owned_parameter,
         matrix_small_gram_side_for_spec,
         set_matrix_shard_spec,
     )
@@ -75,13 +74,7 @@ def _matrix_dp_shard_layout_for_axis(dp_shard_axis: Optional[int]) -> Optional[s
 
 
 def _is_matrix_optimizer_owned_param(param: torch.Tensor) -> bool:
-    if not HAVE_MCORE_MATRIX_UPDATE:
-        return False
-    matrix_optimizer_info = get_matrix_optimizer_info(param)
-    return matrix_optimizer_info is not None and getattr(matrix_optimizer_info, "owner", None) in (
-        MATRIX_OPTIMIZER_OWNER_MUON,
-        MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
-    )
+    return HAVE_MCORE_MATRIX_UPDATE and is_matrix_optimizer_owned_parameter(param)
 
 
 def _matrix_optimizer_param_checkpoint_identity(
