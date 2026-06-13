@@ -45,6 +45,7 @@ from megatron.core.optimizer.matrix_update import (
     set_grad_gram_finalization_required,
     set_linear_weight_info,
     set_matrix_optimizer_info,
+    set_matrix_shard_spec,
 )
 from megatron.training.arguments import normalize_matrix_and_emerging_optimizer_args
 
@@ -1253,6 +1254,146 @@ def test_matrix_update_rule_small_gram_muon_honors_ns_config(monkeypatch):
     assert kwargs["steps"] == 7
     assert kwargs["coefficient_type"] == "polar_express"
     assert not kwargs["use_syrk"]
+
+
+def _install_fake_initialized_all_reduce(monkeypatch, *, world_size):
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: world_size)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_reduce",
+        lambda tensor, op=None, group=None: tensor.mul_(world_size),
+    )
+
+
+def test_matrix_fsdp_small_gram_muon_row_shard_matches_full_reference(monkeypatch):
+    import megatron.core.optimizer.matrix_optimizer as matrix_optimizer_module
+
+    if not matrix_optimizer_module.HAVE_EMERGING_MATRIX_OPTIMIZERS:
+        pytest.skip("emerging_optimizers is not installed")
+
+    _install_fake_initialized_all_reduce(monkeypatch, world_size=2)
+    local = torch.tensor([[1.0, 0.25], [0.5, 2.0]])
+    full = torch.cat([local, local], dim=0)
+    spec = matrix_shard_spec_with_dp_axis(
+        MatrixShardSpec(logical_shape=(4, 2), local_shape=(4, 2), tp_layout="none"),
+        dp_shard_axis=0,
+        dp_local_start=0,
+        dp_local_end=2,
+    )
+    config = OptimizerConfig(
+        matrix_optimizer="muon",
+        muon_num_ns_steps=2,
+        muon_coefficient_type="simple",
+    )
+
+    update = matrix_optimizer_module._fsdp_small_gram_newton_schulz_allreduce(
+        local,
+        spec,
+        group=object(),
+        config=config,
+    )
+    ref = matrix_optimizer_module.newton_schulz_orthogonalize(
+        full,
+        steps=2,
+        coefficient_type="simple",
+    ).chunk(2, dim=0)[0]
+
+    torch.testing.assert_close(update, ref)
+
+
+def test_matrix_fsdp_small_gram_muon_column_shard_matches_full_reference(monkeypatch):
+    import megatron.core.optimizer.matrix_optimizer as matrix_optimizer_module
+
+    if not matrix_optimizer_module.HAVE_EMERGING_MATRIX_OPTIMIZERS:
+        pytest.skip("emerging_optimizers is not installed")
+
+    _install_fake_initialized_all_reduce(monkeypatch, world_size=2)
+    local = torch.tensor([[1.0, 0.25], [0.5, 2.0]])
+    full = torch.cat([local, local], dim=1)
+    spec = matrix_shard_spec_with_dp_axis(
+        MatrixShardSpec(logical_shape=(2, 4), local_shape=(2, 4), tp_layout="none"),
+        dp_shard_axis=1,
+        dp_local_start=0,
+        dp_local_end=2,
+    )
+    config = OptimizerConfig(
+        matrix_optimizer="muon",
+        muon_num_ns_steps=2,
+        muon_coefficient_type="simple",
+    )
+
+    update = matrix_optimizer_module._fsdp_small_gram_newton_schulz_allreduce(
+        local,
+        spec,
+        group=object(),
+        config=config,
+    )
+    ref = matrix_optimizer_module.newton_schulz_orthogonalize(
+        full,
+        steps=2,
+        coefficient_type="simple",
+    ).chunk(2, dim=1)[0]
+
+    torch.testing.assert_close(update, ref)
+
+
+def test_matrix_update_rule_uses_fsdp_small_gram_and_logical_scale(monkeypatch):
+    import contextlib
+    from types import SimpleNamespace
+
+    import megatron.core.optimizer.matrix_optimizer as matrix_optimizer_module
+
+    param = _param_with_info(tp_layout="none", shape=(2, 2), logical_shape=(4, 2))
+    set_matrix_shard_spec(
+        param,
+        matrix_shard_spec_with_dp_axis(
+            MatrixShardSpec(logical_shape=(4, 2), local_shape=(4, 2), tp_layout="none"),
+            dp_shard_axis=0,
+            dp_local_start=0,
+            dp_local_end=2,
+        ),
+    )
+    grad = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+    config = OptimizerConfig(
+        matrix_optimizer="muon",
+        muon_scale_mode="unit_rms_norm",
+        muon_extra_scale_factor=1.0,
+    )
+    dp_group = object()
+    calls = []
+
+    def fake_fsdp_small_gram(matrix, spec, *, group, config):
+        calls.append((matrix, spec, group, config))
+        return matrix + 1.0
+
+    monkeypatch.setattr(
+        matrix_optimizer_module,
+        "_fsdp_small_gram_newton_schulz_allreduce",
+        fake_fsdp_small_gram,
+    )
+    monkeypatch.setattr(
+        matrix_optimizer_module,
+        "fp32_matmul_precision",
+        lambda precision: contextlib.nullcontext(),
+        raising=False,
+    )
+    rule = matrix_optimizer_module._make_matrix_update_rule(
+        config,
+        SimpleNamespace(tp=None, dp_cp=dp_group),
+    )
+
+    update = rule(grad, None, None, param)
+
+    torch.testing.assert_close(update, -(grad + 1.0) * (4 / 2) ** 0.5)
+    assert len(calls) == 1
+    seen_matrix, seen_spec, seen_group, seen_config = calls[0]
+    torch.testing.assert_close(seen_matrix, grad)
+    assert seen_spec == get_matrix_shard_spec(param)
+    assert seen_group is dp_group
+    assert seen_config is config
 
 
 def test_matrix_function_optimizer_state_dict_does_not_serialize_update_rule():

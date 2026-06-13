@@ -19,6 +19,8 @@ import torch
 from megatron.core.matrix_update import (
     TPUpdateMode,
     configure_model_matrix_updates,
+    get_matrix_shard_spec,
+    matrix_small_gram_side_for_spec,
     set_feature_gram_finalization_required,
     set_grad_gram_finalization_required,
 )
@@ -104,6 +106,85 @@ def _muon_scale_factor(size_out: int, size_in: int, config: OptimizerConfig) -> 
     raise ValueError(f"Invalid muon_scale_mode: {mode}")
 
 
+def _muon_scale_shape(
+    grad: torch.Tensor,
+    param: torch.nn.Parameter,
+) -> tuple[int, int]:
+    """Return the logical matrix shape used for Muon scaling."""
+
+    matrix_shard_spec = get_matrix_shard_spec(param)
+    if matrix_shard_spec is not None and matrix_shard_spec.dp_shard_axis is not None:
+        return matrix_shard_spec.logical_shape
+    return (grad.size(-2), grad.size(-1))
+
+
+def _fsdp_small_gram_tp_layout(matrix_shard_spec) -> str:
+    """Map a matrix-axis FSDP shard contract to the EO small-Gram layout name."""
+
+    if matrix_shard_spec.dp_shard_axis not in (0, 1):
+        raise RuntimeError(
+            "Matrix FSDP small-Gram Muon requires a MatrixShardSpec with dp_shard_axis."
+        )
+    small_gram_side = matrix_small_gram_side_for_spec(matrix_shard_spec)
+    if small_gram_side == "right":
+        return "column_parallel"
+    if small_gram_side == "left":
+        return "row_parallel"
+    raise RuntimeError(f"Unsupported MatrixShardSpec small_gram_side: {small_gram_side}")
+
+
+def _fsdp_small_gram_process_group(matrix_shard_spec, pg_collection: ProcessGroupCollection):
+    """Return the process group that spans all matrix-axis shards for FSDP Muon."""
+
+    if matrix_shard_spec.tp_shard_axis is not None:
+        process_group = getattr(pg_collection, "tp_dp_cp", None)
+        if process_group is None:
+            raise RuntimeError(
+                "Matrix FSDP Muon with both TP and DP matrix sharding requires "
+                "pg_collection.tp_dp_cp so the small Gram is reduced over every "
+                "matrix-axis shard."
+            )
+        return process_group
+    process_group = getattr(pg_collection, "dp_cp", None)
+    if process_group is None:
+        process_group = getattr(pg_collection, "dp", None)
+    if process_group is None:
+        raise RuntimeError(
+            "Matrix FSDP Muon requires pg_collection.dp_cp or pg_collection.dp for "
+            "small-Gram all-reduce."
+        )
+    return process_group
+
+
+def _fsdp_small_gram_newton_schulz_allreduce(
+    local_matrix: torch.Tensor,
+    matrix_shard_spec,
+    *,
+    group: torch.distributed.ProcessGroup,
+    config: OptimizerConfig,
+) -> torch.Tensor:
+    """Apply exact small-Gram Muon to a matrix-axis FSDP local shard."""
+
+    if local_matrix.ndim != 2:
+        raise RuntimeError(
+            f"Matrix FSDP Muon requires a 2D local matrix shard, got {tuple(local_matrix.shape)}."
+        )
+    if tuple(local_matrix.shape) != tuple(matrix_shard_spec.local_shape):
+        raise RuntimeError(
+            "Matrix FSDP Muon local shard shape does not match MatrixShardSpec: "
+            f"local_matrix={tuple(local_matrix.shape)}, spec.local_shape={matrix_shard_spec.local_shape}."
+        )
+    tp_layout = _fsdp_small_gram_tp_layout(matrix_shard_spec)
+    return tp_small_gram_newton_schulz_allreduce(
+        local_matrix,
+        tp_layout=tp_layout,
+        group=group,
+        steps=config.muon_num_ns_steps,
+        coefficient_type=config.muon_coefficient_type,
+        use_syrk=False,
+    )
+
+
 def _copy_matrix_model_refs_to_main_params(optimizer: MegatronOptimizer) -> None:
     if not isinstance(optimizer, Float16OptimizerWithFloat16Params):
         return
@@ -153,7 +234,8 @@ def _make_matrix_update_rule(config: OptimizerConfig, pg_collection: ProcessGrou
         param: torch.nn.Parameter,
     ):
         info = getattr(param, "_mcore_linear_weight_info", None)
-        if info is None:
+        matrix_shard_spec = get_matrix_shard_spec(param)
+        if info is None and matrix_shard_spec is None:
             raise RuntimeError("Matrix optimizer parameter is missing LinearWeightInfo.")
 
         direction = grad
@@ -185,21 +267,27 @@ def _make_matrix_update_rule(config: OptimizerConfig, pg_collection: ProcessGrou
             raise RuntimeError(f"Unsupported matrix optimizer: {config.matrix_optimizer}")
 
         preconditioned = direction.to(torch.float32)
-        tp_group = pg_collection.tp
-        tp_layout = info.tp_layout
+        tp_layout = info.tp_layout if info is not None else matrix_shard_spec.tp_layout
         with fp32_matmul_precision(config.muon_fp32_matmul_prec):
-            if tp_update_mode == TPUpdateMode.TP_ALLGATHER_LOGICAL_MATRIX:
+            if matrix_shard_spec is not None and matrix_shard_spec.dp_shard_axis is not None:
+                update = _fsdp_small_gram_newton_schulz_allreduce(
+                    preconditioned,
+                    matrix_shard_spec,
+                    group=_fsdp_small_gram_process_group(matrix_shard_spec, pg_collection),
+                    config=config,
+                )
+            elif tp_update_mode == TPUpdateMode.TP_ALLGATHER_LOGICAL_MATRIX:
                 update = tp_allgather_logical_matrix_update(
                     preconditioned,
                     orthogonalize,
                     tp_layout=tp_layout,
-                    group=tp_group,
+                    group=pg_collection.tp,
                 )
             elif tp_update_mode == TPUpdateMode.TP_SMALL_GRAM_NS_ALLREDUCE:
                 update = tp_small_gram_newton_schulz_allreduce(
                     preconditioned,
                     tp_layout=tp_layout,
-                    group=tp_group,
+                    group=pg_collection.tp,
                     steps=config.muon_num_ns_steps,
                     coefficient_type=config.muon_coefficient_type,
                     use_syrk=False,
@@ -212,7 +300,8 @@ def _make_matrix_update_rule(config: OptimizerConfig, pg_collection: ProcessGrou
                 )
             else:
                 raise RuntimeError(f"Unsupported TP update mode: {tp_update_mode}")
-        scale = _muon_scale_factor(grad.size(-2), grad.size(-1), config)
+        scale_rows, scale_cols = _muon_scale_shape(grad, param)
+        scale = _muon_scale_factor(scale_rows, scale_cols, config)
         return -update * scale * config.muon_extra_scale_factor
 
     return update_rule
