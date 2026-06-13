@@ -418,9 +418,10 @@ def _validate_matrix_optimizer_state_sharding(
 
     Muon momentum and mixed-precision master parameters are matrix-shaped state
     tensors and must be sharded exactly like the matrix parameter they belong
-    to. Megatron-FSDP initializes optimizer state via a dummy optimizer step;
-    checking immediately after that step prevents plain local tensors from
-    being checkpointed as if they were valid matrix-axis shards.
+    to. State may be absent before the first real optimizer step or before a
+    checkpoint load; any present same-shaped state is validated before save and
+    after load so plain local tensors are not checkpointed as valid matrix-axis
+    shards.
     """
 
     if not HAVE_MCORE_MATRIX_UPDATE:
@@ -1127,20 +1128,13 @@ def fully_shard_optimizer(
     optimizer_step_base_func = type(optimizer).step
     optimizer_zero_grad_base_func = type(optimizer).zero_grad
 
-    # Pre-initialize the optimizer state for checkpoint loading via DCP.
-    for group in optimizer.param_groups:
-        for param in group["params"]:
-            if param.numel() == 0 or (
-                hasattr(param, "_local_tensor") and param._local_tensor.numel() == 0
-            ):
-                # Avoid FusedAdam errors on empty tensor input.
-                continue
-            # Optimizer state is built from wgrad.
-            param.grad = torch.zeros_like(param)
-    # Non-lazy optimizer state initialization.
-    optimizer.step()
-    _validate_matrix_optimizer_state_sharding(optimizer, mfsdp_model)
-    optimizer.zero_grad()
+    # Do not materialize optimizer state by executing a dummy optimizer.step().
+    # That is not a benign initialization path for AdamW/FusedAdam-style
+    # optimizers: it can advance step counters and apply decoupled weight decay
+    # before the first user step or before checkpoint resume. Optimizer state is
+    # instead created by the first real training step or by load_state_dict(), and
+    # the matrix-state hooks below validate any present same-shaped state before
+    # save and after load.
 
     def add_matrix_optimizer_checkpoint_metadata(optimizer, state_dict):
         _add_matrix_optimizer_checkpoint_metadata(optimizer, mfsdp_model, state_dict)

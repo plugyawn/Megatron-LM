@@ -353,6 +353,39 @@ def test_matrix_optimizer_runtime_master_param_state_gets_matrix_shard_spec(monk
     assert get_matrix_shard_spec(master_param) == get_matrix_shard_spec(param)
 
 
+def test_fully_shard_optimizer_registration_does_not_step():
+    class _StepCountingSGD(torch.optim.SGD):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.step_calls = 0
+
+        def step(self, *args, **kwargs):
+            self.step_calls += 1
+            return super().step(*args, **kwargs)
+
+    param = torch.nn.Parameter(torch.ones(2, 3))
+    mfsdp_model = SimpleNamespace(
+        model_auto_sync=True,
+        param_and_grad_buffer=SimpleNamespace(
+            bucketing_policy=SimpleNamespace(data_parallel_sharding_strategy="no_shard")
+        ),
+        finish_grad_sync=lambda: None,
+        install_optimized_model_weights=lambda: None,
+        zero_grad_buffer=lambda: None,
+    )
+    param._megatron_fsdp_model = mfsdp_model
+    optimizer = _StepCountingSGD([param], lr=0.1, momentum=0.9, weight_decay=0.1)
+    param_before = param.detach().clone()
+
+    fully_shard_module.fully_shard_optimizer(
+        optimizer, preproc_state_dict_for_dcp_ckpt=False
+    )
+
+    assert optimizer.step_calls == 0
+    assert optimizer.state == {}
+    torch.testing.assert_close(param, param_before)
+
+
 def test_matrix_optimizer_checkpoint_metadata_records_master_param_state(monkeypatch):
     monkeypatch.setattr(fully_shard_module, "DTensor", _FakeDTensor)
     param = _matrix_param()

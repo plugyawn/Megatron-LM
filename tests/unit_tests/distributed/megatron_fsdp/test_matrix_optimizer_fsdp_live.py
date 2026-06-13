@@ -116,16 +116,16 @@ def test_matrix_optimizer_owned_param_state_checkpoint_contract(distributed_cuda
     assert matrix_spec.dp_shard_axis == 0
     assert matrix_spec.small_gram_side == "right"
 
-    state = optimizer.state[matrix_param]
-    assert isinstance(state["momentum_buffer"], DTensor)
-    assert get_matrix_shard_spec(state["momentum_buffer"]) == matrix_spec
-
     x = torch.randn(2, 3, device=setup["device"])
     y = torch.randn(2, 4, device=setup["device"])
     loss = mse_loss(mfsdp_model(x), y)
     loss.backward()
     optimizer.step()
     optimizer.zero_grad()
+
+    state = optimizer.state[matrix_param]
+    assert isinstance(state["momentum_buffer"], DTensor)
+    assert get_matrix_shard_spec(state["momentum_buffer"]) == matrix_spec
 
     state_dict = optimizer.state_dict()
     metadata_block = state_dict[MATRIX_OPTIMIZER_STATE_METADATA_KEY]
@@ -194,16 +194,16 @@ def test_matrix_optimizer_owned_column_axis_param_state_checkpoint_contract(
     assert matrix_spec.dp_shard_axis == 1
     assert matrix_spec.small_gram_side == "left"
 
-    state = optimizer.state[matrix_param]
-    assert isinstance(state["momentum_buffer"], DTensor)
-    assert get_matrix_shard_spec(state["momentum_buffer"]) == matrix_spec
-
     x = torch.randn(2, 5, device=setup["device"])
     y = torch.randn(2, 3, device=setup["device"])
     loss = mse_loss(mfsdp_model(x), y)
     loss.backward()
     optimizer.step()
     optimizer.zero_grad()
+
+    state = optimizer.state[matrix_param]
+    assert isinstance(state["momentum_buffer"], DTensor)
+    assert get_matrix_shard_spec(state["momentum_buffer"]) == matrix_spec
 
     state_dict = optimizer.state_dict()
     metadata_block = state_dict[MATRIX_OPTIMIZER_STATE_METADATA_KEY]
