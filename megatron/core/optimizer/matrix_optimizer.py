@@ -135,12 +135,12 @@ def _tp_mode_from_config(config: OptimizerConfig) -> TPUpdateMode:
     }[config.matrix_tp_update_mode]
 
 
-class MegatronFSDPMatrixFunctionOptimizer(MegatronOptimizer):
-    """Megatron optimizer adapter for FSDP-hooked MatrixFunctionOptimizer."""
+class MegatronFSDPOptimizer(MegatronOptimizer):
+    """Megatron optimizer adapter for FSDP-hooked torch optimizers."""
 
     def __init__(
         self,
-        optimizer: MatrixFunctionOptimizer,
+        optimizer: torch.optim.Optimizer,
         config: OptimizerConfig,
         pg_collection: ProcessGroupCollection,
     ) -> None:
@@ -659,7 +659,7 @@ def get_megatron_matrix_optimizer(
     if use_megatron_fsdp:
         if megatron_fsdp_fully_shard_optimizer is None:
             raise RuntimeError("Megatron-FSDP matrix optimizer requires Megatron-FSDP support.")
-        matrix_optimizer = MegatronFSDPMatrixFunctionOptimizer(
+        matrix_optimizer = MegatronFSDPOptimizer(
             megatron_fsdp_fully_shard_optimizer(matrix_torch_optimizer),
             config,
             pg_collection,
@@ -704,26 +704,20 @@ def get_megatron_matrix_optimizer(
     optimizers = [matrix_optimizer]
     if fallback_param_groups:
         if use_megatron_fsdp:
-            (
-                distopt_process_groups,
-                distopt_distributed_optimizer_instance_id,
-                distopt_per_model_buffers,
-            ) = _setup_layerwise_fallback_distopt_routing(pg_collection, model_chunks)
-            fallback_optimizer = _get_megatron_optimizer_based_on_param_groups(
-                config=fallback_config,
+            fallback_torch_config = replace(fallback_config, use_distributed_optimizer=False)
+            fallback_torch_optimizer, _ = _get_megatron_optimizer_based_on_param_groups(
+                config=fallback_torch_config,
                 model_chunks=model_chunks,
                 param_groups=fallback_param_groups,
-                per_model_buffers=distopt_per_model_buffers,
-                model_parallel_group=distopt_process_groups['mp_group'],
-                data_parallel_group=distopt_process_groups['intra_dp_cp_group'],
-                data_parallel_group_gloo=distopt_process_groups['intra_dp_cp_group_gloo'],
-                data_parallel_group_idx=get_pg_rank(distopt_process_groups['mp_group']),
-                intra_dist_opt_group=distopt_process_groups['intra_dist_opt_group'],
-                distributed_optimizer_instance_id=distopt_distributed_optimizer_instance_id,
+                model_parallel_group=_matrix_optimizer_model_parallel_group(pg_collection),
                 pg_collection=pg_collection,
-                skip_megatron_wrapping=False,
+                skip_megatron_wrapping=True,
             )
-            setattr(fallback_optimizer, '_chained_optimizer_config', config)
+            fallback_optimizer = MegatronFSDPOptimizer(
+                megatron_fsdp_fully_shard_optimizer(fallback_torch_optimizer),
+                config,
+                pg_collection,
+            )
         elif use_separate_distributed_optimizer:
             (
                 distopt_process_groups,
