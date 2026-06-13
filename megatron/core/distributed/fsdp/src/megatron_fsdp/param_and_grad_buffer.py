@@ -1231,6 +1231,20 @@ class DataParallelBuffer:
                     "[Megatron-FSDP] Matrix optimizer-owned parameter is missing "
                     "MatrixShardSpec metadata. Configure matrix metadata before FSDP sharding."
             )
+            if (
+                matrix_shard_spec.dp_shard_axis is not None
+                and matrix_shard_spec.dp_local_start is not None
+                and matrix_shard_spec.dp_local_end is not None
+            ):
+                if matrix_shard_spec.dp_shard_axis != matrix_fsdp_shard_axis_for_spec(
+                    matrix_shard_spec
+                ):
+                    raise RuntimeError(
+                        "[Megatron-FSDP] MatrixShardSpec has inconsistent DP shard axis: "
+                        f"metadata={matrix_shard_spec.dp_shard_axis}, "
+                        f"required={matrix_fsdp_shard_axis_for_spec(matrix_shard_spec)}."
+                    )
+                continue
             dp_shard_axis = matrix_fsdp_shard_axis_for_spec(matrix_shard_spec)
             local_shape = to_local_if_dtensor(param).shape
             if len(local_shape) < 2:
@@ -1531,7 +1545,6 @@ class DataParallelBuffer:
     ) -> Optional[MatrixFSDPShardPlan]:
         if (
             not HAVE_MCORE_MATRIX_UPDATE
-            or not self.is_data_distributed
             or item_id >= len(self.params)
         ):
             return None
@@ -1622,7 +1635,14 @@ class DataParallelBuffer:
         """
         matrix_shard_plan = self._get_matrix_fsdp_shard_plan_for_item(item_id)
         if matrix_shard_plan is not None:
-            return self.get_shard_from_local_buffer()
+            if self.is_data_distributed:
+                return self.get_shard_from_local_buffer()
+            if only_shard:
+                item_index = self.item_index_map[item_id]
+                start = item_index.global_data_index
+                end = start + item_index.size
+                matrix = self.data[start:end].view(item_index.shape)
+                return _pack_matrix_fsdp_local_shard(matrix, matrix_shard_plan)
 
         if only_shard:
             # Get segment of the item saved in the shard associated with this rank.
@@ -5184,12 +5204,18 @@ def make_fsdp_dtensor(
                 )
             dp_shard_axis = matrix_fsdp_shard_axis_for_spec(matrix_shard_spec)
             fsdp_shard_axis = dp_shard_axis
-            if matrix_shard_spec.dp_shard_axis is None:
-                matrix_shard_spec = matrix_shard_spec_with_dp_axis(
-                    matrix_shard_spec, dp_shard_axis=dp_shard_axis
+            if (
+                matrix_shard_spec.dp_shard_axis is None
+                or matrix_shard_spec.dp_local_start is None
+                or matrix_shard_spec.dp_local_end is None
+                or matrix_shard_spec.pre_dp_local_shape is None
+            ):
+                raise RuntimeError(
+                    "[Megatron-FSDP] Matrix optimizer-owned sharded DTensor creation "
+                    "requires a MatrixShardSpec with DP local range metadata from "
+                    "DataParallelBuffer planning."
                 )
-                set_matrix_shard_spec(orig_param, matrix_shard_spec)
-            elif matrix_shard_spec.dp_shard_axis != dp_shard_axis:
+            if matrix_shard_spec.dp_shard_axis != dp_shard_axis:
                 raise RuntimeError(
                     "[Megatron-FSDP] MatrixShardSpec has inconsistent DP shard axis: "
                     f"metadata={matrix_shard_spec.dp_shard_axis}, required={dp_shard_axis}."

@@ -1536,10 +1536,76 @@ def test_matrix_optimizer_axis1_fsdp_buffer_planner_sets_column_spec(monkeypatch
     assert matrix_shard_spec.small_gram_side == "left"
 
 
+def test_matrix_optimizer_unsharded_buffer_virtual_axis1_shard_uses_column_plan(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    param = _tag_muon_matrix_param_with_axis1_fsdp(
+        torch.nn.Parameter(torch.zeros(4, 3))
+    )
+    buffer = DataParallelBuffer(
+        ddp_config=SimpleNamespace(data_parallel_sharding_strategy="optim"),
+        params=[param],
+        is_data_distributed=False,
+        bucket_id=0,
+        data_parallel_group=None,
+        chunk_size_factor=4,
+    )
+    matrix = torch.arange(12, dtype=torch.float32).view(4, 3)
+    data = torch.empty(buffer.data_size, dtype=torch.float32)
+    data[: matrix.numel()] = matrix.flatten()
+    buffer.init_data(data)
+
+    shard = buffer.get_item(0, only_shard=True)
+
+    assert torch.equal(shard, matrix[:, :2].reshape(-1))
+
+
+def test_matrix_optimizer_helper_buffer_does_not_overwrite_canonical_column_spec(monkeypatch):
+    rank = 0
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: rank)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    param = _tag_muon_matrix_param_with_axis1_fsdp(
+        torch.nn.Parameter(torch.zeros(4, 3))
+    )
+
+    DataParallelBuffer(
+        ddp_config=SimpleNamespace(data_parallel_sharding_strategy="optim"),
+        params=[param],
+        is_data_distributed=True,
+        bucket_id=0,
+        data_parallel_group=None,
+        chunk_size_factor=4,
+    )
+    canonical_spec = get_matrix_shard_spec(param)
+    assert canonical_spec.dp_local_start == 0
+    assert canonical_spec.dp_local_end == 2
+
+    rank = 1
+    DataParallelBuffer(
+        ddp_config=SimpleNamespace(data_parallel_sharding_strategy="optim"),
+        params=[param],
+        is_data_distributed=True,
+        bucket_id=0,
+        data_parallel_group=None,
+        chunk_size_factor=4,
+    )
+
+    assert get_matrix_shard_spec(param) == canonical_spec
+
+
 def test_make_fsdp_dtensor_preserves_matrix_metadata(monkeypatch):
     monkeypatch.setattr(param_buffer_module, "DTensor", _FakeFSDPDTensor)
     monkeypatch.setattr(param_buffer_module, "using_tensor_parallel", lambda *args, **kwargs: False)
     param = _tag_muon_matrix_param(torch.nn.Parameter(torch.zeros(4, 3)))
+    set_matrix_shard_spec(
+        param,
+        param_buffer_module.matrix_shard_spec_with_dp_axis(
+            get_matrix_shard_spec(param),
+            dp_shard_axis=0,
+            dp_local_start=0,
+            dp_local_end=2,
+        ),
+    )
 
     fsdp_param = param_buffer_module.make_fsdp_dtensor(
         local_tensor=torch.zeros(6),
@@ -1552,6 +1618,20 @@ def test_make_fsdp_dtensor_preserves_matrix_metadata(monkeypatch):
     assert get_matrix_shard_spec(fsdp_param) == get_matrix_shard_spec(param)
     assert get_matrix_shard_spec(fsdp_param).dp_shard_axis == 0
     assert get_matrix_shard_spec(fsdp_param).small_gram_side == "right"
+
+
+def test_make_fsdp_dtensor_rejects_unplanned_matrix_metadata(monkeypatch):
+    monkeypatch.setattr(param_buffer_module, "DTensor", _FakeFSDPDTensor)
+    monkeypatch.setattr(param_buffer_module, "using_tensor_parallel", lambda *args, **kwargs: False)
+    param = _tag_muon_matrix_param(torch.nn.Parameter(torch.zeros(4, 3)))
+
+    with pytest.raises(RuntimeError, match="DP local range metadata"):
+        param_buffer_module.make_fsdp_dtensor(
+            local_tensor=torch.zeros(6),
+            param=param,
+            dist_index=_FakeDistIndex(),
+            is_sharded_param=True,
+        )
 
 
 def test_make_fsdp_dtensor_accepts_packed_matrix_axis1_local_tensor(monkeypatch):

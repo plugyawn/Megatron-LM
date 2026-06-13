@@ -62,6 +62,29 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _matrix_optimizer_model_parallel_group(pg_collection: ProcessGroupCollection):
+    """Return the optimizer stats group matching Megatron's standard dense path."""
+
+    return getattr(pg_collection, "mp", getattr(pg_collection, "tp", None))
+
+
+def _matrix_optimizer_tp_group(pg_collection: ProcessGroupCollection):
+    return getattr(pg_collection, "tp", None)
+
+
+def _set_matrix_optimizer_process_groups(
+    optimizer: MegatronOptimizer,
+    pg_collection: ProcessGroupCollection,
+) -> None:
+    """Attach optimizer-local reduction groups instead of relying on global MPU state."""
+
+    model_parallel_group = _matrix_optimizer_model_parallel_group(pg_collection)
+    tp_group = _matrix_optimizer_tp_group(pg_collection)
+    for child in getattr(optimizer, "chained_optimizers", [optimizer]):
+        setattr(child, "grad_stats_parallel_group", model_parallel_group)
+        setattr(child, "tp_group", tp_group)
+
+
 def _tp_mode_from_config(config: OptimizerConfig) -> TPUpdateMode:
     return {
         "allgather": TPUpdateMode.TP_ALLGATHER_LOGICAL_MATRIX,
@@ -406,6 +429,7 @@ def get_megatron_matrix_optimizer(
         _copy_matrix_model_refs_to_main_params(matrix_optimizer)
     else:
         matrix_optimizer = FP32Optimizer(matrix_optimizer, config, matrix_init_state_fn)
+    _set_matrix_optimizer_process_groups(matrix_optimizer, pg_collection)
 
     fallback_config = copy.copy(config)
     fallback_config.matrix_optimizer = "none"
@@ -455,7 +479,7 @@ def get_megatron_matrix_optimizer(
             config=fallback_config,
             model_chunks=model_chunks,
             param_groups=fallback_param_groups,
-            model_parallel_group=pg_collection.tp,
+            model_parallel_group=_matrix_optimizer_model_parallel_group(pg_collection),
             pg_collection=pg_collection,
             skip_megatron_wrapping=False,
         )
