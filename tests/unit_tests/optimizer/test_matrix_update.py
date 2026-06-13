@@ -744,6 +744,59 @@ def test_matrix_function_optimizer_respects_grad_gram_refresh_interval():
     assert param._grad_gram_generation == first_generation + 1
 
 
+def test_matrix_function_optimizer_does_not_refinalize_cached_grams(monkeypatch):
+    param = _param_with_info()
+    param.data = torch.zeros_like(param.data)
+    param.main_grad = torch.ones_like(param.data)
+    input_recipe = _recipe(
+        normalization=MatrixPreconditionerNormalization.MEAN, refresh_interval=2
+    )
+    output_recipe = _output_recipe(
+        normalization=MatrixPreconditionerNormalization.MEAN, refresh_interval=2
+    )
+    configure_matrix_update_param(param, recipe=input_recipe, output_recipe=output_recipe)
+    set_feature_gram_finalization_required([param], required=True)
+    set_grad_gram_finalization_required([param], required=True)
+    reduce_calls = []
+
+    def fake_all_reduce(tensor, op=None, group=None):
+        reduce_calls.append((tensor, op, group))
+        return tensor
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    def update_rule(grad, feature_gram, grad_gram, model_param):
+        return -grad
+
+    process_group = object()
+    opt = MatrixFunctionOptimizer(
+        [param],
+        lr=0.1,
+        update_rule=update_rule,
+        feature_gram_process_groups=(process_group,),
+    )
+    x0 = torch.tensor([[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]])
+    dy0 = torch.tensor([[1.0, 0.0, 0.0, 0.0], [0.0, 2.0, 0.0, 0.0]])
+    x1 = torch.tensor([[3.0, 0.0, 0.0]])
+    dy1 = torch.tensor([[3.0, 0.0, 0.0, 0.0]])
+
+    opt.zero_grad()
+    maybe_accumulate_feature_gram(param, x0)
+    maybe_accumulate_grad_gram(param, dy0)
+    opt.step()
+    finalized_call_count = len(reduce_calls)
+    assert finalized_call_count == 4
+
+    opt.zero_grad()
+    assert not param._feature_gram_active
+    assert not param._grad_gram_active
+    maybe_accumulate_feature_gram(param, x1)
+    maybe_accumulate_grad_gram(param, dy1)
+    opt.step()
+
+    assert len(reduce_calls) == finalized_call_count
+
+
 def test_matrix_update_rule_caches_factorization_by_feature_gram_generation(monkeypatch):
     from types import SimpleNamespace
 
