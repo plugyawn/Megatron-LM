@@ -81,6 +81,16 @@ def _bucket_is_managed_by_layer_wise_optimizer(bucket, default_for_untagged: boo
     return param.is_managed_by_layer_wise_optimizer
 
 
+def _layerwise_metadata_process_group(
+    pg_collection: Optional[ProcessGroupCollection], param_group: dict
+) -> Optional[torch.distributed.ProcessGroup]:
+    if pg_collection is None:
+        return None
+    if param_group.get("is_expert_parallel", False):
+        return pg_collection.expt_dp
+    return pg_collection.dp_cp
+
+
 def _resolve_layerwise_matrix_optimizer_info(
     param: torch.nn.Parameter,
     *,
@@ -912,8 +922,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 local_params = group.pop('params')
                 # save whether this group is empty, so we can use non-empty rank for metadata
                 group['params'] = bool(local_params.unwrap())
-                all_rank_groups = [None for _ in range(torch.distributed.get_world_size())]
-                torch.distributed.all_gather_object(all_rank_groups, group)
+                metadata_group = _layerwise_metadata_process_group(self.pg_collection, group)
+                all_rank_groups = [None for _ in range(get_pg_size(metadata_group))]
+                torch.distributed.all_gather_object(
+                    all_rank_groups, group, group=metadata_group
+                )
                 # find first non-empty group if it exists
                 nonempty_rank_group = next((g for g in all_rank_groups if g['params']), group)
                 nonempty_rank_group['params'] = local_params

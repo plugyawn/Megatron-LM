@@ -13,7 +13,10 @@ from unittest import mock
 import pytest
 import torch
 
-from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+from megatron.core.optimizer.layer_wise_optimizer import (
+    LayerWiseDistributedOptimizer,
+    _layerwise_metadata_process_group,
+)
 from megatron.core.optimizer.param_layout import BufferKey, pad_param_start, pad_to_divisor
 
 # ---------------------------------------------------------------------------
@@ -21,6 +24,23 @@ from megatron.core.optimizer.param_layout import BufferKey, pad_param_start, pad
 # ---------------------------------------------------------------------------
 
 _LWO = LayerWiseDistributedOptimizer
+
+
+def test_layerwise_metadata_process_group_uses_optimizer_dp_scope():
+    pg_collection = mock.Mock()
+    pg_collection.dp_cp = object()
+    pg_collection.expt_dp = object()
+
+    assert _layerwise_metadata_process_group(pg_collection, {}) is pg_collection.dp_cp
+    assert (
+        _layerwise_metadata_process_group(pg_collection, {"is_expert_parallel": False})
+        is pg_collection.dp_cp
+    )
+    assert (
+        _layerwise_metadata_process_group(pg_collection, {"is_expert_parallel": True})
+        is pg_collection.expt_dp
+    )
+    assert _layerwise_metadata_process_group(None, {}) is None
 
 
 def _make_param(shape, dtype=torch.bfloat16, **attrs):

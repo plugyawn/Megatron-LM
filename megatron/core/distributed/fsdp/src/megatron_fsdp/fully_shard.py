@@ -55,7 +55,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 MATRIX_OPTIMIZER_STATE_METADATA_KEY = "_mcore_matrix_optimizer_state"
-MATRIX_OPTIMIZER_STATE_METADATA_VERSION = 6
+MATRIX_OPTIMIZER_STATE_METADATA_VERSION = 7
 MATRIX_OPTIMIZER_SAME_SHARD_STATE_LAYOUT = "same_as_param"
 MATRIX_OPTIMIZER_DP_SHARD_LAYOUT_ROW_CONTIGUOUS = "row_contiguous_flat_buffer"
 MATRIX_OPTIMIZER_DP_SHARD_LAYOUT_COLUMN_CONTIGUOUS = "column_contiguous_flat_buffer"
@@ -82,6 +82,56 @@ def _is_matrix_optimizer_owned_param(param: torch.Tensor) -> bool:
         MATRIX_OPTIMIZER_OWNER_MUON,
         MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
     )
+
+
+def _matrix_optimizer_param_checkpoint_identity(
+    param: torch.Tensor, mfsdp_model: MegatronFSDP
+) -> Optional[str]:
+    """Return the stable model-parameter identity used for matrix optimizer state.
+
+    Optimizer state indices are local to the current optimizer param-group
+    ordering. Matrix-shaped same-shard optimizer state must also be tied to the
+    model parameter name that Megatron-FSDP already uses for distributed
+    parameter registration, otherwise a reordered optimizer can accidentally
+    validate compatible-looking matrix metadata against the wrong parameter.
+    """
+
+    for attr_name in ("megatron_fsdp_param_name", "_megatron_fsdp_param_name"):
+        identity = getattr(param, attr_name, None)
+        if isinstance(identity, str) and identity:
+            return identity
+
+    param_and_grad_buffer = getattr(mfsdp_model, "param_and_grad_buffer", None)
+    param_to_name = getattr(param_and_grad_buffer, "param_to_name", None)
+    if isinstance(param_to_name, dict):
+        orig_param = getattr(param, "orig_param", None)
+        for candidate_param in (param, orig_param):
+            if candidate_param is not None and candidate_param in param_to_name:
+                identity = param_to_name[candidate_param]
+                if isinstance(identity, str) and identity:
+                    return identity
+
+    optimizer_named_parameters = getattr(
+        param_and_grad_buffer, "optimizer_named_parameters", None
+    )
+    if optimizer_named_parameters is not None:
+        for name, named_param in optimizer_named_parameters:
+            if named_param is param and isinstance(name, str) and name:
+                return name
+
+    return None
+
+
+def _require_matrix_optimizer_param_checkpoint_identity(
+    param: torch.Tensor, mfsdp_model: MegatronFSDP, param_idx: str
+) -> str:
+    param_identity = _matrix_optimizer_param_checkpoint_identity(param, mfsdp_model)
+    if param_identity is None:
+        raise RuntimeError(
+            "[MegatronFSDP] Matrix optimizer checkpoint metadata requires a stable "
+            f"parameter identity for optimizer state index {param_idx}."
+        )
+    return param_identity
 
 
 def _matrix_shard_spec_to_checkpoint_dict(spec) -> dict:
@@ -511,7 +561,11 @@ def _matrix_optimizer_checkpoint_metadata(
             )
             if not state_names:
                 continue
-            metadata[str(param_state_indices[id(param)])] = {
+            param_idx = str(param_state_indices[id(param)])
+            metadata[param_idx] = {
+                "param_identity": _require_matrix_optimizer_param_checkpoint_identity(
+                    param, mfsdp_model, param_idx
+                ),
                 "owner": matrix_optimizer_info.owner,
                 "update_family": matrix_optimizer_info.update_family,
                 "matrix_shard_contract": _matrix_shard_global_contract_to_checkpoint_dict(
@@ -616,6 +670,22 @@ def _validate_matrix_optimizer_checkpoint_metadata(
                 raise RuntimeError(
                     "[MegatronFSDP] Matrix optimizer checkpoint metadata for optimizer "
                     f"state index {param_idx} must be a dict."
+                )
+            current_param_identity = _require_matrix_optimizer_param_checkpoint_identity(
+                param, mfsdp_model, param_idx
+            )
+            checkpoint_param_identity = param_metadata.get("param_identity")
+            if not isinstance(checkpoint_param_identity, str) or not checkpoint_param_identity:
+                raise RuntimeError(
+                    "[MegatronFSDP] Matrix optimizer checkpoint metadata is missing "
+                    f"stable parameter identity for optimizer state index {param_idx}."
+                )
+            if checkpoint_param_identity != current_param_identity:
+                raise RuntimeError(
+                    "[MegatronFSDP] Matrix optimizer checkpoint parameter identity does "
+                    f"not match for optimizer state index {param_idx}: "
+                    f"checkpoint={checkpoint_param_identity!r}, "
+                    f"current={current_param_identity!r}."
                 )
             matrix_shard_contract = param_metadata.get("matrix_shard_contract")
             if not isinstance(matrix_shard_contract, dict):

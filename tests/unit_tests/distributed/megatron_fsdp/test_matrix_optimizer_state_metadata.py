@@ -69,15 +69,16 @@ def _fake_mesh():
 
 def _fake_mfsdp_model():
     bucketing_policy = SimpleNamespace(data_parallel_sharding_strategy="optim")
-    param_and_grad_buffer = SimpleNamespace(bucketing_policy=bucketing_policy)
+    param_and_grad_buffer = SimpleNamespace(bucketing_policy=bucketing_policy, param_to_name={})
     return SimpleNamespace(param_and_grad_buffer=param_and_grad_buffer)
 
 
-def _matrix_param(shape=(2, 3)):
+def _matrix_param(shape=(2, 3), name="layers.0.weight"):
     param = _FakeDTensor(torch.zeros(*shape))
     param._local_tensor = torch.zeros(1, shape[1])
     param.device_mesh = _fake_mesh()
     param.placements = ("shard0",)
+    param.megatron_fsdp_param_name = name
     set_matrix_optimizer_info(
         param,
         owner=MATRIX_OPTIMIZER_OWNER_MUON,
@@ -147,6 +148,9 @@ def _fake_dtensor_state(shape=(2, 3)):
 def _metadata_for_param(param, **overrides):
     matrix_shard_spec = fully_shard_module.get_matrix_shard_spec(param)
     metadata = {
+        "param_identity": fully_shard_module._matrix_optimizer_param_checkpoint_identity(
+            param, _fake_mfsdp_model()
+        ),
         "owner": "muon",
         "update_family": "muon",
         "matrix_shard_contract": (
@@ -182,6 +186,7 @@ def test_matrix_optimizer_checkpoint_metadata_round_trip_contract(monkeypatch):
     assert metadata_block["version"] == fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_VERSION
     metadata = metadata_block["params"]
     assert metadata["0"]["owner"] == "muon"
+    assert metadata["0"]["param_identity"] == "layers.0.weight"
     assert metadata["0"]["update_family"] == "muon"
     assert metadata["0"]["same_shard_state_layout"] == "same_as_param"
     assert metadata["0"]["same_shard_state_names"] == ["momentum_buffer"]
@@ -306,6 +311,41 @@ def test_matrix_optimizer_checkpoint_rejects_local_same_shaped_state(monkeypatch
     }
 
     with pytest.raises(RuntimeError, match="local tensor state"):
+        fully_shard_module._validate_matrix_optimizer_checkpoint_metadata(
+            optimizer, _fake_mfsdp_model(), load_state_dict
+        )
+
+
+def test_matrix_optimizer_checkpoint_rejects_missing_param_identity(monkeypatch):
+    monkeypatch.setattr(fully_shard_module, "DTensor", _FakeDTensor)
+    param = _matrix_param()
+    delattr(param, "megatron_fsdp_param_name")
+    optimizer = torch.optim.SGD([param], lr=0.1)
+    optimizer.state[param]["momentum_buffer"] = _fake_dtensor_state()
+
+    with pytest.raises(RuntimeError, match="stable parameter identity"):
+        fully_shard_module._add_matrix_optimizer_checkpoint_metadata(
+            optimizer, _fake_mfsdp_model(), {"state": {}, "param_groups": []}
+        )
+
+
+def test_matrix_optimizer_checkpoint_rejects_param_identity_mismatch(monkeypatch):
+    monkeypatch.setattr(fully_shard_module, "DTensor", _FakeDTensor)
+    param = _matrix_param(name="layers.0.weight")
+    optimizer = torch.optim.SGD([param], lr=0.1)
+    metadata = {
+        "0": _metadata_for_param(param, param_identity="layers.1.weight")
+    }
+    load_state_dict = {
+        "state": {0: {"momentum_buffer": _fake_dtensor_state()}},
+        "param_groups": [],
+        fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_KEY: {
+            "version": fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_VERSION,
+            "params": metadata,
+        },
+    }
+
+    with pytest.raises(RuntimeError, match="parameter identity"):
         fully_shard_module._validate_matrix_optimizer_checkpoint_metadata(
             optimizer, _fake_mfsdp_model(), load_state_dict
         )

@@ -3400,6 +3400,7 @@ class ParamAndGradBuffer:
                         "or dist main weight."
                     )
                 dist_param = torch.nn.Parameter(param_data)
+                setattr(dist_param, "megatron_fsdp_param_name", param_name)
 
                 def set_param_attribute_closure(param, orig_param):
                     def set_param_attribute():
