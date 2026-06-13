@@ -573,6 +573,35 @@ def test_layerwise_buffer_routing_marks_matrix_optimizer_owned_params():
     assert not module.bias.is_managed_by_layer_wise_optimizer
 
 
+def test_layerwise_buffer_routing_preserves_parameterization_role():
+    module = torch.nn.Module()
+    module.hidden_weight = _param_with_info()
+    module.hidden_weight.parameterization_role = "hidden_matrix"
+    module.output_weight = _param_with_info()
+    module.output_weight.parameterization_role = "output"
+    module.output_weight.is_embedding_or_output_parameter = True
+
+    tag_params_for_buffer_routing(
+        [module],
+        optimizer_type="muon",
+        matrix_optimizer_type=None,
+        matrix_min_dim=2,
+        requires_layerwise_layout=True,
+    )
+
+    hidden_info = get_matrix_optimizer_info(module.hidden_weight)
+    output_info = get_matrix_optimizer_info(module.output_weight)
+    assert module.hidden_weight.parameterization_role == "hidden_matrix"
+    assert module.output_weight.parameterization_role == "output"
+    assert hidden_info.owner == MATRIX_OPTIMIZER_OWNER_MUON
+    assert hidden_info.update_family == "muon"
+    assert hidden_info.requires_layerwise_layout
+    assert module.hidden_weight.is_managed_by_layer_wise_optimizer
+    assert output_info.owner == MATRIX_OPTIMIZER_OWNER_FALLBACK
+    assert output_info.update_family == "none"
+    assert not module.output_weight.is_managed_by_layer_wise_optimizer
+
+
 def test_fp8_dequant_source_fails_closed_in_native_collector():
     param = _param_with_info()
     recipe = _recipe()
