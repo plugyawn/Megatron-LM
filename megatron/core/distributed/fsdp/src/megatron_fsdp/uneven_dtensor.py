@@ -38,6 +38,7 @@ def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
 
     offsets = [0] * len(local_shape)
     cumulative_shape = list(local_shape).copy()
+    sharded_tensor_dims = set()
 
     def _update_offsets_and_cumulative_shape(
         mesh_dim: int, offsets: List[int], cumulative_shape: List[int]
@@ -82,6 +83,7 @@ def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
     for mesh_dim in reversed(shard_order):
         p = dtensor.placements[mesh_dim]
         if isinstance(p, (Shard, _StridedShard)):
+            sharded_tensor_dims.add(p.dim)
             _update_offsets_and_cumulative_shape(mesh_dim, offsets, cumulative_shape)
         elif isinstance(p, Replicate):
             # If we have a replicate placement, we do not need to update offsets
@@ -90,7 +92,22 @@ def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
         else:
             raise ValueError(f"Unsupported placement type {type(p)} in DTensor: {dtensor}")
 
-    return ChunkStorageMetadata(offsets=tuple(offsets), sizes=tuple(local_shape))
+    # DTensor local tensors may be padded to a uniform capacity even when the
+    # logical shard is uneven.  The chunk metadata must describe the logical
+    # slice in the global tensor, not the padded local storage.  This is visible
+    # for matrix-axis FSDP shards such as a global (3, 5) tensor sharded on dim 1
+    # across two ranks: rank 1 stores a (3, 3) local buffer but owns only columns
+    # [3:5].
+    chunk_offsets = list(offsets)
+    chunk_sizes = list(local_shape)
+    for shard_dim in sharded_tensor_dims:
+        global_dim_size = dtensor.shape[shard_dim]
+        chunk_offsets[shard_dim] = min(chunk_offsets[shard_dim], global_dim_size)
+        chunk_sizes[shard_dim] = max(
+            0, min(chunk_sizes[shard_dim], global_dim_size - chunk_offsets[shard_dim])
+        )
+
+    return ChunkStorageMetadata(offsets=tuple(chunk_offsets), sizes=tuple(chunk_sizes))
 
 
 def update_uneven_dtensor_chunk_metadata(dtensor: DTensor) -> dict:
