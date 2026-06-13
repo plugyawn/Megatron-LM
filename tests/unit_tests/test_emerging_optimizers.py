@@ -1225,6 +1225,31 @@ def test_adaptive_muon_fsdp_rejected_by_args(monkeypatch):
         validate_args(args)
 
 
+@pytest.mark.parametrize(
+    ("optimizer", "matrix_optimizer"),
+    [
+        ("adam", "muon"),
+        ("muon", "none"),
+    ],
+)
+def test_matrix_muon_distopt_split_requires_layerwise_param_layout(
+    monkeypatch, optimizer, matrix_optimizer
+):
+    monkeypatch.setattr("sys.argv", ["test"])
+    args = parse_args(ignore_unknown_args=True)
+    args.optimizer = optimizer
+    args.matrix_optimizer = matrix_optimizer
+    args.use_distributed_optimizer = True
+    args.use_layer_wise_param_layout = False
+    args.use_megatron_fsdp = False
+    args.use_torch_fsdp2 = False
+    args.matrix_input_preconditioner = "none"
+    args.matrix_output_preconditioner = "none"
+
+    with pytest.raises(ValueError, match="precomputed LayerWise param layout"):
+        validate_args(args)
+
+
 @pytest.mark.skipif(
     int(os.getenv('WORLD_SIZE', '1')) == 1, reason="Multi-rank test requires WORLD_SIZE > 1"
 )
