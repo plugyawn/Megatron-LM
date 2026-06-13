@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from megatron.core.optimizer import (
+    get_matrix_optimizer_config_overrides,
     get_mup_config_overrides,
     get_scaling_config_overrides,
     get_standard_config_overrides,
@@ -1714,6 +1715,133 @@ class TestMuPOptimizerTypeHandling:
         assert 'max_lr' not in override
         assert 'min_lr' not in override
         assert 'eps' not in override
+
+    @pytest.mark.parametrize(
+        ('input_preconditioner', 'output_preconditioner'),
+        [
+            ('none', 'none'),
+            ('feature_gram', 'none'),
+            ('none', 'grad_gram'),
+            ('feature_gram', 'grad_gram'),
+        ],
+    )
+    def test_matrix_function_sgd_mup_policy_uses_matrix_family_not_fallback_adam(
+        self, input_preconditioner, output_preconditioner
+    ):
+        optimizer_config = OptimizerConfig(
+            optimizer='adam',
+            matrix_optimizer='sgd',
+            matrix_input_preconditioner=input_preconditioner,
+            matrix_output_preconditioner=output_preconditioner,
+            lr=1e-3,
+            min_lr=1e-5,
+            adam_eps=1e-8,
+        )
+        fallback_policy = build_legacy_mup_training_policy(
+            mup_width_mult=4.0, optimizer_type='adam'
+        )
+        fallback_overrides = get_standard_config_overrides(
+            config=optimizer_config, scaling_policy=fallback_policy
+        )
+        fallback_overrides.update(
+            get_scaling_config_overrides(
+                config=optimizer_config, scaling_policy=fallback_policy
+            )
+        )
+        matrix_overrides = get_matrix_optimizer_config_overrides(
+            config=optimizer_config,
+            fallback_config_overrides=fallback_overrides,
+            scaling_policy=fallback_policy,
+        )
+
+        param = torch.nn.Parameter(torch.zeros(10, 10))
+        set_parameterization_metadata(param, role=ROLE_HIDDEN_MATRIX)
+        register_matrix_optimizer_param(
+            param,
+            owner=MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
+            update_family='sgd',
+            requires_layerwise_layout=False,
+        )
+
+        param_name = 'decoder.layers.0.self_attention.linear_qkv.weight'
+        fallback_override = _combined_override_for_param(fallback_overrides, param, param_name)
+        matrix_override = _combined_override_for_param(matrix_overrides, param, param_name)
+
+        assert fallback_override['max_lr'] == pytest.approx(optimizer_config.lr / 4.0)
+        assert fallback_override['min_lr'] == pytest.approx(optimizer_config.min_lr / 4.0)
+        assert fallback_override['eps'] == pytest.approx(optimizer_config.adam_eps / 4.0)
+
+        assert get_parameterization_role(param) == ROLE_HIDDEN_MATRIX
+        assert 'max_lr' not in matrix_override
+        assert 'min_lr' not in matrix_override
+        assert 'eps' not in matrix_override
+
+    @pytest.mark.parametrize(
+        ('input_preconditioner', 'output_preconditioner'),
+        [
+            ('none', 'none'),
+            ('feature_gram', 'none'),
+            ('none', 'grad_gram'),
+            ('feature_gram', 'grad_gram'),
+        ],
+    )
+    def test_matrix_function_muon_mup_policy_uses_matrix_family_not_fallback_adam(
+        self, input_preconditioner, output_preconditioner
+    ):
+        optimizer_config = OptimizerConfig(
+            optimizer='adam',
+            matrix_optimizer='muon',
+            matrix_input_preconditioner=input_preconditioner,
+            matrix_output_preconditioner=output_preconditioner,
+            muon_scale_mode='unit_rms_norm',
+            lr=1e-3,
+            min_lr=1e-5,
+            adam_eps=1e-8,
+        )
+        fallback_policy = build_legacy_mup_training_policy(
+            mup_width_mult=4.0, optimizer_type='adam'
+        )
+        fallback_overrides = get_standard_config_overrides(
+            config=optimizer_config, scaling_policy=fallback_policy
+        )
+        fallback_overrides.update(
+            get_scaling_config_overrides(
+                config=optimizer_config, scaling_policy=fallback_policy
+            )
+        )
+        matrix_overrides = get_matrix_optimizer_config_overrides(
+            config=optimizer_config,
+            fallback_config_overrides=fallback_overrides,
+            scaling_policy=fallback_policy,
+        )
+
+        matrix_param = torch.nn.Parameter(torch.zeros(10, 10))
+        set_parameterization_metadata(matrix_param, role=ROLE_HIDDEN_MATRIX)
+        register_matrix_optimizer_param(
+            matrix_param,
+            owner=MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
+            update_family='muon',
+            requires_layerwise_layout=False,
+        )
+        fallback_param = torch.nn.Parameter(torch.zeros(10, 10))
+        set_parameterization_metadata(fallback_param, role=ROLE_HIDDEN_MATRIX)
+
+        param_name = 'decoder.layers.0.self_attention.linear_qkv.weight'
+        matrix_override = _combined_override_for_param(
+            matrix_overrides, matrix_param, param_name
+        )
+        fallback_override = _combined_override_for_param(
+            fallback_overrides, fallback_param, param_name
+        )
+
+        assert fallback_override['max_lr'] == pytest.approx(optimizer_config.lr / 4.0)
+        assert fallback_override['min_lr'] == pytest.approx(optimizer_config.min_lr / 4.0)
+        assert fallback_override['eps'] == pytest.approx(optimizer_config.adam_eps / 4.0)
+
+        assert get_parameterization_role(matrix_param) == ROLE_HIDDEN_MATRIX
+        assert 'max_lr' not in matrix_override
+        assert 'min_lr' not in matrix_override
+        assert 'eps' not in matrix_override
 
     @pytest.mark.parametrize('optimizer_type', ['muon', 'dist_muon'])
     def test_muon_warns_for_spectral_scale_mode(self, optimizer_type):

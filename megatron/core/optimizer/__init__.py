@@ -368,6 +368,43 @@ def get_scaling_config_overrides(
 
     return scaling_overrides
 
+
+def get_matrix_optimizer_config_overrides(
+    config: OptimizerConfig,
+    fallback_config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]],
+    scaling_policy: TrainingScalingPolicy,
+) -> Optional[Dict[ParamKey, ParamGroupOverride]]:
+    """Resolve optimizer overrides for matrix-owned params.
+
+    Matrix preconditioners are update-rule sidecars, not parameterization
+    roles. Width-MuP optimizer policy is therefore selected by the matrix
+    optimizer family (``sgd`` or ``muon``), while input/right and output/left
+    preconditioner choices compose inside the matrix update rule.
+    """
+
+    if config.matrix_optimizer == 'none':
+        return fallback_config_overrides
+    if not scaling_policy.enabled:
+        return fallback_config_overrides
+
+    matrix_scaling_policy = TrainingScalingPolicy(
+        context=scaling_policy.context,
+        optimizer_type=config.matrix_optimizer,
+    )
+    matrix_config_overrides = get_standard_config_overrides(
+        config=config, scaling_policy=matrix_scaling_policy
+    )
+    matrix_scaling_overrides = get_scaling_config_overrides(
+        config=config, scaling_policy=matrix_scaling_policy
+    )
+    if matrix_scaling_overrides:
+        matrix_config_overrides = {
+            **(matrix_config_overrides or {}),
+            **matrix_scaling_overrides,
+        }
+    return matrix_config_overrides
+
+
 def _get_param_groups(
     model_chunks: List[MegatronModule],
     config: OptimizerConfig,

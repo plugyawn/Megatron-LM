@@ -147,6 +147,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     is_linear_attention_variant,
 )
 from megatron.core.optimizer import (
+    get_matrix_optimizer_config_overrides,
     get_mup_config_overrides,
     get_scaling_config_overrides,
     get_standard_config_overrides,
@@ -2007,22 +2008,11 @@ def setup_model_and_optimizer(
                 config_overrides = {**(config_overrides or {}), **scaling_overrides}
 
         if config.matrix_optimizer != 'none':
-            matrix_config_overrides = config_overrides
-            if scaling_policy.enabled:
-                matrix_scaling_policy = build_training_scaling_policy(
-                    model_config, optimizer_type=config.matrix_optimizer
-                )
-                matrix_config_overrides = get_standard_config_overrides(
-                    config=config, scaling_policy=matrix_scaling_policy
-                )
-                matrix_scaling_overrides = get_scaling_config_overrides(
-                    config=config, scaling_policy=matrix_scaling_policy
-                )
-                if matrix_scaling_overrides:
-                    matrix_config_overrides = {
-                        **(matrix_config_overrides or {}),
-                        **matrix_scaling_overrides,
-                    }
+            matrix_config_overrides = get_matrix_optimizer_config_overrides(
+                config=config,
+                fallback_config_overrides=config_overrides,
+                scaling_policy=scaling_policy,
+            )
             optimizer = get_megatron_matrix_optimizer(
                 config,
                 model,

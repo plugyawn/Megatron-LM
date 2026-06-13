@@ -1393,6 +1393,106 @@ def test_matrix_update_rule_supports_two_sided_diag_preconditioning():
     torch.testing.assert_close(rule(grad, feature_gram, grad_gram, param), expected)
 
 
+def test_matrix_update_rule_supports_two_sided_diag_muon_preconditioning(monkeypatch):
+    from types import SimpleNamespace
+
+    import megatron.core.optimizer.matrix_optimizer as matrix_optimizer_module
+
+    if not matrix_optimizer_module.HAVE_EMERGING_MATRIX_OPTIMIZERS:
+        pytest.skip("emerging_optimizers is not installed")
+
+    def local_block_update(matrix, orthogonalize, *, approximation_label):
+        assert approximation_label == "tp_block_local_matrix_update"
+        return matrix
+
+    monkeypatch.setattr(
+        matrix_optimizer_module, "tp_block_local_approx", local_block_update
+    )
+
+    param = _param_with_info(tp_layout="none")
+    grad = torch.arange(1, 13, dtype=torch.float32).reshape(4, 3)
+    feature_gram = torch.tensor([1.0, 4.0, 9.0])
+    grad_gram = torch.tensor([2.0, 3.0, 4.0, 5.0])
+    config = OptimizerConfig(
+        matrix_optimizer="muon",
+        matrix_tp_update_mode="block_local",
+        muon_scale_mode="unit_rms_norm",
+        muon_extra_scale_factor=1.0,
+        matrix_input_preconditioner="feature_gram",
+        matrix_input_preconditioner_approximation="diag",
+        matrix_input_preconditioner_ridge=0.5,
+        matrix_output_preconditioner="grad_gram",
+        matrix_output_preconditioner_approximation="diag",
+        matrix_output_preconditioner_ridge=1.0,
+    )
+
+    rule = matrix_optimizer_module._make_matrix_update_rule(config, SimpleNamespace(tp=None))
+
+    preconditioned = grad / (grad_gram + 1.0).unsqueeze(1) / (
+        feature_gram + 0.5
+    ).unsqueeze(0)
+    expected = -preconditioned * ((grad.size(0) / grad.size(1)) ** 0.5)
+    torch.testing.assert_close(rule(grad, feature_gram, grad_gram, param), expected)
+
+
+def test_matrix_inplace_update_rule_routes_output_only_diag_sgd_to_left_kernel(monkeypatch):
+    from types import SimpleNamespace
+
+    import megatron.core.optimizer.matrix_optimizer as matrix_optimizer_module
+
+    if not matrix_optimizer_module.HAVE_EMERGING_MATRIX_OPTIMIZERS:
+        pytest.skip("emerging_optimizers is not installed")
+
+    calls = []
+
+    def fake_left_update(param, grad, diag_grad_gram, **kwargs):
+        calls.append((param, grad, diag_grad_gram, kwargs))
+        return param
+
+    monkeypatch.setattr(
+        matrix_optimizer_module,
+        "apply_diag_left_preconditioned_update_",
+        fake_left_update,
+    )
+
+    param = _param_with_info(tp_layout="none")
+    grad = torch.ones_like(param)
+    grad_gram = torch.arange(1, param.shape[0] + 1, dtype=torch.float32)
+    config = OptimizerConfig(
+        matrix_optimizer="sgd",
+        matrix_output_preconditioner="grad_gram",
+        matrix_output_preconditioner_approximation="diag",
+        matrix_output_preconditioner_ridge=0.25,
+    )
+
+    rule = matrix_optimizer_module._make_matrix_inplace_update_rule(
+        config, SimpleNamespace(tp=None)
+    )
+
+    assert rule(
+        param,
+        grad,
+        None,
+        grad_gram,
+        param,
+        lr=0.1,
+        weight_decay=0.2,
+        decoupled_weight_decay=False,
+    )
+    assert len(calls) == 1
+    called_param, called_grad, called_grad_gram, kwargs = calls[0]
+    assert called_param is param
+    assert called_grad is grad
+    assert called_grad_gram is grad_gram
+    assert kwargs == {
+        "lr": 0.1,
+        "ridge": 0.25,
+        "update_scale": 1.0,
+        "weight_decay": 0.2,
+        "decoupled_weight_decay": False,
+    }
+
+
 def test_matrix_update_rule_supports_plain_muon_without_input_preconditioner(monkeypatch):
     from types import SimpleNamespace
 
