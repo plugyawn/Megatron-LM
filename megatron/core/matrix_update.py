@@ -346,7 +346,7 @@ def get_matrix_shard_spec(param: torch.nn.Parameter) -> Optional[MatrixShardSpec
     return getattr(param, MATRIX_SHARD_SPEC_ATTR, None)
 
 
-def ensure_matrix_shard_spec(param: torch.nn.Parameter) -> MatrixShardSpec:
+def _ensure_matrix_shard_spec(param: torch.nn.Parameter) -> MatrixShardSpec:
     """Attach and return a MatrixShardSpec for a matrix-owned parameter.
 
     Affine weights should normally already carry LinearWeightInfo, which records
@@ -422,14 +422,6 @@ def matrix_small_gram_side_for_spec(
 
     rows, cols = spec.logical_shape
     return "right" if rows >= cols else "left"
-
-
-def matrix_small_gram_orientation_for_spec(
-    spec: MatrixShardSpec,
-) -> MatrixSmallGramSide:
-    """Compatibility alias for ``matrix_small_gram_side_for_spec``."""
-
-    return matrix_small_gram_side_for_spec(spec)
 
 
 def matrix_shard_spec_with_dp_axis(
@@ -611,7 +603,7 @@ def register_matrix_optimizer_param(
     )
     if owner in (MATRIX_OPTIMIZER_OWNER_MUON, MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION):
         if ensure_shard_spec:
-            ensure_matrix_shard_spec(param)
+            _ensure_matrix_shard_spec(param)
         param.is_managed_by_layer_wise_optimizer = info.requires_layerwise_layout
     else:
         param.is_managed_by_layer_wise_optimizer = False

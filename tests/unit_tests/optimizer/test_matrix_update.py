@@ -610,8 +610,10 @@ def test_layerwise_buffer_routing_marks_matrix_optimizer_owned_params():
     assert weight_info.update_family == "muon"
     assert weight_info.requires_layerwise_layout
     assert module.weight.is_managed_by_layer_wise_optimizer
+    assert get_matrix_shard_spec(module.weight) is not None
     assert bias_info.owner == MATRIX_OPTIMIZER_OWNER_FALLBACK
     assert not module.bias.is_managed_by_layer_wise_optimizer
+    assert get_matrix_shard_spec(module.bias) is None
 
 
 def test_layerwise_buffer_routing_preserves_parameterization_role():
