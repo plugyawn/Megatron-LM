@@ -151,6 +151,7 @@ class MegatronOptimizer(ABC):
     ):
         """Input optimizer is the base optimizer (e.g., Adam)."""
         self.optimizer = optimizer
+        self.is_stub_optimizer = optimizer is None
         if self.optimizer is None:
             warnings.warn(
                 f"WARNING: there is no optimizer on RANK {torch.distributed.get_rank()}. "

@@ -148,6 +148,165 @@ class MegatronFSDPOptimizer(MegatronOptimizer):
         self.grad_stats_parallel_group = _matrix_optimizer_fsdp_stats_group(pg_collection)
         self.tp_group = _matrix_optimizer_tp_group(pg_collection)
 
+    def _param_name(self, param: torch.nn.Parameter) -> str:
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
+            _matrix_optimizer_param_checkpoint_identity,
+            _megatron_fsdp_model_from_optimizer_params,
+            _optimizer_param_state_indices,
+        )
+
+        mfsdp_model = _megatron_fsdp_model_from_optimizer_params(self.optimizer)
+        if mfsdp_model is None:
+            raise RuntimeError(
+                "Megatron-FSDP optimizer checkpointing requires optimizer parameters "
+                "to carry MegatronFSDP ownership metadata."
+            )
+        param_state_indices = _optimizer_param_state_indices(self.optimizer)
+        param_idx = str(param_state_indices.get(id(param), "unknown"))
+        param_name = _matrix_optimizer_param_checkpoint_identity(param, mfsdp_model)
+        if param_name is None:
+            raise RuntimeError(
+                "Megatron-FSDP optimizer checkpointing requires a stable parameter "
+                f"identity for optimizer state index {param_idx}."
+            )
+        return param_name
+
+    def _param_groups_to_param2group_meta(self, param_groups: list[dict]) -> dict:
+        param_to_group_meta = {}
+        for group in param_groups:
+            group_meta = group.copy()
+            del group_meta["params"]
+            for param in group["params"]:
+                param_to_group_meta[self._param_name(param)] = group_meta
+        return param_to_group_meta
+
+    def _param2group_meta_to_param_groups(
+        self,
+        param_to_group_meta: dict,
+        param_groups: list[dict],
+        strict: bool = True,
+    ) -> list[dict]:
+        new_param_groups = []
+        for group in param_groups:
+            new_group = {"params": []}
+            for param in group["params"]:
+                param_name = self._param_name(param)
+                if param_name not in param_to_group_meta:
+                    if strict:
+                        raise ValueError(
+                            f"Parameter {param_name} not found in param_to_group_meta mapping."
+                        )
+                    continue
+                group_meta = param_to_group_meta[param_name]
+                new_group_wo_params = new_group.copy()
+                del new_group_wo_params["params"]
+                if new_group_wo_params and new_group_wo_params != group_meta:
+                    error_info = (
+                        f"Parameter {param_name} and the parameters in the same group "
+                        f"{new_group['params']} have different metadata. Please check "
+                        "whether the checkpoint and current param_groups match. "
+                        f"Parameter {param_name} has metadata {group_meta}, "
+                        f"while other group metadata is {new_group}."
+                    )
+                    if strict:
+                        raise ValueError(error_info)
+                    logger.warning(error_info)
+                    continue
+                new_group["params"].append(param_name)
+                new_group.update(group_meta)
+            new_param_groups.append(new_group)
+        return new_param_groups
+
+    def _param_state_index_to_name(self) -> dict[int, str]:
+        index_to_name = {}
+        seen_param_ids = {}
+        state_idx = 0
+        for group in self.optimizer.param_groups:
+            for param in group["params"]:
+                param_id = id(param)
+                if param_id not in seen_param_ids:
+                    seen_param_ids[param_id] = state_idx
+                    index_to_name[state_idx] = self._param_name(param)
+                    state_idx += 1
+        return index_to_name
+
+    def _optimizer_state_dtensor_keys(self) -> list[str]:
+        local_keys = set()
+        for param_state in self.optimizer.state.values():
+            if not isinstance(param_state, dict):
+                continue
+            for state_key, state_value in param_state.items():
+                if DTensor is not None and isinstance(state_value, DTensor):
+                    local_keys.add(state_key)
+        if torch.distributed.is_initialized():
+            gathered_keys = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(gathered_keys, sorted(local_keys))
+            local_keys = set()
+            for rank_keys in gathered_keys:
+                local_keys.update(rank_keys or [])
+        return sorted(local_keys)
+
+    def _optimizer_state_step_value(self) -> Optional[float]:
+        local_step = None
+        for param_state in self.optimizer.state.values():
+            if not isinstance(param_state, dict) or "step" not in param_state:
+                continue
+            step = param_state["step"]
+            if torch.is_tensor(step) and step.numel() == 1:
+                local_step = float(step.detach().cpu().item())
+                break
+            if isinstance(step, (int, float)):
+                local_step = float(step)
+                break
+        if torch.distributed.is_initialized():
+            gathered_steps = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(gathered_steps, local_step)
+            for step in gathered_steps:
+                if step is not None:
+                    return float(step)
+        return local_step
+
+    def _add_empty_dtensor_state_for_missing_params(
+        self, packed_state: dict, dtensor_state_keys: list[str], step_value: Optional[float]
+    ) -> None:
+        if DTensor is None or not dtensor_state_keys:
+            return
+        for group in self.optimizer.param_groups:
+            for param in group["params"]:
+                if not isinstance(param, DTensor):
+                    continue
+                param_name = self._param_name(param)
+                param_state = packed_state.setdefault(param_name, {})
+                if not isinstance(param_state, dict):
+                    continue
+                local_param = param.to_local()
+                for state_key in dtensor_state_keys:
+                    if state_key in param_state:
+                        continue
+                    param_state[state_key] = DTensor.from_local(
+                        local_tensor=torch.empty(
+                            0, dtype=local_param.dtype, device=local_param.device
+                        ),
+                        device_mesh=param.device_mesh,
+                        placements=param.placements,
+                        shape=param.shape,
+                        stride=param.stride(),
+                    )
+                if step_value is not None and "step" not in param_state:
+                    param_state["step"] = torch.tensor(
+                        step_value, dtype=torch.float32, device=local_param.device
+                    )
+
+    def _init_optimizer_states_with_dummy_values(self) -> None:
+        for group in self.optimizer.param_groups:
+            for param in group["params"]:
+                local_param = param.to_local() if DTensor is not None and isinstance(param, DTensor) else param
+                if local_param.numel() == 0:
+                    continue
+                param.grad = torch.zeros_like(param)
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+
     def prepare_grads(self) -> bool:
         return False
 
@@ -175,6 +334,27 @@ class MegatronFSDPOptimizer(MegatronOptimizer):
         return self.optimizer.state_dict()
 
     def load_state_dict(self, state_dict):
+        if "param_to_group_meta" in state_dict:
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
+                _matrix_optimizer_checkpoint_state_dict_for_validation,
+                _megatron_fsdp_model_from_optimizer_params,
+                _validate_matrix_optimizer_checkpoint_metadata,
+            )
+
+            state_dict = state_dict.copy()
+            mfsdp_model = _megatron_fsdp_model_from_optimizer_params(self.optimizer)
+            if mfsdp_model is not None:
+                _validate_matrix_optimizer_checkpoint_metadata(
+                    self.optimizer,
+                    mfsdp_model,
+                    _matrix_optimizer_checkpoint_state_dict_for_validation(
+                        self.optimizer, state_dict, self._param_name
+                    ),
+                )
+            state_dict["param_groups"] = self._param2group_meta_to_param_groups(
+                state_dict["param_to_group_meta"], self.optimizer.param_groups
+            )
+            del state_dict["param_to_group_meta"]
         self.optimizer.load_state_dict(state_dict)
 
     @torch.no_grad()
@@ -183,7 +363,47 @@ class MegatronFSDPOptimizer(MegatronOptimizer):
         return True, None, None
 
     def sharded_state_dict(self, model_sharded_state_dict, is_loading: bool = False, **kwargs):
-        return self.state_dict()
+        if is_loading:
+            self._init_optimizer_states_with_dummy_values()
+
+        state_dict = self.optimizer.state_dict()
+        index_to_name = self._param_state_index_to_name()
+        dtensor_state_keys = self._optimizer_state_dtensor_keys()
+        step_value = self._optimizer_state_step_value()
+        packed_state = {}
+        for param_idx, param_state in state_dict.get("state", {}).items():
+            if isinstance(param_idx, int) and param_idx in index_to_name:
+                packed_state[index_to_name[param_idx]] = param_state
+            elif isinstance(param_idx, str) and param_idx.isdigit() and int(param_idx) in index_to_name:
+                packed_state[index_to_name[int(param_idx)]] = param_state
+            else:
+                packed_state[param_idx] = param_state
+        self._add_empty_dtensor_state_for_missing_params(
+            packed_state, dtensor_state_keys, step_value
+        )
+
+        sharded_state_dict = {
+            key: value
+            for key, value in state_dict.items()
+            if key not in ("state", "param_groups")
+        }
+        sharded_state_dict["state"] = packed_state
+        sharded_state_dict["param_to_group_meta"] = self._param_groups_to_param2group_meta(
+            self.optimizer.param_groups
+        )
+
+        if not is_loading:
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
+                _add_matrix_optimizer_checkpoint_metadata,
+                _megatron_fsdp_model_from_optimizer_params,
+            )
+
+            mfsdp_model = _megatron_fsdp_model_from_optimizer_params(self.optimizer)
+            if mfsdp_model is not None:
+                _add_matrix_optimizer_checkpoint_metadata(
+                    self.optimizer, mfsdp_model, sharded_state_dict
+                )
+        return sharded_state_dict
 
 
 def _muon_scale_factor(size_out: int, size_in: int, config: OptimizerConfig) -> float:
