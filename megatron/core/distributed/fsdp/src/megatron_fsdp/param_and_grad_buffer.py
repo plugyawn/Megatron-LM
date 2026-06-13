@@ -359,6 +359,26 @@ def _unpack_matrix_fsdp_local_shard(
     return padded_shard[:, : matrix_shard_plan.local_shape[1]]
 
 
+def _fsdp_local_view_shape(param_shape: torch.Size, fsdp_shard_axis: int) -> Tuple[int, ...]:
+    """Return the local tensor view shape for a flat FSDP shard."""
+
+    if fsdp_shard_axis not in (0, 1):
+        raise ValueError(
+            "[Megatron-FSDP] FSDP local view shard axis must be 0 or 1, got "
+            f"{fsdp_shard_axis}."
+        )
+    if len(param_shape) <= 1:
+        return (-1,)
+    if fsdp_shard_axis == 0:
+        return (-1, *param_shape[1:])
+    if len(param_shape) != 2:
+        raise RuntimeError(
+            "[Megatron-FSDP] Matrix-axis FSDP sharding on axis 1 requires a 2D "
+            f"parameter, got shape {tuple(param_shape)}."
+        )
+    return (param_shape[0], -1)
+
+
 class MultiGroupUBRAllocator:
     """
     A custom allocator class that registers a single memory pool with multiple different
@@ -3309,10 +3329,12 @@ class ParamAndGradBuffer:
                 )
             else:
                 # Update the existing distributed tensor with the new gradient.
-                if len(orig_param.shape) > 1:
-                    local_shape = (-1, *orig_param.shape[1:])
-                else:
-                    local_shape = (-1,)
+                fsdp_shard_axis = 0
+                if HAVE_MCORE_MATRIX_UPDATE and _is_matrix_optimizer_owned_param(orig_param):
+                    matrix_shard_spec = get_matrix_shard_spec(orig_param)
+                    if matrix_shard_spec is not None:
+                        fsdp_shard_axis = matrix_fsdp_shard_axis_for_spec(matrix_shard_spec)
+                local_shape = _fsdp_local_view_shape(orig_param.shape, fsdp_shard_axis)
                 self.dist_main_grad[name]._local_tensor = optimizer_grad.view(local_shape)
             grad = self.dist_main_grad[name]
 
@@ -5062,14 +5084,8 @@ def make_fsdp_dtensor(
         fsdp_shard_axis=fsdp_shard_axis,
     )
 
-    # Reshape local tensor for sharded layouts beyond 1D
-    if len(orig_param.shape) > 1:
-        if fsdp_shard_axis == 0:
-            local_shape = (-1, *orig_param.shape[1:])
-        else:
-            local_shape = (*orig_param.shape[:1], -1)
-    else:
-        local_shape = (-1,)
+    # Reshape local tensor for sharded layouts beyond 1D.
+    local_shape = _fsdp_local_view_shape(orig_param.shape, fsdp_shard_axis)
 
     # Create the FSDP-compliant DTensor
     fsdp_tensor = DTensor.from_local(
