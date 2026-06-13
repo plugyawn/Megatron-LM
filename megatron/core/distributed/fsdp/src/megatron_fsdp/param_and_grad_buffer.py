@@ -1664,7 +1664,13 @@ class DataParallelBuffer:
                 dp_shard_axis=matrix_shard_plan.dp_shard_axis,
                 dp_world_size=self.dp_world_size,
             )
-            return matrix.reshape(-1)
+            item = matrix.reshape(-1)
+            matrix_axis_items = getattr(bucket, "_matrix_axis_unpacked_items", None)
+            if matrix_axis_items is None:
+                matrix_axis_items = {}
+                setattr(bucket, "_matrix_axis_unpacked_items", matrix_axis_items)
+            matrix_axis_items[item_id] = item
+            return item
 
         item_index = self.item_index_map[item_id]
         bucket_index = self.bucket_index
@@ -1712,6 +1718,35 @@ class DataParallelBuffer:
                 fp8_get_raw_data(param_local, self.is_transpose_buffer).copy_(unpacked_item)
             else:
                 param_local.data.copy_(unpacked_item)
+
+    def pack_matrix_axis_bucket_items(self, bucket: Bucket) -> None:
+        """Pack cached column-axis row-major item workspaces back into ``bucket``."""
+
+        matrix_axis_items = getattr(bucket, "_matrix_axis_unpacked_items", None)
+        if not matrix_axis_items:
+            return
+        for item_id, unpacked_item in matrix_axis_items.items():
+            matrix_shard_plan = self._get_matrix_fsdp_shard_plan_for_item(item_id)
+            if matrix_shard_plan is None or matrix_shard_plan.dp_shard_axis == 0:
+                continue
+            if len(self.params) != 1:
+                raise RuntimeError(
+                    "[Megatron-FSDP] Column-axis matrix optimizer-owned parameters "
+                    "must use singleton FSDP buckets before packing gradient buckets."
+                )
+            item_index = self.item_index_map[item_id]
+            packed_bucket = _pack_matrix_fsdp_global_bucket(
+                unpacked_item.view(item_index.shape),
+                dp_shard_axis=matrix_shard_plan.dp_shard_axis,
+                dp_world_size=self.dp_world_size,
+            )
+            if packed_bucket.numel() != bucket.data.numel():
+                raise RuntimeError(
+                    "[Megatron-FSDP] Packed matrix-axis bucket size does not match "
+                    f"the communication bucket: packed={packed_bucket.numel()}, "
+                    f"bucket={bucket.data.numel()}, item_shape={tuple(item_index.shape)}."
+                )
+            bucket.data.copy_(packed_bucket)
 
 
 @dataclasses.dataclass
@@ -4147,6 +4182,7 @@ class GradReducePipeline:
                     unreduced_grad_bucket = gbuf.fetch_bucket(
                         dtype=mp_policy.grad_comm_dtype if gbuf.is_data_distributed else None
                     )
+                    gbuf.pack_matrix_axis_bucket_items(unreduced_grad_bucket)
                     # NOTE(@cspades): `no_shard` or `optim`
                     # Un-sharded gradient buffers accumulate un-reduced gradients locally
                     # without allocating an un-sharded buffer. For custom communication
