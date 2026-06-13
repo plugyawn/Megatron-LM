@@ -536,6 +536,29 @@ def test_distributed_optimizer_fsdp_dtensor_state_records_matrix_metadata(monkey
     ]
 
 
+def test_distributed_optimizer_fsdp_dtensor_load_preserves_matrix_state(monkeypatch):
+    monkeypatch.setattr(fully_shard_module, "DTensor", _FakeDTensor)
+    save_param = _matrix_param()
+    save_param._megatron_fsdp_model = _fake_mfsdp_model()
+    save_optimizer = torch.optim.SGD([save_param], lr=0.1)
+    saved_momentum = _fake_dtensor_state()
+    save_optimizer.state[save_param]["momentum_buffer"] = saved_momentum
+    save_distopt = _fake_distributed_optimizer(save_param, save_optimizer)
+    state_dict = save_distopt.sharded_param_state_fsdp_dtensor()
+
+    load_param = _matrix_param()
+    load_param._megatron_fsdp_model = _fake_mfsdp_model()
+    load_optimizer = torch.optim.SGD([load_param], lr=0.1)
+    load_distopt = _fake_distributed_optimizer(load_param, load_optimizer)
+
+    load_distopt.load_state_dict(state_dict)
+
+    assert "momentum_buffer" in load_optimizer.state[load_param]
+    loaded_momentum = load_optimizer.state[load_param]["momentum_buffer"]
+    assert tuple(loaded_momentum.shape) == tuple(saved_momentum.shape)
+    torch.testing.assert_close(loaded_momentum, saved_momentum)
+
+
 def test_distributed_optimizer_fsdp_dtensor_load_validates_matrix_metadata(monkeypatch):
     monkeypatch.setattr(fully_shard_module, "DTensor", _FakeDTensor)
     param = _matrix_param()
