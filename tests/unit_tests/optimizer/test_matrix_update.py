@@ -877,6 +877,78 @@ def test_matrix_update_rule_supports_output_grad_gram_preconditioner():
     torch.testing.assert_close(rule(grad, None, grad_gram, param), expected)
 
 
+def test_matrix_update_rule_full_output_grad_gram_tp1_matches_unsharded():
+    from types import SimpleNamespace
+
+    import megatron.core.optimizer.matrix_optimizer as matrix_optimizer_module
+
+    if not matrix_optimizer_module.HAVE_EMERGING_MATRIX_OPTIMIZERS:
+        pytest.skip("emerging_optimizers is not installed")
+
+    column_parallel_param = _param_with_info(
+        tp_layout="column_parallel", shape=(4, 3), logical_shape=(4, 3)
+    )
+    unsharded_param = _param_with_info(tp_layout="none", shape=(4, 3), logical_shape=(4, 3))
+    grad = torch.arange(1, 13, dtype=torch.float32).reshape(4, 3)
+    grad_gram = torch.tensor(
+        [
+            [5.0, 1.0, 0.0, 0.0],
+            [1.0, 4.0, 1.0, 0.0],
+            [0.0, 1.0, 6.0, 1.0],
+            [0.0, 0.0, 1.0, 3.0],
+        ]
+    )
+    config = OptimizerConfig(
+        matrix_optimizer="sgd",
+        matrix_output_preconditioner="grad_gram",
+        matrix_output_preconditioner_approximation="full",
+        matrix_output_preconditioner_ridge=0.5,
+    )
+
+    rule = matrix_optimizer_module._make_matrix_update_rule(config, SimpleNamespace(tp=None))
+
+    expected = -torch.linalg.solve(grad_gram + 0.5 * torch.eye(4), grad)
+    torch.testing.assert_close(rule(grad, None, grad_gram, column_parallel_param), expected)
+    torch.testing.assert_close(
+        rule(grad, None, grad_gram, column_parallel_param),
+        rule(grad, None, grad_gram, unsharded_param),
+    )
+
+
+def test_matrix_update_rule_block_diag_output_grad_gram_solves_real_coordinates_only():
+    from types import SimpleNamespace
+
+    import megatron.core.optimizer.matrix_optimizer as matrix_optimizer_module
+
+    if not matrix_optimizer_module.HAVE_EMERGING_MATRIX_OPTIMIZERS:
+        pytest.skip("emerging_optimizers is not installed")
+
+    param = _param_with_info(tp_layout="none", shape=(3, 2), logical_shape=(3, 2))
+    grad = torch.arange(1, 7, dtype=torch.float32).reshape(3, 2)
+    grad_gram = torch.tensor(
+        [
+            [[4.0, 1.0], [1.0, 3.0]],
+            [[9.0, 0.0], [0.0, 0.0]],
+        ]
+    )
+    config = OptimizerConfig(
+        matrix_optimizer="sgd",
+        matrix_output_preconditioner="grad_gram",
+        matrix_output_preconditioner_approximation="block_diag",
+        matrix_output_preconditioner_block_size=2,
+        matrix_output_preconditioner_ridge=0.25,
+    )
+
+    rule = matrix_optimizer_module._make_matrix_update_rule(config, SimpleNamespace(tp=None))
+
+    ridge_eye = 0.25 * torch.eye(2)
+    first_block = -torch.linalg.solve(grad_gram[0] + ridge_eye, grad[:2])
+    last_rhs = torch.stack([grad[2], torch.zeros_like(grad[2])])
+    last_block = -torch.linalg.solve(grad_gram[1] + ridge_eye, last_rhs)[:1]
+    expected = torch.cat([first_block, last_block], dim=0)
+    torch.testing.assert_close(rule(grad, None, grad_gram, param), expected)
+
+
 def test_matrix_update_rule_supports_two_sided_diag_preconditioning():
     from types import SimpleNamespace
 
