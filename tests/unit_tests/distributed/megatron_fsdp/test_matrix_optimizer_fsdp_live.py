@@ -8,6 +8,7 @@ Run with:
 """
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -23,12 +24,16 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
     fully_shard_optimizer,
 )
 from megatron.core.matrix_update import (
+    MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
     MATRIX_OPTIMIZER_OWNER_MUON,
     MatrixShardSpec,
     get_matrix_shard_spec,
     register_matrix_optimizer_param,
     update_matrix_shard_spec,
 )
+from megatron.core.optimizer.matrix_function_optimizer import MatrixFunctionOptimizer
+from megatron.core.optimizer.matrix_optimizer import _make_matrix_update_rule
+from megatron.core.optimizer.optimizer_config import OptimizerConfig
 
 
 class _ToyMatrixModel(torch.nn.Module):
@@ -167,6 +172,79 @@ def test_matrix_optimizer_owned_param_state_checkpoint_contract(distributed_cuda
     torch.testing.assert_close(
         reloaded_state["master_param"].to_local(), saved_master_param_local
     )
+    dist.barrier()
+
+
+@pytest.mark.distributed
+def test_matrix_function_muon_step_uses_fsdp_dtensor_local_shard(distributed_cuda_setup):
+    setup = distributed_cuda_setup
+    if setup["world_size"] < 2:
+        pytest.skip("Matrix-sharded Megatron-FSDP smoke requires at least 2 ranks.")
+
+    device_mesh = init_device_mesh(
+        "cuda", mesh_shape=(setup["world_size"], 1), mesh_dim_names=("dp_shard", "tp")
+    )
+    toy_model = _ToyMatrixModel(setup["device"])
+    register_matrix_optimizer_param(
+        toy_model.linear.weight,
+        owner=MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
+        update_family="muon",
+        requires_layerwise_layout=True,
+    )
+    update_matrix_shard_spec(
+        toy_model.linear.weight,
+        MatrixShardSpec(
+            logical_shape=tuple(toy_model.linear.weight.shape),
+            local_shape=tuple(toy_model.linear.weight.shape),
+            tp_layout="none",
+        ),
+    )
+
+    mfsdp_model = fully_shard_model(
+        module=toy_model,
+        device_mesh=device_mesh,
+        dp_shard_dim="dp_shard",
+        tp_dim="tp",
+        zero_dp_strategy="optim_grads_params",
+        fsdp_unit_modules=[torch.nn.Linear],
+        disable_bucketing=True,
+    )
+    matrix_param = next(mfsdp_model.parameters())
+    matrix_spec = get_matrix_shard_spec(matrix_param)
+    assert matrix_spec is not None
+    assert tuple(matrix_param.to_local().shape) == matrix_spec.local_shape
+    before_local = matrix_param.to_local().detach().clone()
+
+    config = OptimizerConfig(
+        matrix_optimizer="muon",
+        muon_num_ns_steps=2,
+        muon_coefficient_type="simple",
+        muon_scale_mode="unit_rms_norm",
+    )
+    process_groups = SimpleNamespace(
+        tp=dist.group.WORLD,
+        dp=dist.group.WORLD,
+        dp_cp=dist.group.WORLD,
+        tp_dp_cp=dist.group.WORLD,
+    )
+    optimizer = fully_shard_optimizer(
+        MatrixFunctionOptimizer(
+            [matrix_param],
+            lr=0.01,
+            update_rule=_make_matrix_update_rule(config, process_groups),
+            weight_decay=0.0,
+        )
+    )
+
+    x = torch.randn(2, 3, device=setup["device"])
+    y = torch.randn(2, 4, device=setup["device"])
+    loss = mse_loss(mfsdp_model(x), y)
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+
+    after_local = matrix_param.to_local().detach()
+    assert torch.linalg.vector_norm(after_local - before_local) > 0
     dist.barrier()
 
 

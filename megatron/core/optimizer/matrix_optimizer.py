@@ -16,6 +16,11 @@ from typing import Dict, List, Optional
 
 import torch
 
+try:
+    from torch.distributed.tensor import DTensor
+except ImportError:
+    DTensor = None
+
 from megatron.core.matrix_update import (
     TPUpdateMode,
     configure_model_matrix_updates,
@@ -166,18 +171,26 @@ def _fsdp_small_gram_newton_schulz_allreduce(
 ) -> torch.Tensor:
     """Apply exact small-Gram Muon to a matrix-axis FSDP local shard."""
 
-    if local_matrix.ndim != 2:
+    dtensor_template = None
+    local_matrix_for_update = local_matrix
+    if DTensor is not None and isinstance(local_matrix, DTensor):
+        dtensor_template = local_matrix
+        local_matrix_for_update = local_matrix.to_local()
+
+    if local_matrix_for_update.ndim != 2:
         raise RuntimeError(
-            f"Matrix FSDP Muon requires a 2D local matrix shard, got {tuple(local_matrix.shape)}."
+            "Matrix FSDP Muon requires a 2D local matrix shard, got "
+            f"{tuple(local_matrix_for_update.shape)}."
         )
-    if tuple(local_matrix.shape) != tuple(matrix_shard_spec.local_shape):
+    if tuple(local_matrix_for_update.shape) != tuple(matrix_shard_spec.local_shape):
         raise RuntimeError(
             "Matrix FSDP Muon local shard shape does not match MatrixShardSpec: "
-            f"local_matrix={tuple(local_matrix.shape)}, spec.local_shape={matrix_shard_spec.local_shape}."
+            f"local_matrix={tuple(local_matrix_for_update.shape)}, "
+            f"spec.local_shape={matrix_shard_spec.local_shape}."
         )
     tp_layout = _fsdp_small_gram_tp_layout(matrix_shard_spec)
-    return tp_small_gram_newton_schulz_allreduce(
-        local_matrix,
+    local_update = tp_small_gram_newton_schulz_allreduce(
+        local_matrix_for_update,
         tp_layout=tp_layout,
         group=group,
         logical_shape=matrix_shard_spec.logical_shape,
@@ -185,6 +198,16 @@ def _fsdp_small_gram_newton_schulz_allreduce(
         coefficient_type=config.muon_coefficient_type,
         use_syrk=False,
     )
+    if dtensor_template is not None:
+        return DTensor.from_local(
+            local_update,
+            device_mesh=dtensor_template.device_mesh,
+            placements=dtensor_template.placements,
+            run_check=False,
+            shape=dtensor_template.shape,
+            stride=tuple(dtensor_template.stride()),
+        )
+    return local_update
 
 
 def _copy_matrix_model_refs_to_main_params(optimizer: MegatronOptimizer) -> None:
