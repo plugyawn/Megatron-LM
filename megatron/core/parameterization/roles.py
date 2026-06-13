@@ -146,7 +146,9 @@ def is_hidden_matrix_parameter(param: Any, param_name: Optional[str] = None) -> 
     return param.dim() > 1 and not is_embedding_class_parameter(param, param_name)
 
 
-def is_muon_managed_matrix_parameter(param: Any, *, optimizer_type: str) -> bool:
+def is_muon_update_family_matrix_parameter(param: Any, *, optimizer_type: str) -> bool:
+    """Return whether matrix-update scaling should be owned by Muon semantics."""
+
     matrix_optimizer_info = getattr(param, '_mcore_matrix_optimizer_info', None)
     if matrix_optimizer_info is not None:
         return (
@@ -158,3 +160,7 @@ def is_muon_managed_matrix_parameter(param: Any, *, optimizer_type: str) -> bool
     if get_parameterization_role(param) == ROLE_MUON_MANAGED_MATRIX:
         return True
     return param.dim() == 2 and not is_embedding_or_output_parameter(param)
+
+
+def is_muon_managed_matrix_parameter(param: Any, *, optimizer_type: str) -> bool:
+    return is_muon_update_family_matrix_parameter(param, optimizer_type=optimizer_type)

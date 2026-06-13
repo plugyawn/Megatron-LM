@@ -204,7 +204,7 @@ class MatrixFunctionOptimizer(torch.optim.Optimizer):
 
         for group in self.param_groups:
             lr = group["lr"]
-            weight_decay = group["weight_decay"] * group.get("wd_mult", 1.0)
+            weight_decay = group["weight_decay"]
             decoupled_weight_decay = group["decoupled_weight_decay"]
             for param in group["params"]:
                 if param is None:

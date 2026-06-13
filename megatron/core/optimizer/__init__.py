@@ -61,7 +61,7 @@ from megatron.core.parameterization import (
     is_embedding_or_output_parameter,
     is_hidden_matrix_parameter,
     is_hidden_vector_parameter,
-    is_muon_managed_matrix_parameter,
+    is_muon_update_family_matrix_parameter,
     is_vector_like_parameter,
     should_skip_depth_mup_vector_weight_decay,
 )
@@ -216,7 +216,9 @@ def get_scaling_config_overrides(
     def should_scale_hidden_matrix(param: torch.nn.Parameter, param_name: str) -> bool:
         if decoupled_lr_enabled and is_embedding_or_output_parameter(param):
             return False
-        if is_muon_managed_matrix_parameter(param, optimizer_type=scaling_policy.optimizer_type):
+        if is_muon_update_family_matrix_parameter(
+            param, optimizer_type=scaling_policy.optimizer_type
+        ):
             return False
         return is_hidden_matrix_parameter(param, param_name)
 
@@ -231,7 +233,9 @@ def get_scaling_config_overrides(
         return is_hidden_vector_parameter(param, param_name)
 
     def should_scale_hidden_matrix_eps(param: torch.nn.Parameter, param_name: str) -> bool:
-        if is_muon_managed_matrix_parameter(param, optimizer_type=scaling_policy.optimizer_type):
+        if is_muon_update_family_matrix_parameter(
+            param, optimizer_type=scaling_policy.optimizer_type
+        ):
             return False
         return is_hidden_matrix_parameter(param, param_name)
 

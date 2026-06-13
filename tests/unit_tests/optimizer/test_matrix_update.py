@@ -1669,6 +1669,29 @@ def test_matrix_function_optimizer_applies_decoupled_weight_decay():
     torch.testing.assert_close(param, torch.full_like(param, 0.98))
 
 
+def test_matrix_function_optimizer_uses_resolved_weight_decay_once():
+    param = _param_with_info()
+    param.data.fill_(1.0)
+    param.main_grad = torch.zeros_like(param.data)
+    configure_matrix_update_param(param, recipe=_recipe())
+    maybe_accumulate_feature_gram(param, torch.ones(2, 3))
+
+    def update_rule(grad, feature_gram, grad_gram, model_param):
+        return torch.zeros_like(grad)
+
+    opt = MatrixFunctionOptimizer(
+        [param],
+        lr=0.1,
+        update_rule=update_rule,
+        weight_decay=0.1,
+        decoupled_weight_decay=True,
+    )
+    opt.param_groups[0]["wd_mult"] = 0.5
+    opt.step()
+
+    torch.testing.assert_close(param, torch.full_like(param, 0.99))
+
+
 def test_matrix_function_optimizer_uses_inplace_update_rule_when_available():
     param = _param_with_info()
     param.data.fill_(1.0)

@@ -26,14 +26,21 @@ from megatron.core.optimizer import (
     get_scaling_config_overrides,
     get_standard_config_overrides,
 )
+from megatron.core.matrix_update import (
+    MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
+    set_matrix_optimizer_info,
+)
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.optimizer_param_scheduler import combine_param_group_overrides
 from megatron.core.parameterization import (
+    ROLE_HIDDEN_MATRIX,
     allow_scaling_policy_eval,
     build_legacy_mup_training_policy,
     build_model_scaling_policy,
     build_scaling_context,
     build_training_scaling_policy,
+    get_parameterization_role,
+    set_parameterization_metadata,
 )
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.multi_token_prediction import process_mtp_loss
@@ -1679,6 +1686,34 @@ class TestMuPOptimizerTypeHandling:
         assert 'max_lr' not in bias_override
         assert 'min_lr' not in bias_override
         assert 'eps' not in bias_override
+
+    def test_matrix_function_muon_excludes_hidden_matrix_from_mup_overrides(self):
+        optimizer_config = OptimizerConfig(lr=1e-3, min_lr=1e-5, muon_scale_mode='unit_rms_norm')
+        width_mult = 4.0
+        overrides = get_mup_config_overrides(
+            optimizer_config, width_mult, optimizer_type='muon'
+        )
+
+        param = torch.nn.Parameter(torch.zeros(10, 10))
+        set_parameterization_metadata(param, role=ROLE_HIDDEN_MATRIX)
+        set_matrix_optimizer_info(
+            param,
+            owner=MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
+            update_family='muon',
+            requires_layerwise_layout=False,
+        )
+
+        matches = [
+            override
+            for param_key, override in overrides.items()
+            if param_key.matches(param, 'decoder.layers.0.self_attention.linear_proj.weight')
+        ]
+        override = combine_param_group_overrides(matches)
+
+        assert get_parameterization_role(param) == ROLE_HIDDEN_MATRIX
+        assert 'max_lr' not in override
+        assert 'min_lr' not in override
+        assert 'eps' not in override
 
     @pytest.mark.parametrize('optimizer_type', ['muon', 'dist_muon'])
     def test_muon_warns_for_spectral_scale_mode(self, optimizer_type):
