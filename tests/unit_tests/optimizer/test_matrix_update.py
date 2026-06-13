@@ -1433,6 +1433,7 @@ def test_matrix_update_rule_small_gram_muon_honors_ns_config(monkeypatch):
     torch.testing.assert_close(seen_matrix, grad)
     assert kwargs["tp_layout"] == "column_parallel"
     assert kwargs["group"] is None
+    assert kwargs["logical_shape"] == param._mcore_linear_weight_info.logical_shape
     assert kwargs["steps"] == 7
     assert kwargs["coefficient_type"] == "polar_express"
     assert not kwargs["use_syrk"]
@@ -1520,6 +1521,40 @@ def test_matrix_fsdp_small_gram_muon_column_shard_matches_full_reference(monkeyp
     ).chunk(2, dim=1)[0]
 
     torch.testing.assert_close(update, ref)
+
+
+def test_matrix_fsdp_small_gram_muon_passes_true_logical_shape(monkeypatch):
+    import megatron.core.optimizer.matrix_optimizer as matrix_optimizer_module
+
+    spec = matrix_shard_spec_with_dp_axis(
+        MatrixShardSpec(logical_shape=(5, 5), local_shape=(5, 5), tp_layout="none"),
+        dp_shard_axis=0,
+        dp_local_start=3,
+        dp_local_end=5,
+    )
+    local = torch.empty(2, 5)
+    config = OptimizerConfig(matrix_optimizer="muon")
+    calls = []
+
+    def fake_small_gram(matrix, **kwargs):
+        calls.append((matrix, kwargs))
+        return matrix
+
+    monkeypatch.setattr(
+        matrix_optimizer_module,
+        "tp_small_gram_newton_schulz_allreduce",
+        fake_small_gram,
+    )
+
+    update = matrix_optimizer_module._fsdp_small_gram_newton_schulz_allreduce(
+        local,
+        spec,
+        group=object(),
+        config=config,
+    )
+
+    assert update is local
+    assert calls[0][1]["logical_shape"] == (5, 5)
 
 
 def test_matrix_update_rule_uses_fsdp_small_gram_and_logical_scale(monkeypatch):
@@ -2146,3 +2181,45 @@ def test_native_column_parallel_linear_backward_collects_feature_gram():
         )
     finally:
         Utils.destroy_model_parallel()
+
+
+def test_wrap_model_chunks_with_fsdp_preregisters_matrix_metadata():
+    from types import SimpleNamespace
+
+    from megatron.core.matrix_update import (
+        MATRIX_OPTIMIZER_OWNER_FALLBACK,
+        MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
+        get_matrix_optimizer_info,
+        get_matrix_shard_spec,
+    )
+    from megatron.training.training import wrap_model_chunks_with_ddp
+
+    module = torch.nn.Module()
+    module.weight = _param_with_info(shape=(4, 3), logical_shape=(4, 3))
+    module.bias = torch.nn.Parameter(torch.empty(4))
+    seen = {}
+
+    class FakeFSDP:
+        def __init__(self, *args, **kwargs):
+            wrapped_module = kwargs.get("module")
+            if wrapped_module is None:
+                wrapped_module = next((arg for arg in args if arg is module), None)
+            assert wrapped_module is module
+            seen["weight_info"] = get_matrix_optimizer_info(wrapped_module.weight)
+            seen["bias_info"] = get_matrix_optimizer_info(wrapped_module.bias)
+            self.module = wrapped_module
+
+    wrapped = wrap_model_chunks_with_ddp(
+        [module],
+        SimpleNamespace(),
+        SimpleNamespace(bucket_size=None),
+        DP=FakeFSDP,
+        matrix_optimizer_type="muon",
+        matrix_min_dim=2,
+    )
+
+    assert wrapped[0].module is module
+    assert seen["weight_info"].owner == MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION
+    assert seen["weight_info"].update_family == "muon"
+    assert seen["bias_info"].owner == MATRIX_OPTIMIZER_OWNER_FALLBACK
+    assert get_matrix_shard_spec(module.weight) is not None

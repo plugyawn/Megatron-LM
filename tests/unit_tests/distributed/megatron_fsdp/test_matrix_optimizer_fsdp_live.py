@@ -207,7 +207,7 @@ def test_matrix_optimizer_owned_column_axis_param_state_checkpoint_contract(
         disable_bucketing=True,
     )
     optimizer = fully_shard_optimizer(
-        torch.optim.SGD(mfsdp_model.parameters(), lr=0.01, momentum=0.9)
+        _SGDWithMasterParamState(mfsdp_model.parameters(), lr=0.01, momentum=0.9)
     )
 
     matrix_params = [
@@ -231,8 +231,11 @@ def test_matrix_optimizer_owned_column_axis_param_state_checkpoint_contract(
 
     state = optimizer.state[matrix_param]
     assert isinstance(state["momentum_buffer"], DTensor)
+    assert isinstance(state["master_param"], DTensor)
     assert get_matrix_shard_spec(state["momentum_buffer"]) == matrix_spec
+    assert get_matrix_shard_spec(state["master_param"]) == matrix_spec
     saved_momentum_local = state["momentum_buffer"].to_local().detach().clone()
+    saved_master_param_local = state["master_param"].to_local().detach().clone()
 
     state_dict = optimizer.state_dict()
     metadata_block = state_dict[MATRIX_OPTIMIZER_STATE_METADATA_KEY]
@@ -241,16 +244,21 @@ def test_matrix_optimizer_owned_column_axis_param_state_checkpoint_contract(
     assert metadata["update_family"] == "muon"
     assert metadata["matrix_shard_contract"]["dp_shard_axis"] == 1
     assert metadata["matrix_shard_contract"]["dp_shard_layout"] == "column_contiguous_flat_buffer"
-    assert metadata["same_shard_state_names"] == ["momentum_buffer"]
+    assert metadata["same_shard_state_names"] == ["master_param", "momentum_buffer"]
 
     reloaded_optimizer = fully_shard_optimizer(
-        torch.optim.SGD(mfsdp_model.parameters(), lr=0.01, momentum=0.9)
+        _SGDWithMasterParamState(mfsdp_model.parameters(), lr=0.01, momentum=0.9)
     )
     reloaded_optimizer.load_state_dict(state_dict)
     reloaded_state = reloaded_optimizer.state[matrix_param]
     assert isinstance(reloaded_state["momentum_buffer"], DTensor)
+    assert isinstance(reloaded_state["master_param"], DTensor)
     assert get_matrix_shard_spec(reloaded_state["momentum_buffer"]) == matrix_spec
+    assert get_matrix_shard_spec(reloaded_state["master_param"]) == matrix_spec
     torch.testing.assert_close(
         reloaded_state["momentum_buffer"].to_local(), saved_momentum_local
+    )
+    torch.testing.assert_close(
+        reloaded_state["master_param"].to_local(), saved_master_param_local
     )
     dist.barrier()

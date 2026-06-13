@@ -235,7 +235,7 @@ def _build_matrix_fsdp_shard_plan(
 
     This is intentionally axis-based rather than flat-offset based. For axis 0,
     the plan matches the existing row-major buffer layout. For axis 1, it
-    describes the column-contiguous layout that a future matrix-aware packing
+    describes the column-contiguous layout that the explicit matrix-axis packing
     path must materialize before the parameter can be exposed as ``Shard(1)``.
     """
 
@@ -1205,16 +1205,16 @@ class DataParallelBuffer:
 
         # Count all parameters in this buffer and store their enumerated index.
         self.param_idx = {p: i for i, p in enumerate(self.params)}
+        self._matrix_axis_unpacked_items: Dict[int, torch.Tensor] = {}
         self._set_matrix_optimizer_shard_specs()
 
     def _set_matrix_optimizer_shard_specs(self) -> None:
-        """Attach row-aligned DP shard metadata for matrix-owned parameters.
+        """Attach matrix-axis DP shard metadata for matrix-owned parameters.
 
-        Megatron-FSDP stores parameters in flat bucket shards. A matrix optimizer
-        can only consume the resulting local tensor as a row shard when the
-        parameter/bucket intersection begins and ends on full-row boundaries.
-        Anything else would make ``local_tensor.view(-1, cols)`` a partial-row
-        patch rather than a principled matrix shard.
+        Row-axis shards use Megatron-FSDP's existing row-major flat bucket layout
+        and must be aligned on complete matrix rows. Column-axis shards use the
+        explicit matrix-axis packing path and record column ranges from the
+        matrix shard plan.
         """
 
         if (
@@ -1399,6 +1399,7 @@ class DataParallelBuffer:
         """
         Release the storage of a temporarily-allocated communication bucket.
         """
+        self._matrix_axis_unpacked_items.clear()
         self.temporary_bucket_allocator.free(self.bucket_index.bucket_id)
 
     def reset_param_main_grad(self):
@@ -1674,11 +1675,7 @@ class DataParallelBuffer:
                 dp_world_size=self.dp_world_size,
             )
             item = matrix.reshape(-1)
-            matrix_axis_items = getattr(bucket, "_matrix_axis_unpacked_items", None)
-            if matrix_axis_items is None:
-                matrix_axis_items = {}
-                setattr(bucket, "_matrix_axis_unpacked_items", matrix_axis_items)
-            matrix_axis_items[item_id] = item
+            self._matrix_axis_unpacked_items[item_id] = item
             return item
 
         item_index = self.item_index_map[item_id]
@@ -1731,10 +1728,10 @@ class DataParallelBuffer:
     def pack_matrix_axis_bucket_items(self, bucket: Bucket) -> None:
         """Pack cached column-axis row-major item workspaces back into ``bucket``."""
 
-        matrix_axis_items = getattr(bucket, "_matrix_axis_unpacked_items", None)
+        matrix_axis_items = self._matrix_axis_unpacked_items
         if not matrix_axis_items:
             return
-        for item_id, unpacked_item in matrix_axis_items.items():
+        for item_id, unpacked_item in list(matrix_axis_items.items()):
             matrix_shard_plan = self._get_matrix_fsdp_shard_plan_for_item(item_id)
             if matrix_shard_plan is None or matrix_shard_plan.dp_shard_axis == 0:
                 continue
@@ -1756,6 +1753,7 @@ class DataParallelBuffer:
                     f"bucket={bucket.data.numel()}, item_shape={tuple(item_index.shape)}."
                 )
             bucket.data.copy_(packed_bucket)
+            del matrix_axis_items[item_id]
 
 
 @dataclasses.dataclass

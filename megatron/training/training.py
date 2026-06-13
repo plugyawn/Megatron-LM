@@ -1547,7 +1547,9 @@ def wrap_model_chunks_with_ddp(
 
     Layouts are only computed when ``DP is DDP`` (i.e. the standard
     ``DistributedDataParallel``); FSDP variants don't accept
-    ``full_param_layout``.
+    ``full_param_layout``. Matrix optimizer metadata is still registered before
+    FSDP wrapping so matrix-aware FSDP planners can see ownership and shard
+    contracts while building buffers.
 
     Args:
         model_chunks: List of model chunks to wrap (un-DDP-wrapped).
@@ -1581,6 +1583,20 @@ def wrap_model_chunks_with_ddp(
         bucket_sizes = [ddp_config.bucket_size] * n
     if disable_bucketing_per_chunk is None:
         disable_bucketing_per_chunk = [False] * n
+
+    if DP is not DDP and (
+        matrix_optimizer_type != "none"
+        or optimizer_type in ("muon", "dist_muon")
+    ):
+        tag_params_for_buffer_routing(
+            model_chunks,
+            optimizer_type=optimizer_type,
+            matrix_optimizer_type=matrix_optimizer_type,
+            matrix_min_dim=matrix_min_dim,
+            requires_layerwise_layout=(
+                use_layer_wise_distributed_optimizer and use_layer_wise_param_layout
+            ),
+        )
 
     # Compute per-chunk layouts (DDP only).
     per_chunk_layouts = [None] * n
