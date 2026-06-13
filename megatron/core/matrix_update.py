@@ -148,9 +148,10 @@ class MatrixShardSpec:
     """Internal logical matrix layout contract for distributed matrix optimizers.
 
     ``tp_shard_axis`` describes the current tensor-parallel local matrix shard,
-    when the local shape proves that an axis is actually sharded. Future FSDP
-    support should extend the DP fields rather than inferring matrix layout from
-    flat parameter-storage offsets.
+    when the local shape proves that an axis is actually sharded. The DP/FSDP
+    fields are reserved for matrix-axis-aware FSDP planner output; their
+    presence is not a claim that generic Megatron-FSDP matrix optimizer support
+    is wired.
     """
 
     logical_shape: tuple[int, int]
@@ -360,14 +361,16 @@ def ensure_matrix_shard_spec(param: torch.nn.Parameter) -> MatrixShardSpec:
 
 
 def matrix_fsdp_shard_axis_for_spec(spec: MatrixShardSpec) -> int:
-    """Return the DP/FSDP matrix axis required by the small-Gram Muon contract.
+    """Return the future DP/FSDP matrix axis required by small-Gram Muon.
 
-    The DP/FSDP shard should align with the existing matrix shard axis when TP
-    already shards the matrix. Sharding the opposite axis would create 2D
-    patches, which are not a valid input to the simple row/column small-Gram
-    distributed Muon rule. If TP does not shard the matrix, choose the axis that
-    keeps the small Gram on the smaller matrix dimension: row-axis shards for
-    tall matrices and column-axis shards for wide matrices.
+    This helper is a layout-planning rule, not active generic FSDP support. A
+    future matrix-aware DP/FSDP shard should align with the existing matrix
+    shard axis when TP already shards the matrix. Sharding the opposite axis
+    would create 2D patches, which are not a valid input to the simple
+    row/column small-Gram distributed Muon rule. If TP does not shard the
+    matrix, choose the axis that keeps the small Gram on the smaller matrix
+    dimension: row-axis shards for tall matrices and column-axis shards for wide
+    matrices.
     """
 
     if spec.tp_shard_axis is None:

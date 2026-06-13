@@ -198,12 +198,13 @@ def _make_matrix_inplace_update_rule(
 
     For SGD-style matrix updates, diagonal input, output, and two-sided
     preconditioners are eligible for the EO fused in-place/Triton helpers. For
-    Muon, only the diagonal input-side FEATURE_GRAM path uses the fused
-    Newton-Muon helper today; output-side or two-sided Muon preconditioning
-    intentionally falls back to the generic update rule. Full and block-diagonal
-    Grams also fall back to the generic rule, where the cached factorized solve
-    path preserves the supported math without implying a Triton Gram-solve
-    implementation.
+    Muon, only the diagonal input-side FEATURE_GRAM path uses the fast diagonal
+    helper today: diagonal preconditioning and parameter application are
+    in-place, while Polar Express/NS remains the shared Muon implementation.
+    Output-side or two-sided Muon preconditioning intentionally falls back to
+    the generic update rule. Full and block-diagonal Grams also fall back to the
+    generic rule, where the cached factorized solve path preserves the
+    supported math without implying a Triton Gram-solve implementation.
     """
 
     if config.matrix_optimizer not in ("sgd", "muon"):

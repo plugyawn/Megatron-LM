@@ -1639,6 +1639,9 @@ def validate_args(args, defaults={}):
     # emerging optimizer check
     args.use_layer_wise_distributed_optimizer = False
     if args.matrix_optimizer != 'none' and args.use_distributed_optimizer:
+        # Matrix optimizers use LayerWiseDistributedOptimizer ownership plus a
+        # fallback DistOpt for non-matrix params; this is not standard DistOpt
+        # ownership for the matrix params themselves.
         args.use_layer_wise_distributed_optimizer = True
         args.use_distributed_optimizer = False
 
@@ -2561,10 +2564,10 @@ def _add_regularization_args(parser):
                        help='Approximation for the input/right preconditioner.')
     group.add_argument('--matrix-output-preconditioner', type=str, default='none',
                        choices=['none', 'grad_gram'],
-                       help='Output/left preconditioner for matrix optimizer updates.')
+                       help='Grad-output/left preconditioner for matrix optimizer updates.')
     group.add_argument('--matrix-output-preconditioner-approximation', type=str, default='diag',
                        choices=['diag', 'block_diag', 'full'],
-                       help='Approximation for the output/left preconditioner.')
+                       help='Approximation for the grad-output/left preconditioner.')
     group.add_argument('--matrix-input-preconditioner-refresh-interval', type=int, default=1,
                        help='Number of optimizer steps between input preconditioner refreshes.')
     group.add_argument('--matrix-output-preconditioner-refresh-interval', type=int, default=1,

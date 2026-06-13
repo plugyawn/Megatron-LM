@@ -332,10 +332,10 @@ class OptimizerConfig:
     """Input/right preconditioner approximation: diag, block_diag, or full."""
 
     matrix_output_preconditioner: str = "none"
-    """Output/left preconditioner for matrix optimizer updates: none or grad_gram."""
+    """Grad-output/left preconditioner for matrix optimizer updates: none or grad_gram."""
 
     matrix_output_preconditioner_approximation: str = "diag"
-    """Output/left preconditioner approximation: diag, block_diag, or full."""
+    """Grad-output/left preconditioner approximation: diag, block_diag, or full."""
 
     matrix_input_preconditioner_refresh_interval: int = 1
     """Number of optimizer steps between input preconditioner refreshes."""
@@ -377,7 +377,7 @@ class OptimizerConfig:
     """Default ridge used when consuming the input/right preconditioner."""
 
     matrix_output_preconditioner_ridge: float = 0.0
-    """Default ridge used when consuming the output/left preconditioner."""
+    """Default ridge used when consuming the grad-output/left preconditioner."""
 
     matrix_input_preconditioner_ema_beta: Optional[float] = None
     """Optional EMA coefficient for persistent input preconditioner estimates."""
@@ -647,7 +647,9 @@ class OptimizerConfig:
         if self.matrix_optimizer != "none" and self.use_distributed_optimizer:
             raise ValueError(
                 "Matrix optimizers do not support standard DistributedOptimizer yet; "
-                "use whole-parameter layer-wise ownership or disable --use-distributed-optimizer."
+                "the arguments layer rewrites this combination to "
+                "LayerWiseDistributedOptimizer ownership. Disable "
+                "--use-distributed-optimizer to use a local matrix optimizer path."
             )
         if self.matrix_input_preconditioner == "feature_gram" and self.matrix_input_preconditioner_ema_beta is not None:
             raise ValueError(
