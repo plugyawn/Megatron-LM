@@ -633,8 +633,6 @@ def _matrix_optimizer_checkpoint_metadata(
             state_names, state_shapes = _matrix_same_shard_state_metadata(
                 optimizer.state.get(param, {}), param
             )
-            if not state_names:
-                continue
             param_idx = str(param_state_indices[id(param)])
             param_identity = _require_matrix_optimizer_param_checkpoint_identity(
                 param, mfsdp_model, param_idx
@@ -738,9 +736,9 @@ def _validate_matrix_optimizer_checkpoint_metadata(
                         "matrix-shaped Muon state must be checkpointed as a DTensor."
                     )
             same_shape_state_names = _matrix_state_names_sharded_like_param(loaded_state, param)
-            if not same_shape_state_names:
-                continue
             if metadata is None or param_idx not in metadata:
+                if not same_shape_state_names:
+                    continue
                 raise RuntimeError(
                     "[MegatronFSDP] Matrix optimizer checkpoint is missing matrix-shard "
                     f"metadata for optimizer state index {param_idx}."
