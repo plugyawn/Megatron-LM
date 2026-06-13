@@ -1166,6 +1166,18 @@ def _accumulate_diag_feature_gram(gram: torch.Tensor, x: torch.Tensor) -> None:
     gram.add_(torch.sum(x * x, dim=0))
 
 
+def _accumulate_diag_grad_gram(gram: torch.Tensor, dy: torch.Tensor) -> None:
+    if gram.is_cuda and dy.is_cuda:
+        try:
+            from emerging_optimizers.triton_kernels.feature_gram import diag_grad_gram_reduce
+
+            diag_grad_gram_reduce(dy, out=gram, accumulate=True)
+            return
+        except Exception:
+            pass
+    gram.add_(torch.sum(dy * dy, dim=0))
+
+
 def _accumulate_block_diag_feature_gram(
     gram: torch.Tensor,
     x: torch.Tensor,
@@ -1269,7 +1281,7 @@ def maybe_accumulate_grad_gram(weight: torch.Tensor, grad_output: torch.Tensor) 
     if recipe.approximation == MatrixPreconditionerApproximation.FULL:
         gram.add_(dy.t().matmul(dy))
     elif recipe.approximation == MatrixPreconditionerApproximation.DIAG:
-        _accumulate_diag_feature_gram(gram, dy)
+        _accumulate_diag_grad_gram(gram, dy)
     elif recipe.approximation == MatrixPreconditionerApproximation.BLOCK_DIAG:
         _accumulate_block_diag_feature_gram(
             gram,
