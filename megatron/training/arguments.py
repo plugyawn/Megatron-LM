@@ -1662,6 +1662,16 @@ def validate_args(args, defaults={}):
         assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
+    if (
+        args.use_layer_wise_distributed_optimizer
+        and not args.use_layer_wise_param_layout
+        and (args.matrix_optimizer != 'none' or args.optimizer in ('muon', 'adaptive_muon'))
+    ):
+        raise ValueError(
+            "Matrix/Muon LayerWise + fallback DistributedOptimizer routing requires "
+            "the precomputed LayerWise param layout. Remove "
+            "--no-use-layer-wise-param-layout or disable the distributed split path."
+        )
 
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
@@ -3151,8 +3161,9 @@ def _add_distributed_args(parser):
                        '(including non-Muon embeddings, biases, layernorm) live in a single '
                        'LayerWise buffer and the optimizer uses the allgather_params() codepath. '
                        'The default (precomputed layout) routes non-Muon params through a '
-                       'separate DistributedOptimizer with byte-level sharding, which is faster '
-                       'and uses less padding but produces different bf16 reduction ordering '
+                       'separate DistributedOptimizer with byte-level sharding, which is required '
+                       'for matrix/Muon distributed split routing, faster, and uses less padding '
+                       'but produces different bf16 reduction ordering '
                        'and so will not match legacy-path loss curves bit-for-bit.')
     group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub',
                        help='Use the userbuffer registration for DP/FSDP communication buffers.'
