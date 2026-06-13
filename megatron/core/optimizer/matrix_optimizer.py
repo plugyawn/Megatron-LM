@@ -528,6 +528,13 @@ def get_megatron_matrix_optimizer(
     fallback_param_groups = _get_param_groups(
         model_chunks, fallback_config, config_overrides, param_filter=is_fallback_param
     )
+    if any(group.get('is_expert_parallel', False) for group in fallback_param_groups):
+        raise RuntimeError(
+            "Matrix optimizer fallback does not yet support expert-parallel fallback "
+            "parameter groups. Route expert fallback through the standard Megatron "
+            "optimizer path or add explicit expert DistOpt routing before enabling this "
+            "combination."
+        )
     if use_separate_distributed_optimizer:
         distopt_process_groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
             pg_collection, model_chunks, use_gloo_process_groups=False
