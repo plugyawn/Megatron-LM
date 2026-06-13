@@ -1171,6 +1171,11 @@ def fully_shard_optimizer(
         # Execute the base optimizer.step() on the model optimizer named parameters.
         optimizer_step_base_func(optimizer, *args, **kwargs)
 
+        # Validate matrix optimizer state after the real step materializes it.
+        # This avoids dummy-step initialization while still catching local
+        # same-shaped Muon momentum/master state as soon as it exists.
+        _validate_matrix_optimizer_state_sharding(optimizer, mfsdp_model)
+
         # Update the raw module training parameters with optimized values.
         if install_optimized_model_weights:
             mfsdp_model.install_optimized_model_weights()
