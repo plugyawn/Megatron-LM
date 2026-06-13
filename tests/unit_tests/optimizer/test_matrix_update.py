@@ -888,6 +888,48 @@ def test_matrix_inplace_update_rule_uses_two_sided_diag_sgd():
     torch.testing.assert_close(param, expected)
 
 
+def test_matrix_inplace_update_rule_routes_input_only_diag_sgd_to_right_kernel(monkeypatch):
+    from types import SimpleNamespace
+
+    import megatron.core.optimizer.matrix_optimizer as matrix_optimizer_module
+
+    if not matrix_optimizer_module.HAVE_EMERGING_MATRIX_OPTIMIZERS:
+        pytest.skip("emerging_optimizers is not installed")
+
+    param = _param_with_info()
+    grad = torch.ones_like(param.data)
+    feature_gram = torch.tensor([2.0, 3.0, 4.0])
+    config = OptimizerConfig(
+        matrix_optimizer="sgd",
+        matrix_input_preconditioner="feature_gram",
+        matrix_input_preconditioner_approximation="diag",
+        matrix_input_preconditioner_ridge=1.0,
+    )
+    calls = []
+
+    def fake_apply(param_arg, grad_arg, diag_feature_gram, **kwargs):
+        calls.append((param_arg, grad_arg, diag_feature_gram, kwargs))
+        return True
+
+    monkeypatch.setattr(
+        matrix_optimizer_module, "apply_diag_right_preconditioned_update_", fake_apply
+    )
+    rule = matrix_optimizer_module._make_matrix_inplace_update_rule(
+        config, SimpleNamespace(tp=None)
+    )
+
+    assert rule(param, grad, feature_gram, None, param, 0.1, 0.2, True)
+    assert len(calls) == 1
+    seen_param, seen_grad, seen_feature_gram, kwargs = calls[0]
+    assert seen_param is param
+    assert seen_grad is grad
+    assert seen_feature_gram is feature_gram
+    assert kwargs["lr"] == 0.1
+    assert kwargs["weight_decay"] == 0.2
+    assert kwargs["decoupled_weight_decay"] is True
+    assert kwargs["ridge"] == 1.0
+
+
 def test_matrix_inplace_update_rule_uses_diag_muon_for_local_matrix(monkeypatch):
     from types import SimpleNamespace
 
