@@ -625,6 +625,154 @@ def test_layerwise_muon_routing_synthesizes_matrix_shard_spec_for_plain_2d_param
     assert spec.tp_shard_axis is None
 
 
+def test_matrix_optimizer_split_routes_fallback_to_standard_distopt(monkeypatch):
+    import copy
+    import types
+
+    import megatron.core.optimizer.matrix_optimizer as matrix_optimizer_module
+
+    matrix_param = _param_with_info(shape=(4, 3))
+    fallback_param = torch.nn.Parameter(torch.ones(3))
+
+    class DummyModel:
+        ddp_config = types.SimpleNamespace(use_distributed_optimizer=True)
+        buffers = []
+
+        def named_parameters(self):
+            return [("matrix", matrix_param), ("fallback", fallback_param)]
+
+    class FakeMatrixFunctionOptimizer:
+        def __init__(self, param_groups, **kwargs):
+            self.param_groups = param_groups
+
+    class FakeLayerWiseDistributedOptimizer:
+        def __init__(
+            self,
+            chained_optimizers,
+            config,
+            pg_collection,
+            init_state_fn_list=None,
+            model_chunks=None,
+        ):
+            self.chained_optimizers = chained_optimizers
+            self.config = config
+
+    class FakeFallbackOptimizer:
+        def __init__(self, config):
+            self.config = config
+
+    class FakeChainedOptimizer:
+        def __init__(self, chained_optimizers):
+            self.chained_optimizers = chained_optimizers
+
+    param_group_calls = []
+    fallback_calls = []
+
+    def fake_get_param_groups(model_chunks, config, config_overrides=None):
+        trainable = [
+            param
+            for model_chunk in model_chunks
+            for _, param in model_chunk.named_parameters()
+            if param.requires_grad
+        ]
+        param_group_calls.append(
+            {
+                "params": trainable,
+                "use_distributed_optimizer": config.use_distributed_optimizer,
+                "use_layer_wise_distributed_optimizer": config.use_layer_wise_distributed_optimizer,
+                "matrix_optimizer": config.matrix_optimizer,
+            }
+        )
+        return [{"params": trainable}]
+
+    def fake_fallback_optimizer(**kwargs):
+        fallback_calls.append(copy.copy(kwargs["config"]))
+        return FakeFallbackOptimizer(kwargs["config"])
+
+    monkeypatch.setattr(matrix_optimizer_module, "HAVE_EMERGING_MATRIX_OPTIMIZERS", True)
+    monkeypatch.setattr(
+        matrix_optimizer_module,
+        "configure_model_matrix_updates",
+        lambda model_chunks, config: [matrix_param],
+    )
+    monkeypatch.setattr(matrix_optimizer_module, "get_pg_size", lambda group: 1)
+    monkeypatch.setattr(matrix_optimizer_module, "_get_param_groups", fake_get_param_groups)
+    monkeypatch.setattr(
+        matrix_optimizer_module,
+        "_make_matrix_update_rule",
+        lambda config, pg_collection: object(),
+    )
+    monkeypatch.setattr(
+        matrix_optimizer_module,
+        "_make_matrix_inplace_update_rule",
+        lambda config, pg_collection: object(),
+    )
+    monkeypatch.setattr(
+        matrix_optimizer_module,
+        "MatrixFunctionOptimizer",
+        FakeMatrixFunctionOptimizer,
+    )
+    monkeypatch.setattr(
+        matrix_optimizer_module,
+        "LayerWiseDistributedOptimizer",
+        FakeLayerWiseDistributedOptimizer,
+    )
+    monkeypatch.setattr(matrix_optimizer_module, "ChainedOptimizer", FakeChainedOptimizer)
+    monkeypatch.setattr(
+        matrix_optimizer_module,
+        "_copy_matrix_model_refs_to_main_params",
+        lambda optimizer: None,
+    )
+    monkeypatch.setattr(
+        matrix_optimizer_module.ProcessGroupCollection,
+        "setup_process_groups_for_optimizer",
+        staticmethod(
+            lambda pg_collection, model_chunks, use_gloo_process_groups=False: {
+                "mp_group": object(),
+                "intra_dp_cp_group": object(),
+                "intra_dp_cp_group_gloo": object(),
+                "intra_dist_opt_group": object(),
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        matrix_optimizer_module,
+        "_distributed_optimizer_instance_id_from_process_groups",
+        lambda process_groups: 0,
+    )
+    monkeypatch.setattr(
+        matrix_optimizer_module,
+        "_get_megatron_optimizer_based_on_param_groups",
+        fake_fallback_optimizer,
+    )
+
+    config = OptimizerConfig(
+        optimizer="adam",
+        lr=1e-3,
+        matrix_optimizer="muon",
+        use_distributed_optimizer=False,
+        use_layer_wise_distributed_optimizer=True,
+    )
+    pg_collection = types.SimpleNamespace(dp_cp=object())
+
+    optimizer = matrix_optimizer_module.get_megatron_matrix_optimizer(
+        config,
+        [DummyModel()],
+        pg_collection=pg_collection,
+    )
+
+    assert isinstance(optimizer, FakeChainedOptimizer)
+    assert param_group_calls[0]["params"] == [matrix_param]
+    assert param_group_calls[0]["matrix_optimizer"] == "muon"
+    assert param_group_calls[1]["params"] == [fallback_param]
+    assert param_group_calls[1]["matrix_optimizer"] == "none"
+    assert fallback_calls[0].use_distributed_optimizer
+    assert not fallback_calls[0].use_layer_wise_distributed_optimizer
+    assert config.matrix_optimizer == "muon"
+    assert matrix_param.requires_grad
+    assert fallback_param.requires_grad
+
+
 def test_fp8_dequant_source_fails_closed_in_native_collector():
     param = _param_with_info()
     recipe = _recipe()
