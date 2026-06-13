@@ -2267,3 +2267,30 @@ def test_wrap_model_chunks_with_fsdp_preregisters_matrix_metadata():
     assert seen["weight_info"].update_family == "muon"
     assert seen["bias_info"].owner == MATRIX_OPTIMIZER_OWNER_FALLBACK
     assert get_matrix_shard_spec(module.weight) is not None
+
+
+@pytest.mark.parametrize("matrix_optimizer", ["sgd", "muon"])
+@pytest.mark.parametrize("input_preconditioner", ["none", "feature_gram"])
+def test_first_sweep_matrix_optimizer_modes_configure_owned_matrix_params(
+    matrix_optimizer, input_preconditioner
+):
+    module = torch.nn.Module()
+    module.weight = _param_with_info(shape=(4, 3), logical_shape=(4, 3))
+    module.bias = torch.nn.Parameter(torch.empty(4))
+    config = OptimizerConfig(
+        matrix_optimizer=matrix_optimizer,
+        matrix_input_preconditioner=input_preconditioner,
+        matrix_input_preconditioner_approximation="diag",
+        matrix_input_preconditioner_ridge=1e-4,
+    )
+
+    configured_params = configure_model_matrix_updates([module], config)
+
+    assert configured_params == [module.weight]
+    info = get_matrix_optimizer_info(module.weight)
+    assert info.owner == MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION
+    assert info.update_family == matrix_optimizer
+    assert get_matrix_shard_spec(module.weight).logical_shape == (4, 3)
+    assert hasattr(module.weight, "_feature_gram_recipe") == (
+        input_preconditioner == "feature_gram"
+    )
