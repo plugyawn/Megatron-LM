@@ -2633,7 +2633,7 @@ def _add_regularization_args(parser):
     group.add_argument('--matrix-output-preconditioner-ridge', type=float, default=0.0,
                        help='Default ridge for matrix optimizer rules consuming an output preconditioner.')
     group.add_argument('--matrix-tp-update-mode', type=str, default='allgather',
-                       choices=['allgather', 'small_gram_polar', 'block_local'],
+                       choices=['allgather', 'small_gram_ns', 'block_local'],
                        help='Tensor-parallel matrix update apply mode.')
     group.add_argument('--matrix-bias-mode', type=str, default='fallback',
                        choices=['fallback'],

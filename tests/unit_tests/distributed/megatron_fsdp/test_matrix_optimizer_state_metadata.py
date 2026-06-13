@@ -351,6 +351,47 @@ def test_matrix_optimizer_checkpoint_rejects_param_identity_mismatch(monkeypatch
         )
 
 
+def test_matrix_optimizer_checkpoint_rejects_duplicate_saved_param_identity(monkeypatch):
+    monkeypatch.setattr(fully_shard_module, "DTensor", _FakeDTensor)
+    param_a = _matrix_param(name="layers.duplicate.weight")
+    param_b = _matrix_param(name="layers.duplicate.weight")
+    optimizer = torch.optim.SGD([param_a, param_b], lr=0.1)
+    optimizer.state[param_a]["momentum_buffer"] = _fake_dtensor_state()
+    optimizer.state[param_b]["momentum_buffer"] = _fake_dtensor_state()
+
+    with pytest.raises(RuntimeError, match="parameter identity must be unique"):
+        fully_shard_module._add_matrix_optimizer_checkpoint_metadata(
+            optimizer, _fake_mfsdp_model(), {"state": {}, "param_groups": []}
+        )
+
+
+def test_matrix_optimizer_checkpoint_rejects_duplicate_loaded_param_identity(monkeypatch):
+    monkeypatch.setattr(fully_shard_module, "DTensor", _FakeDTensor)
+    param_a = _matrix_param(name="layers.0.weight")
+    param_b = _matrix_param(name="layers.1.weight")
+    optimizer = torch.optim.SGD([param_a, param_b], lr=0.1)
+    duplicate_metadata = _metadata_for_param(param_a, param_identity="layers.0.weight")
+    load_state_dict = {
+        "state": {
+            0: {"momentum_buffer": _fake_dtensor_state()},
+            1: {"momentum_buffer": _fake_dtensor_state()},
+        },
+        "param_groups": [],
+        fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_KEY: {
+            "version": fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_VERSION,
+            "params": {
+                "0": _metadata_for_param(param_a, param_identity="layers.0.weight"),
+                "1": duplicate_metadata,
+            },
+        },
+    }
+
+    with pytest.raises(RuntimeError, match="parameter identity must be unique"):
+        fully_shard_module._validate_matrix_optimizer_checkpoint_metadata(
+            optimizer, _fake_mfsdp_model(), load_state_dict
+        )
+
+
 def test_matrix_optimizer_runtime_state_rejects_local_same_shaped_state(monkeypatch):
     monkeypatch.setattr(fully_shard_module, "DTensor", _FakeDTensor)
     param = _matrix_param()

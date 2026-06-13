@@ -489,19 +489,27 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 optimizers
             ), "init_state_fn_list must be the same length as optimizers if provided"
 
-        # Wrap base torch optimizers with Float16 for bf16 training.
+        # Wrap base torch optimizers in Megatron optimizer adapters before
+        # ChainedOptimizer sees them. ChainedOptimizer calls the Megatron
+        # optimizer API (prepare_grads, step_with_ready_grads, get_parameters),
+        # which raw torch optimizers do not implement.
         # Callers pass base optimizers; wrapping happens here *after*
         # shard_params so master weights are only created for the local shard.
-        if config.bf16:
-            for i in range(len(optimizers)):
-                opt = optimizers[i]
-                if isinstance(opt, (Float16OptimizerWithFloat16Params, FP32Optimizer)):
-                    raise TypeError(
-                        'LayerWiseDistributedOptimizer expects base torch optimizers, '
-                        f'got {type(opt).__name__}. Do not pre-wrap with Megatron optimizers.'
-                    )
+        for i in range(len(optimizers)):
+            opt = optimizers[i]
+            if isinstance(opt, (Float16OptimizerWithFloat16Params, FP32Optimizer)):
+                raise TypeError(
+                    'LayerWiseDistributedOptimizer expects base torch optimizers, '
+                    f'got {type(opt).__name__}. Do not pre-wrap with Megatron optimizers.'
+                )
+            init_state_fn = init_state_fn_list[i] if init_state_fn_list else None
+            if config.bf16:
                 optimizers[i] = Float16OptimizerWithFloat16Params(
-                    opt, config, None, init_state_fn_list[i] if init_state_fn_list else None
+                    opt, config, None, init_state_fn
+                )
+            else:
+                optimizers[i] = FP32Optimizer(
+                    opt, config, init_state_fn or (lambda opt, config=None: None)
                 )
 
         super().__init__(optimizers)

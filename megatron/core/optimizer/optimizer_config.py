@@ -392,7 +392,7 @@ class OptimizerConfig:
     """Accumulation dtype for output preconditioner buffers."""
 
     matrix_tp_update_mode: str = "allgather"
-    """TP apply mode: allgather, small_gram_polar, or block_local."""
+    """TP apply mode: allgather, small_gram_ns, or block_local."""
 
     matrix_bias_mode: str = "fallback"
     """Bias handling for matrix optimizers: fallback or augmented_feature_sum."""
@@ -583,9 +583,9 @@ class OptimizerConfig:
             raise ValueError("matrix_input_preconditioner_block_size must be >= 1")
         if self.matrix_output_preconditioner_block_size < 1:
             raise ValueError("matrix_output_preconditioner_block_size must be >= 1")
-        if self.matrix_tp_update_mode not in ("allgather", "small_gram_polar", "block_local"):
+        if self.matrix_tp_update_mode not in ("allgather", "small_gram_ns", "block_local"):
             raise ValueError(
-                "matrix_tp_update_mode must be one of: allgather, small_gram_polar, block_local"
+                "matrix_tp_update_mode must be one of: allgather, small_gram_ns, block_local"
             )
         if self.muon_fp32_matmul_prec not in ("highest", "high", "medium"):
             raise ValueError("muon_fp32_matmul_prec must be one of: highest, high, medium")

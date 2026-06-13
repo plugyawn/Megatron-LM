@@ -66,7 +66,7 @@ class TPUpdateMode(enum.Enum):
     """Tensor-parallel matrix-function apply mode."""
 
     TP_ALLGATHER_LOGICAL_MATRIX = "tp_allgather_logical_matrix"
-    TP_SMALL_GRAM_POLAR_ALLREDUCE = "tp_small_gram_polar_allreduce"
+    TP_SMALL_GRAM_NS_ALLREDUCE = "tp_small_gram_ns_allreduce"
     TP_BLOCK_LOCAL_APPROX = "tp_block_local_approx"
 
 

@@ -134,6 +134,31 @@ def _require_matrix_optimizer_param_checkpoint_identity(
     return param_identity
 
 
+def _raise_if_duplicate_matrix_optimizer_param_identity(
+    seen_param_identities: dict[str, str], param_identity: str, param_idx: str
+) -> None:
+    previous_param_idx = seen_param_identities.get(param_identity)
+    if previous_param_idx is not None:
+        raise RuntimeError(
+            "[MegatronFSDP] Matrix optimizer checkpoint parameter identity must be "
+            f"unique. Identity {param_identity!r} is used by optimizer state indices "
+            f"{previous_param_idx} and {param_idx}."
+        )
+    seen_param_identities[param_identity] = param_idx
+
+
+def _validate_unique_matrix_optimizer_checkpoint_identities(metadata: dict) -> None:
+    seen_param_identities = {}
+    for param_idx, param_metadata in metadata.items():
+        if not isinstance(param_metadata, dict):
+            continue
+        param_identity = param_metadata.get("param_identity")
+        if isinstance(param_identity, str) and param_identity:
+            _raise_if_duplicate_matrix_optimizer_param_identity(
+                seen_param_identities, param_identity, str(param_idx)
+            )
+
+
 def _matrix_shard_spec_to_checkpoint_dict(spec) -> dict:
     return {
         "logical_shape": list(spec.logical_shape),
@@ -545,6 +570,7 @@ def _matrix_optimizer_checkpoint_metadata(
 
     param_state_indices = _optimizer_param_state_indices(optimizer)
     metadata = {}
+    seen_param_identities = {}
     for param_group in optimizer.param_groups:
         for param in param_group["params"]:
             if not _is_matrix_optimizer_owned_param(param):
@@ -562,10 +588,14 @@ def _matrix_optimizer_checkpoint_metadata(
             if not state_names:
                 continue
             param_idx = str(param_state_indices[id(param)])
+            param_identity = _require_matrix_optimizer_param_checkpoint_identity(
+                param, mfsdp_model, param_idx
+            )
+            _raise_if_duplicate_matrix_optimizer_param_identity(
+                seen_param_identities, param_identity, param_idx
+            )
             metadata[param_idx] = {
-                "param_identity": _require_matrix_optimizer_param_checkpoint_identity(
-                    param, mfsdp_model, param_idx
-                ),
+                "param_identity": param_identity,
                 "owner": matrix_optimizer_info.owner,
                 "update_family": matrix_optimizer_info.update_family,
                 "matrix_shard_contract": _matrix_shard_global_contract_to_checkpoint_dict(
@@ -622,7 +652,9 @@ def _validate_matrix_optimizer_checkpoint_metadata(
             raise RuntimeError(
                 "[MegatronFSDP] Matrix optimizer checkpoint metadata is missing params."
             )
+        _validate_unique_matrix_optimizer_checkpoint_identities(metadata)
     param_state_indices = _optimizer_param_state_indices(optimizer)
+    seen_current_param_identities = {}
     for param_group in optimizer.param_groups:
         for param in param_group["params"]:
             if not _is_matrix_optimizer_owned_param(param):
@@ -673,6 +705,9 @@ def _validate_matrix_optimizer_checkpoint_metadata(
                 )
             current_param_identity = _require_matrix_optimizer_param_checkpoint_identity(
                 param, mfsdp_model, param_idx
+            )
+            _raise_if_duplicate_matrix_optimizer_param_identity(
+                seen_current_param_identities, current_param_identity, param_idx
             )
             checkpoint_param_identity = param_metadata.get("param_identity")
             if not isinstance(checkpoint_param_identity, str) or not checkpoint_param_identity:

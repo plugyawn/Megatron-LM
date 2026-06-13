@@ -17,6 +17,8 @@ from megatron.core.optimizer.layer_wise_optimizer import (
     LayerWiseDistributedOptimizer,
     _layerwise_metadata_process_group,
 )
+from megatron.core.optimizer.optimizer import FP32Optimizer
+from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.optimizer.param_layout import BufferKey, pad_param_start, pad_to_divisor
 
 # ---------------------------------------------------------------------------
@@ -41,6 +43,33 @@ def test_layerwise_metadata_process_group_uses_optimizer_dp_scope():
         is pg_collection.expt_dp
     )
     assert _layerwise_metadata_process_group(None, {}) is None
+
+
+def test_layerwise_fp32_wraps_base_torch_optimizers(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    param = _make_param((2, 2), dtype=torch.float32)
+    base_optimizer = torch.optim.SGD([param], lr=0.1)
+    config = OptimizerConfig(bf16=False, fp16=False, lr=0.1)
+    pg_collection = mock.Mock()
+    pg_collection.dp_cp = object()
+    pg_collection.expt_dp = object()
+    monkeypatch.setattr(
+        torch,
+        "tensor",
+        lambda *args, **kwargs: torch.as_tensor(
+            args[0],
+            dtype=kwargs.get("dtype", None),
+        ),
+    )
+    monkeypatch.setattr(
+        LayerWiseDistributedOptimizer,
+        "shard_params",
+        lambda self, optimizers, full_param_layouts=None: None,
+    )
+
+    optimizer = LayerWiseDistributedOptimizer([base_optimizer], config, pg_collection)
+
+    assert isinstance(optimizer.chained_optimizers[0], FP32Optimizer)
 
 
 def _make_param(shape, dtype=torch.bfloat16, **attrs):

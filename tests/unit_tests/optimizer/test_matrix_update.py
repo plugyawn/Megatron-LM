@@ -1224,7 +1224,7 @@ def test_matrix_update_rule_small_gram_muon_honors_ns_config(monkeypatch):
     grad = torch.arange(4, dtype=torch.float32).reshape(2, 2)
     config = OptimizerConfig(
         matrix_optimizer="muon",
-        matrix_tp_update_mode="small_gram_polar",
+        matrix_tp_update_mode="small_gram_ns",
         muon_num_ns_steps=7,
         muon_coefficient_type="polar_express",
         muon_scale_mode="unit_rms_norm",

@@ -65,7 +65,7 @@ logger = logging.getLogger(__name__)
 def _tp_mode_from_config(config: OptimizerConfig) -> TPUpdateMode:
     return {
         "allgather": TPUpdateMode.TP_ALLGATHER_LOGICAL_MATRIX,
-        "small_gram_polar": TPUpdateMode.TP_SMALL_GRAM_POLAR_ALLREDUCE,
+        "small_gram_ns": TPUpdateMode.TP_SMALL_GRAM_NS_ALLREDUCE,
         "block_local": TPUpdateMode.TP_BLOCK_LOCAL_APPROX,
     }[config.matrix_tp_update_mode]
 
@@ -172,7 +172,7 @@ def _make_matrix_update_rule(config: OptimizerConfig, pg_collection: ProcessGrou
                     tp_layout=tp_layout,
                     group=tp_group,
                 )
-            elif tp_update_mode == TPUpdateMode.TP_SMALL_GRAM_POLAR_ALLREDUCE:
+            elif tp_update_mode == TPUpdateMode.TP_SMALL_GRAM_NS_ALLREDUCE:
                 update = tp_small_gram_newton_schulz_allreduce(
                     preconditioned,
                     tp_layout=tp_layout,
