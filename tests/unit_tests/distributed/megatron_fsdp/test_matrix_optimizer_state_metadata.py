@@ -158,6 +158,7 @@ def _metadata_for_param(param, **overrides):
             matrix_shard_spec
         ),
         "same_shard_state_layout": fully_shard_module.MATRIX_OPTIMIZER_SAME_SHARD_STATE_LAYOUT,
+        "declared_same_shard_state_names": ["master_param", "momentum_buffer"],
         "same_shard_state_names": ["momentum_buffer"],
         "same_shard_state_shapes": {"momentum_buffer": list(param.shape)},
     }
@@ -704,6 +705,71 @@ def test_matrix_optimizer_checkpoint_rejects_missing_state_names(monkeypatch):
                 },
             },
         )
+
+
+def test_matrix_optimizer_checkpoint_rejects_malformed_declared_state_names(monkeypatch):
+    monkeypatch.setattr(fully_shard_module, "DTensor", _FakeDTensor)
+    param = _matrix_param()
+    optimizer = torch.optim.SGD([param], lr=0.1)
+    metadata = _metadata_for_param(param, declared_same_shard_state_names="momentum_buffer")
+
+    with pytest.raises(RuntimeError, match="declared_same_shard_state_names"):
+        fully_shard_module._validate_matrix_optimizer_checkpoint_metadata(
+            optimizer,
+            _fake_mfsdp_model(),
+            {
+                "state": {0: {"momentum_buffer": _fake_dtensor_state()}},
+                "param_groups": [],
+                fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_KEY: {
+                    "version": fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_VERSION,
+                    "params": {"0": metadata},
+                },
+            },
+        )
+
+
+def test_matrix_optimizer_checkpoint_rejects_declared_state_contract_mismatch(monkeypatch):
+    monkeypatch.setattr(fully_shard_module, "DTensor", _FakeDTensor)
+    param = _matrix_param()
+    optimizer = torch.optim.SGD([param], lr=0.1)
+    metadata = _metadata_for_param(
+        param, declared_same_shard_state_names=["momentum_buffer"]
+    )
+
+    with pytest.raises(RuntimeError, match="declared state contract"):
+        fully_shard_module._validate_matrix_optimizer_checkpoint_metadata(
+            optimizer,
+            _fake_mfsdp_model(),
+            {
+                "state": {0: {"momentum_buffer": _fake_dtensor_state()}},
+                "param_groups": [],
+                fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_KEY: {
+                    "version": fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_VERSION,
+                    "params": {"0": metadata},
+                },
+            },
+        )
+
+
+def test_matrix_optimizer_checkpoint_allows_legacy_missing_declared_state_names(monkeypatch):
+    monkeypatch.setattr(fully_shard_module, "DTensor", _FakeDTensor)
+    param = _matrix_param()
+    optimizer = torch.optim.SGD([param], lr=0.1)
+    metadata = _metadata_for_param(param)
+    metadata.pop("declared_same_shard_state_names")
+
+    fully_shard_module._validate_matrix_optimizer_checkpoint_metadata(
+        optimizer,
+        _fake_mfsdp_model(),
+        {
+            "state": {0: {"momentum_buffer": _fake_dtensor_state()}},
+            "param_groups": [],
+            fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_KEY: {
+                "version": fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_VERSION,
+                "params": {"0": metadata},
+            },
+        },
+    )
 
 
 def test_matrix_optimizer_checkpoint_rejects_state_shape_mismatch(monkeypatch):

@@ -662,6 +662,24 @@ def _validate_matrix_optimizer_checkpoint_metadata(
                     f"checkpoint={param_metadata.get('same_shard_state_layout')!r}, "
                     f"current={MATRIX_OPTIMIZER_SAME_SHARD_STATE_LAYOUT!r}."
                 )
+            declared_state_names = param_metadata.get("declared_same_shard_state_names")
+            if declared_state_names is not None:
+                if not isinstance(declared_state_names, list) or not all(
+                    isinstance(state_name, str) for state_name in declared_state_names
+                ):
+                    raise RuntimeError(
+                        "[MegatronFSDP] Matrix optimizer checkpoint metadata field "
+                        f"declared_same_shard_state_names for optimizer state index {param_idx} "
+                        "must be a list of strings."
+                    )
+                expected_declared_state_names = _matrix_declared_same_shard_state_names(param)
+                if sorted(declared_state_names) != expected_declared_state_names:
+                    raise RuntimeError(
+                        "[MegatronFSDP] Matrix optimizer checkpoint declared state contract "
+                        f"does not match current optimizer state contract for optimizer state "
+                        f"index {param_idx}: checkpoint={sorted(declared_state_names)}, "
+                        f"expected={expected_declared_state_names}."
+                    )
             metadata_state_names = param_metadata.get("same_shard_state_names")
             if not isinstance(metadata_state_names, list):
                 raise RuntimeError(
