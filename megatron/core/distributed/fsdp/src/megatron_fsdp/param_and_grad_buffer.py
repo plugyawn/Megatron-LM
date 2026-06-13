@@ -1537,6 +1537,32 @@ class DataParallelBuffer:
         # buffer's shard that intersects the specified item tensor.
         return self._get_item_local_shard_index(item_id)
 
+    def _get_matrix_fsdp_shard_plan_for_item(
+        self, item_id: int
+    ) -> Optional[MatrixFSDPShardPlan]:
+        if (
+            not HAVE_MCORE_MATRIX_UPDATE
+            or not self.is_data_distributed
+            or item_id >= len(self.params)
+        ):
+            return None
+        param = self.params[item_id]
+        if not _is_matrix_optimizer_owned_param(param):
+            return None
+        matrix_shard_spec = get_matrix_shard_spec(param)
+        if matrix_shard_spec is None:
+            raise RuntimeError(
+                "[Megatron-FSDP] Matrix optimizer-owned parameter is missing "
+                "MatrixShardSpec metadata while accessing its FSDP buffer item."
+            )
+        local_shape = to_local_if_dtensor(param).shape
+        return _build_matrix_fsdp_shard_plan(
+            local_shape,
+            dp_shard_axis=matrix_fsdp_shard_axis_for_spec(matrix_shard_spec),
+            dp_rank=self.dp_rank,
+            dp_world_size=self.dp_world_size,
+        )
+
     def set_item(self, item_id: int, item_data: torch.Tensor) -> None:
         """
         Update a Tensor item managed by the `DataParallelBuffer` instance,
@@ -1557,6 +1583,21 @@ class DataParallelBuffer:
         # the entire bucket.
         if is_float8tensor(item_data):
             item_data = fp8_get_raw_data(item_data, self.is_transpose_buffer)
+
+        matrix_shard_plan = self._get_matrix_fsdp_shard_plan_for_item(item_id)
+        if matrix_shard_plan is not None:
+            packed_item = _pack_matrix_fsdp_local_shard(item_data, matrix_shard_plan)
+            local_shard = self.get_shard_from_local_buffer()
+            if local_shard.numel() != packed_item.numel():
+                raise RuntimeError(
+                    "[Megatron-FSDP] Matrix optimizer-owned FSDP buffer shard size "
+                    "does not match the packed matrix-axis shard: "
+                    f"buffer_shard_numel={local_shard.numel()}, "
+                    f"packed_item_numel={packed_item.numel()}, "
+                    f"plan={matrix_shard_plan}."
+                )
+            local_shard.data.copy_(packed_item)
+            return
 
         if self.is_data_distributed:
             # Get the coordinates of the slice of the item that is contained in this shard.
@@ -1590,6 +1631,10 @@ class DataParallelBuffer:
         Returns:
             torch.Tensor: The retrieved tensor item.
         """
+        matrix_shard_plan = self._get_matrix_fsdp_shard_plan_for_item(item_id)
+        if matrix_shard_plan is not None:
+            return self.get_shard_from_local_buffer()
+
         if only_shard:
             # Get segment of the item saved in the shard associated with this rank.
             # Used in situations where the buffer is unsharded but another buffer
@@ -1610,6 +1655,17 @@ class DataParallelBuffer:
         """
         Get Tensor item data from the given bucket specified by the item ID.
         """
+        matrix_shard_plan = self._get_matrix_fsdp_shard_plan_for_item(item_id)
+        if matrix_shard_plan is not None:
+            item_index = self.item_index_map[item_id]
+            matrix = _unpack_matrix_fsdp_global_bucket(
+                bucket.data,
+                item_index.shape,
+                dp_shard_axis=matrix_shard_plan.dp_shard_axis,
+                dp_world_size=self.dp_world_size,
+            )
+            return matrix.reshape(-1)
+
         item_index = self.item_index_map[item_id]
         bucket_index = self.bucket_index
         start_index = item_index.global_data_index - bucket_index.global_data_index

@@ -11,6 +11,7 @@ fully_shard_module = importlib.import_module(
 )
 import megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer as param_buffer_module
 from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
+    Bucket,
     BucketingPolicy,
     DataParallelBuffer,
     _build_matrix_fsdp_shard_plan,
@@ -1051,6 +1052,127 @@ def test_matrix_fsdp_global_bucket_round_trips_column_axis():
         ),
         matrix,
     )
+
+
+def test_matrix_fsdp_buffer_set_get_row_axis_packed_item(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 1)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    param = torch.nn.Parameter(torch.zeros(5, 3))
+    buffer = DataParallelBuffer(
+        ddp_config=SimpleNamespace(data_parallel_sharding_strategy="optim"),
+        params=[param],
+        is_data_distributed=True,
+        bucket_id=0,
+        data_parallel_group=None,
+        chunk_size_factor=3,
+    )
+    buffer.init_data(torch.full((buffer.data_size,), -1.0))
+    set_matrix_optimizer_info(
+        param,
+        owner=MATRIX_OPTIMIZER_OWNER_MUON,
+        update_family="muon",
+        requires_layerwise_layout=True,
+    )
+    set_matrix_shard_spec(
+        param,
+        MatrixShardSpec(
+            logical_shape=(5, 3),
+            local_shape=(2, 3),
+            pre_dp_local_shape=(5, 3),
+            tp_layout="none",
+            dp_shard_axis=0,
+            dp_local_start=3,
+            dp_local_end=5,
+        ),
+    )
+    matrix = torch.arange(15, dtype=torch.float32).view(5, 3)
+
+    buffer.set_item(0, matrix)
+
+    expected = torch.tensor([9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 0.0, 0.0, 0.0])
+    assert torch.equal(buffer.get_item(0), expected)
+
+
+def test_matrix_fsdp_buffer_set_get_column_axis_packed_item(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 1)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    param = torch.nn.Parameter(torch.zeros(3, 5))
+    buffer = DataParallelBuffer(
+        ddp_config=SimpleNamespace(data_parallel_sharding_strategy="optim"),
+        params=[param],
+        is_data_distributed=True,
+        bucket_id=0,
+        data_parallel_group=None,
+        chunk_size_factor=3,
+    )
+    buffer.init_data(torch.full((buffer.data_size,), -1.0))
+    set_matrix_optimizer_info(
+        param,
+        owner=MATRIX_OPTIMIZER_OWNER_MUON,
+        update_family="muon",
+        requires_layerwise_layout=True,
+    )
+    set_matrix_shard_spec(
+        param,
+        MatrixShardSpec(
+            logical_shape=(3, 5),
+            local_shape=(3, 2),
+            pre_dp_local_shape=(3, 5),
+            tp_layout="none",
+            dp_shard_axis=1,
+            dp_local_start=3,
+            dp_local_end=5,
+        ),
+    )
+    matrix = torch.arange(15, dtype=torch.float32).view(3, 5)
+
+    buffer.set_item(0, matrix)
+
+    expected = torch.tensor([3.0, 4.0, 0.0, 8.0, 9.0, 0.0, 13.0, 14.0, 0.0])
+    assert torch.equal(buffer.get_item(0), expected)
+
+
+def test_matrix_fsdp_buffer_unpacks_global_bucket_to_row_major_item(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 1)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    param = torch.nn.Parameter(torch.zeros(3, 5))
+    buffer = DataParallelBuffer(
+        ddp_config=SimpleNamespace(data_parallel_sharding_strategy="optim"),
+        params=[param],
+        is_data_distributed=True,
+        bucket_id=0,
+        data_parallel_group=None,
+        chunk_size_factor=3,
+    )
+    buffer.init_data(torch.empty(buffer.data_size))
+    set_matrix_optimizer_info(
+        param,
+        owner=MATRIX_OPTIMIZER_OWNER_MUON,
+        update_family="muon",
+        requires_layerwise_layout=True,
+    )
+    set_matrix_shard_spec(
+        param,
+        MatrixShardSpec(
+            logical_shape=(3, 5),
+            local_shape=(3, 2),
+            pre_dp_local_shape=(3, 5),
+            tp_layout="none",
+            dp_shard_axis=1,
+            dp_local_start=3,
+            dp_local_end=5,
+        ),
+    )
+    matrix = torch.arange(15, dtype=torch.float32).view(3, 5)
+    bucket = Bucket(
+        data=_pack_matrix_fsdp_global_bucket(
+            matrix, dp_shard_axis=1, dp_world_size=2
+        )
+    )
+
+    item = buffer.get_item_from_bucket(bucket, 0)
+
+    assert torch.equal(item, matrix.reshape(-1))
 
 
 def test_matrix_optimizer_axis1_fsdp_rejected_at_grouping():
