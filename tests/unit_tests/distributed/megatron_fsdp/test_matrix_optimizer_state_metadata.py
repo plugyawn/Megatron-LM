@@ -1,10 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from types import SimpleNamespace
 import importlib
+import os
+from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
 
 fully_shard_module = importlib.import_module(
     "megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard"
@@ -25,10 +27,12 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer impo
 )
 from megatron.core.matrix_update import (
     MATRIX_OPTIMIZER_OWNER_MUON,
+    MatrixOptimizerStateSpec,
     MatrixShardSpec,
     get_matrix_optimizer_info,
     get_matrix_shard_spec,
     set_matrix_optimizer_info,
+    set_matrix_optimizer_state_spec,
     set_matrix_shard_spec,
 )
 
@@ -126,6 +130,63 @@ def _tag_muon_matrix_param(param):
         ),
     )
     return param
+
+
+class _TinyMatrixFsdpModule(torch.nn.Module):
+    def __init__(self, device):
+        super().__init__()
+        self.linear = torch.nn.Linear(3, 5, bias=True, device=device)
+        _tag_muon_matrix_param(self.linear.weight)
+        set_matrix_optimizer_state_spec(
+            self.linear.weight,
+            MatrixOptimizerStateSpec(("momentum_buffer", "master_param")),
+        )
+
+    def forward(self, x):
+        return self.linear(x)
+
+
+def _fake_distributed_optimizer_for_params(params, optimizer):
+    distopt = object.__new__(DistributedOptimizer)
+    distopt.ddp_config = SimpleNamespace(use_megatron_fsdp=True)
+    distopt.optimizer = optimizer
+    distopt.model_chunks = []
+    distopt.param_to_name = {
+        param: param.megatron_fsdp_param_name
+        for param in params
+        if hasattr(param, "megatron_fsdp_param_name")
+    }
+    return distopt
+
+
+def _real_fsdp_matrix_distopt_state(seed):
+    torch.manual_seed(seed)
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+    module = _TinyMatrixFsdpModule(device=torch.device("cuda", local_rank))
+    mfsdp_model = fully_shard_module.fully_shard_model(
+        module,
+        fsdp_unit_modules=[torch.nn.Linear],
+        zero_dp_strategy="optim_grads_params",
+        device=torch.device("cuda", local_rank),
+        sync_model_each_microbatch=True,
+    )
+    params = list(mfsdp_model.parameters())
+    optimizer = torch.optim.SGD(params, lr=0.1)
+    matrix_param = next(
+        param
+        for param in params
+        if get_matrix_optimizer_info(param) is not None
+        and get_matrix_optimizer_info(param).owner == MATRIX_OPTIMIZER_OWNER_MUON
+    )
+    momentum = matrix_param.detach().clone()
+    optimizer.state[matrix_param]["momentum_buffer"] = momentum
+    return (
+        _fake_distributed_optimizer_for_params(params, optimizer),
+        optimizer,
+        matrix_param,
+        momentum,
+    )
 
 
 def _tag_muon_matrix_param_with_axis1_fsdp(param):
@@ -557,6 +618,40 @@ def test_distributed_optimizer_fsdp_dtensor_load_preserves_matrix_state(monkeypa
     loaded_momentum = load_optimizer.state[load_param]["momentum_buffer"]
     assert tuple(loaded_momentum.shape) == tuple(saved_momentum.shape)
     torch.testing.assert_close(loaded_momentum, saved_momentum)
+
+
+def test_real_fsdp_dtensor_distributed_optimizer_load_preserves_matrix_state():
+    if not torch.cuda.is_available():
+        pytest.skip("real Megatron-FSDP DTensor smoke requires CUDA")
+    if int(os.environ.get("WORLD_SIZE", "1")) < 2:
+        pytest.skip("run with torchrun --nproc-per-node=2 to exercise real FSDP sharding")
+
+    initialized_here = False
+    if not dist.is_initialized():
+        dist.init_process_group("nccl")
+        initialized_here = True
+    try:
+        save_distopt, _, _, saved_momentum = _real_fsdp_matrix_distopt_state(seed=1234)
+        state_dict = save_distopt.sharded_param_state_fsdp_dtensor()
+        metadata_key = fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_KEY
+        assert metadata_key in state_dict
+        assert state_dict[metadata_key]["params"]["0"]["same_shard_state_names"] == [
+            "momentum_buffer"
+        ]
+
+        load_distopt, load_optimizer, load_matrix_param, _ = _real_fsdp_matrix_distopt_state(
+            seed=5678
+        )
+        load_distopt.load_state_dict(state_dict)
+
+        loaded_momentum = load_optimizer.state[load_matrix_param]["momentum_buffer"]
+        assert type(loaded_momentum) is type(saved_momentum)
+        assert loaded_momentum.placements == saved_momentum.placements
+        torch.testing.assert_close(loaded_momentum.to_local(), saved_momentum.to_local())
+        dist.barrier()
+    finally:
+        if initialized_here:
+            dist.destroy_process_group()
 
 
 def test_distributed_optimizer_fsdp_dtensor_load_validates_matrix_metadata(monkeypatch):
