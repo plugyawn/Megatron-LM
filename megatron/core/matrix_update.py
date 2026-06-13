@@ -1308,27 +1308,32 @@ def _cast_grad_output(grad_output: torch.Tensor, recipe: MatrixOutputPreconditio
     return grad_output.to(recipe.accumulation_dtype)
 
 
-def _accumulate_diag_feature_gram(gram: torch.Tensor, x: torch.Tensor) -> None:
-    if gram.is_cuda and x.is_cuda:
-        try:
-            from emerging_optimizers.triton_kernels.diag_gram import diag_gram_reduce
+def _try_accumulate_cuda_diag_gram(gram: torch.Tensor, value: torch.Tensor) -> bool:
+    if not (gram.is_cuda and value.is_cuda):
+        return False
+    try:
+        from emerging_optimizers.triton_kernels.diag_gram import diag_gram_reduce
+    except ModuleNotFoundError as exc:
+        missing_name = getattr(exc, "name", "")
+        if missing_name and not missing_name.startswith("emerging_optimizers"):
+            raise
+        return False
+    except ImportError:
+        return False
 
-            diag_gram_reduce(x, out=gram, accumulate=True)
-            return
-        except Exception:
-            pass
+    diag_gram_reduce(value, out=gram, accumulate=True)
+    return True
+
+
+def _accumulate_diag_feature_gram(gram: torch.Tensor, x: torch.Tensor) -> None:
+    if _try_accumulate_cuda_diag_gram(gram, x):
+        return
     gram.add_(torch.sum(x * x, dim=0))
 
 
 def _accumulate_diag_grad_gram(gram: torch.Tensor, dy: torch.Tensor) -> None:
-    if gram.is_cuda and dy.is_cuda:
-        try:
-            from emerging_optimizers.triton_kernels.diag_gram import diag_gram_reduce
-
-            diag_gram_reduce(dy, out=gram, accumulate=True)
-            return
-        except Exception:
-            pass
+    if _try_accumulate_cuda_diag_gram(gram, dy):
+        return
     gram.add_(torch.sum(dy * dy, dim=0))
 
 

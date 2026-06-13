@@ -208,6 +208,40 @@ def test_diag_gram_cuda_routes_use_generic_reducer(monkeypatch):
     assert calls == [(x, gram, True), (dy, gram, True)]
 
 
+def test_diag_gram_cuda_kernel_failure_fails_closed(monkeypatch):
+    import sys
+    import types
+
+    import megatron.core.matrix_update as matrix_update_module
+
+    def fake_diag_gram_reduce(x, *, out, accumulate):
+        raise RuntimeError("diag kernel failed")
+
+    emerging_pkg = types.ModuleType("emerging_optimizers")
+    emerging_pkg.__path__ = []
+    kernels_pkg = types.ModuleType("emerging_optimizers.triton_kernels")
+    kernels_pkg.__path__ = []
+    diag_gram_module = types.ModuleType("emerging_optimizers.triton_kernels.diag_gram")
+    diag_gram_module.diag_gram_reduce = fake_diag_gram_reduce
+    monkeypatch.setitem(sys.modules, "emerging_optimizers", emerging_pkg)
+    monkeypatch.setitem(sys.modules, "emerging_optimizers.triton_kernels", kernels_pkg)
+    monkeypatch.setitem(
+        sys.modules, "emerging_optimizers.triton_kernels.diag_gram", diag_gram_module
+    )
+
+    class FakeCudaTensor:
+        is_cuda = True
+
+        def __mul__(self, other):
+            raise AssertionError("fallback path should not run after kernel failure")
+
+    with pytest.raises(RuntimeError, match="diag kernel failed"):
+        matrix_update_module._accumulate_diag_feature_gram(FakeCudaTensor(), FakeCudaTensor())
+
+    with pytest.raises(RuntimeError, match="diag kernel failed"):
+        matrix_update_module._accumulate_diag_grad_gram(FakeCudaTensor(), FakeCudaTensor())
+
+
 def test_block_diag_grad_gram_accumulates_padded_blocks():
     param = _param_with_info()
     recipe = _output_recipe(approximation=MatrixPreconditionerApproximation.BLOCK_DIAG)
