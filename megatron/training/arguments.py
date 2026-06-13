@@ -1638,6 +1638,10 @@ def validate_args(args, defaults={}):
 
     # emerging optimizer check
     args.use_layer_wise_distributed_optimizer = False
+    if args.matrix_optimizer != 'none' and args.use_distributed_optimizer:
+        args.use_layer_wise_distributed_optimizer = True
+        args.use_distributed_optimizer = False
+
     if args.optimizer not in ('sgd', 'adam'):
         if args.optimizer == 'dist_muon':
             warn_rank_0(
@@ -1760,11 +1764,23 @@ def validate_args(args, defaults={}):
     if args.matrix_optimizer != 'none':
         if 'muon' in args.optimizer:
             raise ValueError("--matrix-optimizer cannot be combined with --optimizer muon/dist_muon.")
+        if args.use_torch_fsdp2 or args.use_megatron_fsdp:
+            raise ValueError(
+                "matrix-optimizer does not support FSDP yet. It requires matrix-axis-aware "
+                "FSDP sharding for matrix-owned params, momentum/master params, and "
+                "checkpoint state."
+            )
         if args.use_distributed_optimizer:
             raise ValueError(
                 "Matrix optimizers do not support standard DistributedOptimizer until logical "
                 "matrix gather/apply/scatter views exist."
             )
+    if args.optimizer == 'adaptive_muon' and (args.use_torch_fsdp2 or args.use_megatron_fsdp):
+        raise ValueError(
+            "optimizer=adaptive_muon does not support FSDP yet. Adaptive Muon has matrix "
+            "sidecar optimizer state that needs an explicit sharding/checkpoint contract."
+        )
+    if args.matrix_optimizer != 'none':
         if args.matrix_input_preconditioner not in ('none', 'feature_gram'):
             raise ValueError("matrix-input-preconditioner must be one of: none, feature_gram")
         if args.matrix_input_preconditioner_approximation not in ('diag', 'block_diag', 'full'):

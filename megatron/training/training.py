@@ -1519,6 +1519,9 @@ def wrap_model_chunks_with_ddp(
     *,
     use_layer_wise_distributed_optimizer=False,
     use_layer_wise_param_layout=True,
+    optimizer_type=None,
+    matrix_optimizer_type="none",
+    matrix_min_dim=1,
     DP=DDP,
     pg_collection=None,
     bucket_sizes=None,
@@ -1555,6 +1558,12 @@ def wrap_model_chunks_with_ddp(
         use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
             controls whether to compute and supply a shard-aligned param layout
             to DDP. ``False`` keeps LayerWise on its legacy sync path.
+        optimizer_type: Optimizer name used to resolve explicit matrix ownership
+            metadata before DDP buffer grouping.
+        matrix_optimizer_type: Matrix optimizer name used to resolve explicit
+            matrix-function ownership metadata before DDP buffer grouping.
+        matrix_min_dim: Minimum logical matrix dimension for matrix optimizer
+            ownership.
         DP: The DDP class to construct (``DistributedDataParallel`` or an FSDP
             variant).
         pg_collection: Optional :class:`ProcessGroupCollection`. Forwarded to
@@ -1583,7 +1592,13 @@ def wrap_model_chunks_with_ddp(
             # (Muon's Newton-Schulz domain) to a shard-aligned buffer and routes
             # everything else (embeddings, biases, layernorm) to a separate
             # DistOpt-style buffer.
-            tag_params_for_buffer_routing(model_chunks)
+            tag_params_for_buffer_routing(
+                model_chunks,
+                optimizer_type=optimizer_type,
+                matrix_optimizer_type=matrix_optimizer_type,
+                matrix_min_dim=matrix_min_dim,
+                requires_layerwise_layout=True,
+            )
         elif not use_layer_wise_distributed_optimizer and ddp_config.use_distributed_optimizer:
             compute_layout = DistributedOptimizer.compute_full_param_layout
         else:
@@ -1813,6 +1828,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 use_layer_wise_param_layout=getattr(
                     args, 'use_layer_wise_param_layout', True
                 ),
+                optimizer_type=args.optimizer,
+                matrix_optimizer_type=getattr(args, 'matrix_optimizer', 'none'),
+                matrix_min_dim=getattr(args, 'matrix_min_dim', 1),
                 DP=DP,
                 pg_collection=pg_collection if args.use_megatron_fsdp else None,
                 bucket_sizes=per_chunk_bucket_sizes,

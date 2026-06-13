@@ -10,6 +10,7 @@ optionally left-preconditions it with ``C_out = dY.T @ dY``.
 
 from __future__ import annotations
 
+import copy
 import logging
 from typing import Dict, List, Optional
 
@@ -24,9 +25,10 @@ from megatron.core.matrix_update import (
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import get_pg_size, log_single_rank
+from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
 
-from . import _get_param_groups, get_megatron_optimizer
+from . import _get_megatron_optimizer_based_on_param_groups, _get_param_groups, get_megatron_optimizer
+from .layer_wise_optimizer import LayerWiseDistributedOptimizer
 from .matrix_function_optimizer import MatrixFunctionOptimizer
 from .optimizer import ChainedOptimizer, Float16OptimizerWithFloat16Params, FP32Optimizer, MegatronOptimizer
 from .optimizer_config import OptimizerConfig, ParamKey
@@ -39,10 +41,16 @@ try:
     )
     from emerging_optimizers.matrix_update_rules import (
         apply_diag_newton_muon_update_,
+        apply_diag_left_preconditioned_update_,
         apply_diag_right_preconditioned_update_,
         factorize_feature_gram,
         newton_schulz_orthogonalize,
         right_precondition_with_factorized_feature_gram,
+    )
+    from emerging_optimizers.triton_kernels.feature_gram import (
+        apply_matrix_update_kernel_,
+        diag_left_precondition_matrix,
+        diag_right_precondition_matrix,
     )
     from emerging_optimizers.utils import fp32_matmul_precision
 
@@ -189,9 +197,13 @@ def _make_matrix_inplace_update_rule(
 
     if config.matrix_optimizer not in ("sgd", "muon"):
         return None
-    if config.matrix_input_preconditioner != "feature_gram":
+    input_requested = config.matrix_input_preconditioner == "feature_gram"
+    output_requested = config.matrix_output_preconditioner == "grad_gram"
+    if not input_requested and not output_requested:
         return None
-    if config.matrix_output_preconditioner != "none":
+    if config.matrix_input_preconditioner not in ("none", "feature_gram"):
+        return None
+    if config.matrix_output_preconditioner not in ("none", "grad_gram"):
         return None
     tp_update_mode = _tp_mode_from_config(config)
 
@@ -215,22 +227,58 @@ def _make_matrix_inplace_update_rule(
         weight_decay: float,
         decoupled_weight_decay: bool,
     ) -> bool:
-        if feature_gram is None or feature_gram.ndim != 1:
+        if input_requested and (feature_gram is None or feature_gram.ndim != 1):
             return False
-        if grad_gram is not None:
+        if output_requested and (grad_gram is None or grad_gram.ndim != 1):
             return False
         if config.matrix_optimizer == "sgd":
-            apply_diag_right_preconditioned_update_(
-                param,
-                grad,
-                feature_gram,
-                lr=lr,
-                ridge=config.matrix_input_preconditioner_ridge,
-                update_scale=1.0,
-                weight_decay=weight_decay,
-                decoupled_weight_decay=decoupled_weight_decay,
-            )
+            if input_requested and output_requested:
+                direction = diag_left_precondition_matrix(
+                    grad,
+                    grad_gram,
+                    param=param,
+                    ridge=config.matrix_output_preconditioner_ridge,
+                    weight_decay=weight_decay,
+                    decoupled_weight_decay=decoupled_weight_decay,
+                )
+                direction = diag_right_precondition_matrix(
+                    direction,
+                    feature_gram,
+                    ridge=config.matrix_input_preconditioner_ridge,
+                )
+                apply_matrix_update_kernel_(
+                    param,
+                    direction,
+                    lr=lr,
+                    update_scale=1.0,
+                    weight_decay=weight_decay,
+                    decoupled_weight_decay=decoupled_weight_decay,
+                )
+            elif output_requested:
+                apply_diag_left_preconditioned_update_(
+                    param,
+                    grad,
+                    grad_gram,
+                    lr=lr,
+                    ridge=config.matrix_output_preconditioner_ridge,
+                    update_scale=1.0,
+                    weight_decay=weight_decay,
+                    decoupled_weight_decay=decoupled_weight_decay,
+                )
+            else:
+                apply_diag_right_preconditioned_update_(
+                    param,
+                    grad,
+                    feature_gram,
+                    lr=lr,
+                    ridge=config.matrix_input_preconditioner_ridge,
+                    update_scale=1.0,
+                    weight_decay=weight_decay,
+                    decoupled_weight_decay=decoupled_weight_decay,
+                )
             return True
+        if output_requested:
+            return False
         if not can_use_local_newton_muon(model_param):
             return False
         apply_diag_newton_muon_update_(
@@ -320,6 +368,13 @@ def get_megatron_matrix_optimizer(
         for param in fallback_params:
             param.requires_grad = True
 
+    use_layer_wise = config.use_layer_wise_distributed_optimizer
+    ddp_uses_distributed_optimizer = (
+        bool(getattr(model_chunks[0], 'ddp_config', None))
+        and model_chunks[0].ddp_config.use_distributed_optimizer
+    )
+    use_separate_distributed_optimizer = use_layer_wise and ddp_uses_distributed_optimizer
+
     matrix_optimizer = MatrixFunctionOptimizer(
         matrix_param_groups,
         lr=config.lr,
@@ -334,7 +389,17 @@ def get_megatron_matrix_optimizer(
     def matrix_init_state_fn(opt, config=None):
         return None
 
-    if config.bf16:
+    if use_layer_wise:
+        matrix_optimizer = LayerWiseDistributedOptimizer(
+            [matrix_optimizer],
+            config,
+            pg_collection,
+            init_state_fn_list=[matrix_init_state_fn],
+            model_chunks=model_chunks,
+        )
+        for chained_optimizer in matrix_optimizer.chained_optimizers:
+            _copy_matrix_model_refs_to_main_params(chained_optimizer)
+    elif config.bf16:
         matrix_optimizer = Float16OptimizerWithFloat16Params(
             matrix_optimizer, config, None, matrix_init_state_fn
         )
@@ -347,12 +412,51 @@ def get_megatron_matrix_optimizer(
         for param in matrix_params:
             param.requires_grad = False
         config.matrix_optimizer = "none"
-        fallback_optimizer = get_megatron_optimizer(
-            config,
-            model_chunks,
-            config_overrides=config_overrides,
-            use_gloo_process_groups=use_gloo_process_groups,
-        )
+        if use_separate_distributed_optimizer:
+            fallback_config = copy.copy(config)
+            fallback_config.use_distributed_optimizer = True
+            fallback_config.use_layer_wise_distributed_optimizer = False
+            fallback_param_groups = _get_param_groups(
+                model_chunks, fallback_config, config_overrides
+            )
+            distopt_process_groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
+                pg_collection, model_chunks, use_gloo_process_groups=False
+            )
+            distopt_per_model_buffers = {}
+            for model_chunk_idx, model_chunk in enumerate(model_chunks):
+                if not hasattr(model_chunk, 'buffers'):
+                    continue
+                non_layer_wise_buffers = [
+                    buffer
+                    for buffer in model_chunk.buffers
+                    if buffer.params
+                    and not getattr(buffer.params[0], 'is_managed_by_layer_wise_optimizer', False)
+                ]
+                if non_layer_wise_buffers:
+                    distopt_per_model_buffers[model_chunk_idx] = non_layer_wise_buffers
+            fallback_optimizer = _get_megatron_optimizer_based_on_param_groups(
+                config=fallback_config,
+                model_chunks=model_chunks,
+                param_groups=fallback_param_groups,
+                per_model_buffers=distopt_per_model_buffers,
+                model_parallel_group=distopt_process_groups['mp_group'],
+                data_parallel_group=distopt_process_groups['intra_dp_cp_group'],
+                data_parallel_group_gloo=distopt_process_groups['intra_dp_cp_group_gloo'],
+                data_parallel_group_idx=get_pg_rank(distopt_process_groups['mp_group']),
+                intra_dist_opt_group=distopt_process_groups['intra_dist_opt_group'],
+                distributed_optimizer_instance_id=0,
+                pg_collection=pg_collection,
+                skip_megatron_wrapping=False,
+            )
+            if hasattr(fallback_optimizer, 'config'):
+                fallback_optimizer.config = config
+        else:
+            fallback_optimizer = get_megatron_optimizer(
+                config,
+                model_chunks,
+                config_overrides=config_overrides,
+                use_gloo_process_groups=use_gloo_process_groups,
+            )
     finally:
         config.matrix_optimizer = previous_matrix_optimizer
         for param in matrix_params:

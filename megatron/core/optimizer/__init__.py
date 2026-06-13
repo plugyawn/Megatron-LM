@@ -841,7 +841,15 @@ def _get_megatron_emerging_optimizer(
 
     log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
 
-    # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv).
+    from megatron.core.matrix_update import (
+        MATRIX_OPTIMIZER_OWNER_FALLBACK,
+        MATRIX_OPTIMIZER_OWNER_MUON,
+        set_matrix_optimizer_info,
+    )
+
+    # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv) and
+    # explicit matrix optimizer ownership metadata. The latter is intentionally
+    # separate from parameterization_role, which remains model/scaling semantics.
     for model_chunk in model_chunks:
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
@@ -851,6 +859,21 @@ def _get_megatron_emerging_optimizer(
             # TODO(deyuf): support MLA
             if 'linear_qkv.weight' in name and len(param.shape) == 2:
                 param.is_qkv = True
+            if eopt_name in ('muon', 'adaptive_muon'):
+                is_muon_matrix = (
+                    len(param.shape) == 2
+                    and not getattr(param, 'is_embedding_or_output_parameter', False)
+                )
+                set_matrix_optimizer_info(
+                    param,
+                    owner=(
+                        MATRIX_OPTIMIZER_OWNER_MUON
+                        if is_muon_matrix
+                        else MATRIX_OPTIMIZER_OWNER_FALLBACK
+                    ),
+                    update_family='muon' if is_muon_matrix else 'none',
+                    requires_layerwise_layout=use_layer_wise and is_muon_matrix,
+                )
 
     # Apply optimizer-specific param overrides (e.g. muon: non-linear -> scalar optimizer).
     entry = _EMERGING_OPTIMIZERS[eopt_name]

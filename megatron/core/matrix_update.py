@@ -70,6 +70,48 @@ class TPUpdateMode(enum.Enum):
     TP_BLOCK_LOCAL_APPROX = "tp_block_local_approx"
 
 
+MATRIX_OPTIMIZER_INFO_ATTR = "_mcore_matrix_optimizer_info"
+MATRIX_SHARD_SPEC_ATTR = "_mcore_matrix_shard_spec"
+
+MATRIX_OPTIMIZER_OWNER_NONE = "none"
+MATRIX_OPTIMIZER_OWNER_MUON = "muon"
+MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION = "matrix_function"
+MATRIX_OPTIMIZER_OWNER_FALLBACK = "fallback"
+
+_MATRIX_OPTIMIZER_OWNERS = {
+    MATRIX_OPTIMIZER_OWNER_NONE,
+    MATRIX_OPTIMIZER_OWNER_MUON,
+    MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
+    MATRIX_OPTIMIZER_OWNER_FALLBACK,
+}
+_MATRIX_UPDATE_FAMILY_BY_OPTIMIZER_NAME = {
+    "none": "none",
+    "sgd": "sgd",
+    "muon": "muon",
+}
+
+
+def matrix_update_family_from_optimizer_name(
+    optimizer_name: Optional[str],
+) -> Literal["none", "sgd", "muon"]:
+    """Map public optimizer names to stable matrix-update contract families.
+
+    This deliberately rejects optimizer variants such as ``adaptive_muon`` or
+    legacy/product names such as ``newton_muon``. Those names may select a
+    concrete implementation elsewhere, but they should not leak into metadata
+    consumed by distributed layout and checkpoint code.
+    """
+
+    if optimizer_name is None:
+        optimizer_name = "none"
+    if optimizer_name not in _MATRIX_UPDATE_FAMILY_BY_OPTIMIZER_NAME:
+        raise ValueError(
+            f"{optimizer_name!r} is not a stable matrix update_family. Expected one of: "
+            f"{', '.join(_MATRIX_UPDATE_FAMILY_BY_OPTIMIZER_NAME)}."
+        )
+    return _MATRIX_UPDATE_FAMILY_BY_OPTIMIZER_NAME[optimizer_name]
+
+
 @dataclass(frozen=True)
 class LinearWeightInfo:
     """Static metadata for a local shard of an affine weight."""
@@ -85,6 +127,109 @@ class LinearWeightInfo:
     is_embedding: bool = False
     is_lm_head: bool = False
     role: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class MatrixOptimizerInfo:
+    """Internal optimizer ownership metadata for matrix-shaped parameters.
+
+    This deliberately does not replace ``parameterization_role``. The
+    parameterization role describes model/scaling semantics, while this record
+    describes optimizer ownership and buffer-layout routing.
+    """
+
+    owner: Literal["none", "muon", "matrix_function", "fallback"]
+    update_family: Literal["none", "sgd", "muon"]
+    requires_layerwise_layout: bool = False
+
+
+@dataclass(frozen=True)
+class MatrixShardSpec:
+    """Internal logical matrix layout contract for distributed matrix optimizers.
+
+    ``tp_shard_axis`` describes the current tensor-parallel local matrix shard,
+    when the local shape proves that an axis is actually sharded. Future FSDP
+    support should extend the DP fields rather than inferring matrix layout from
+    flat parameter-storage offsets.
+    """
+
+    logical_shape: tuple[int, int]
+    local_shape: tuple[int, int]
+    tp_layout: Literal["none", "duplicated", "column_parallel", "row_parallel", "grouped_expert"]
+    tp_shard_axis: Optional[int] = None
+    dp_shard_axis: Optional[int] = None
+    dp_local_start: Optional[int] = None
+    dp_local_end: Optional[int] = None
+    pre_dp_local_shape: Optional[tuple[int, int]] = None
+
+    def __post_init__(self) -> None:
+        if len(self.logical_shape) != 2 or len(self.local_shape) != 2:
+            raise ValueError(
+                "MatrixShardSpec requires 2D logical_shape and local_shape, got "
+                f"logical_shape={self.logical_shape}, local_shape={self.local_shape}."
+            )
+        if self.pre_dp_local_shape is not None:
+            if len(self.pre_dp_local_shape) != 2:
+                raise ValueError(
+                    "MatrixShardSpec pre_dp_local_shape must be 2D, got "
+                    f"{self.pre_dp_local_shape}."
+                )
+            if self.dp_shard_axis != 0:
+                raise ValueError(
+                    "MatrixShardSpec pre_dp_local_shape is only valid for row-axis DP shards."
+                )
+            if self.local_shape[0] > self.pre_dp_local_shape[0]:
+                raise ValueError(
+                    "MatrixShardSpec local_shape cannot have more rows than "
+                    f"pre_dp_local_shape: local_shape={self.local_shape}, "
+                    f"pre_dp_local_shape={self.pre_dp_local_shape}."
+                )
+            if self.local_shape[1:] != self.pre_dp_local_shape[1:]:
+                raise ValueError(
+                    "MatrixShardSpec local_shape trailing dimensions must match "
+                    f"pre_dp_local_shape: local_shape={self.local_shape}, "
+                    f"pre_dp_local_shape={self.pre_dp_local_shape}."
+                )
+        if (self.dp_local_start is None) != (self.dp_local_end is None):
+            raise ValueError("MatrixShardSpec dp_local_start and dp_local_end must be set together.")
+        if self.dp_local_start is not None:
+            if self.dp_shard_axis != 0:
+                raise ValueError(
+                    "MatrixShardSpec DP local row ranges are only valid for row-axis DP shards."
+                )
+            if self.dp_local_start < 0 or self.dp_local_end < self.dp_local_start:
+                raise ValueError(
+                    "MatrixShardSpec has an invalid DP local row range: "
+                    f"start={self.dp_local_start}, end={self.dp_local_end}."
+                )
+            if (
+                self.pre_dp_local_shape is not None
+                and self.dp_local_end > self.pre_dp_local_shape[0]
+            ):
+                raise ValueError(
+                    "MatrixShardSpec DP local row range exceeds the pre-DP local shape: "
+                    f"end={self.dp_local_end}, pre_dp_local_shape={self.pre_dp_local_shape}."
+                )
+            expected_rows = self.dp_local_end - self.dp_local_start
+            if self.local_shape[0] != expected_rows:
+                raise ValueError(
+                    "MatrixShardSpec local_shape row count must match the DP local row range: "
+                    f"local_shape={self.local_shape}, start={self.dp_local_start}, "
+                    f"end={self.dp_local_end}."
+                )
+
+    @property
+    def small_gram_side(self) -> Literal["right", "left"]:
+        """Derived small-Gram side for this matrix shard contract."""
+
+        return matrix_small_gram_side_for_spec(self)
+
+
+MatrixSmallGramSide = Literal["right", "left"]
+# Backwards-compatible name for older local tests/helpers. "Side" is the stable
+# contract term: it records whether the small Gram is applied on the right
+# (M.T @ M) or left (M @ M.T).
+MatrixSmallGramOrientation = MatrixSmallGramSide
 
 
 @dataclass
@@ -146,9 +291,212 @@ def _enum_from_string(enum_type, value):
     return enum_type(value)
 
 
+def _tp_shard_axis_from_linear_weight_info(info: LinearWeightInfo) -> Optional[int]:
+    if (
+        info.tp_layout == "column_parallel"
+        and len(info.local_shape) == 2
+        and len(info.logical_shape) == 2
+        and info.local_shape[0] != info.logical_shape[0]
+    ):
+        return 0
+    if (
+        info.tp_layout == "row_parallel"
+        and len(info.local_shape) == 2
+        and len(info.logical_shape) == 2
+        and info.local_shape[1] != info.logical_shape[1]
+    ):
+        return 1
+    return None
+
+
+def matrix_shard_spec_from_linear_weight_info(info: LinearWeightInfo) -> MatrixShardSpec:
+    return MatrixShardSpec(
+        logical_shape=info.logical_shape,
+        local_shape=info.local_shape,
+        tp_layout=info.tp_layout,
+        tp_shard_axis=_tp_shard_axis_from_linear_weight_info(info),
+    )
+
+
+def set_matrix_shard_spec(param: torch.nn.Parameter, spec: MatrixShardSpec) -> None:
+    setattr(param, MATRIX_SHARD_SPEC_ATTR, spec)
+
+
+def get_matrix_shard_spec(param: torch.nn.Parameter) -> Optional[MatrixShardSpec]:
+    return getattr(param, MATRIX_SHARD_SPEC_ATTR, None)
+
+
+def matrix_fsdp_shard_axis_for_spec(spec: MatrixShardSpec) -> int:
+    """Return the DP/FSDP matrix axis required by the small-Gram Muon contract.
+
+    The DP/FSDP shard should align with the existing matrix shard axis when TP
+    already shards the matrix. Sharding the opposite axis would create 2D
+    patches, which are not a valid input to the simple row/column small-Gram
+    distributed Muon rule. If TP does not shard the matrix, choose the axis that
+    keeps the small Gram on the smaller matrix dimension: row-axis shards for
+    tall matrices and column-axis shards for wide matrices.
+    """
+
+    if spec.tp_shard_axis is None:
+        rows, cols = spec.logical_shape
+        return 0 if rows >= cols else 1
+    return spec.tp_shard_axis
+
+
+def matrix_small_gram_side_for_spec(
+    spec: MatrixShardSpec,
+) -> MatrixSmallGramSide:
+    """Return the exact small-Gram side implied by a matrix shard spec.
+
+    Row-axis shards use the small right Gram ``M.T @ M`` and locally apply
+    ``M @ G^{-1/2}``; column-axis shards use the small left Gram ``M @ M.T``
+    and locally apply ``G^{-1/2} @ M``. If TP and DP both shard the matrix,
+    they must agree on the same axis, otherwise the local tensor is a 2D patch
+    rather than a valid small-Gram Muon shard.
+    """
+
+    shard_axes = {axis for axis in (spec.tp_shard_axis, spec.dp_shard_axis) if axis is not None}
+    if len(shard_axes) > 1:
+        raise ValueError(
+            "MatrixShardSpec has conflicting TP/DP shard axes; small-Gram Muon "
+            f"requires a single matrix shard axis, got {sorted(shard_axes)}."
+        )
+    if shard_axes:
+        axis = next(iter(shard_axes))
+        if axis == 0:
+            return "right"
+        if axis == 1:
+            return "left"
+        raise ValueError(f"MatrixShardSpec shard axis must be 0 or 1, got {axis}.")
+
+    rows, cols = spec.logical_shape
+    return "right" if rows >= cols else "left"
+
+
+def matrix_small_gram_orientation_for_spec(
+    spec: MatrixShardSpec,
+) -> MatrixSmallGramSide:
+    """Compatibility alias for ``matrix_small_gram_side_for_spec``."""
+
+    return matrix_small_gram_side_for_spec(spec)
+
+
+def matrix_shard_spec_with_dp_axis(
+    spec: MatrixShardSpec,
+    *,
+    dp_shard_axis: int,
+    dp_local_start: Optional[int] = None,
+    dp_local_end: Optional[int] = None,
+) -> MatrixShardSpec:
+    if dp_shard_axis not in (0, 1):
+        raise ValueError("dp_shard_axis must be 0 or 1 for matrix parameters")
+    if spec.tp_shard_axis is not None and dp_shard_axis != spec.tp_shard_axis:
+        raise ValueError(
+            "MatrixShardSpec cannot add a DP shard axis that differs from the TP "
+            f"shard axis: tp_shard_axis={spec.tp_shard_axis}, dp_shard_axis={dp_shard_axis}."
+        )
+    local_shape = spec.local_shape
+    if dp_local_start is not None or dp_local_end is not None:
+        if dp_local_start is None or dp_local_end is None:
+            raise ValueError("dp_local_start and dp_local_end must be provided together.")
+        if dp_local_start < 0 or dp_local_end < dp_local_start:
+            raise ValueError(
+                f"Invalid DP local row range: start={dp_local_start}, end={dp_local_end}."
+            )
+        if dp_shard_axis != 0:
+            raise ValueError(
+                "DP local range metadata is only supported for row-axis matrix shards."
+            )
+        pre_dp_local_shape = spec.pre_dp_local_shape or spec.local_shape
+        if dp_local_end > pre_dp_local_shape[0]:
+            raise ValueError(
+                "DP local row range exceeds the pre-DP local matrix shape: "
+                f"end={dp_local_end}, pre_dp_local_shape={pre_dp_local_shape}."
+            )
+        local_shape = (dp_local_end - dp_local_start, *pre_dp_local_shape[1:])
+    else:
+        pre_dp_local_shape = spec.pre_dp_local_shape
+    return MatrixShardSpec(
+        logical_shape=spec.logical_shape,
+        local_shape=local_shape,
+        tp_layout=spec.tp_layout,
+        tp_shard_axis=spec.tp_shard_axis,
+        dp_shard_axis=dp_shard_axis,
+        dp_local_start=dp_local_start,
+        dp_local_end=dp_local_end,
+        pre_dp_local_shape=pre_dp_local_shape,
+    )
+
+
+def set_matrix_optimizer_info(
+    param: torch.nn.Parameter,
+    *,
+    owner: Literal["none", "muon", "matrix_function", "fallback"],
+    update_family: Literal["none", "sgd", "muon"],
+    requires_layerwise_layout: bool = False,
+) -> None:
+    if owner not in _MATRIX_OPTIMIZER_OWNERS:
+        raise ValueError(
+            f"{owner!r} is not a stable matrix optimizer owner. Expected one of: "
+            f"{', '.join(sorted(_MATRIX_OPTIMIZER_OWNERS))}."
+        )
+    if update_family not in _MATRIX_UPDATE_FAMILY_BY_OPTIMIZER_NAME.values():
+        raise ValueError(
+            f"{update_family!r} is not a stable matrix update_family. Expected one of: "
+            f"{', '.join(_MATRIX_UPDATE_FAMILY_BY_OPTIMIZER_NAME)}."
+        )
+    if owner in (MATRIX_OPTIMIZER_OWNER_NONE, MATRIX_OPTIMIZER_OWNER_FALLBACK):
+        if update_family != "none":
+            raise ValueError(
+                f"matrix optimizer owner {owner!r} requires update_family='none', "
+                f"got {update_family!r}."
+            )
+    elif owner == MATRIX_OPTIMIZER_OWNER_MUON:
+        if update_family != "muon":
+            raise ValueError(
+                "matrix optimizer owner 'muon' requires update_family='muon', "
+                f"got {update_family!r}."
+            )
+    elif owner == MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION:
+        if update_family == "none":
+            raise ValueError(
+                "matrix optimizer owner 'matrix_function' requires an active "
+                "update_family, got 'none'."
+            )
+    setattr(
+        param,
+        MATRIX_OPTIMIZER_INFO_ATTR,
+        MatrixOptimizerInfo(
+            owner=owner,
+            update_family=update_family,
+            requires_layerwise_layout=requires_layerwise_layout,
+        ),
+    )
+
+
+def get_matrix_optimizer_info(param: torch.nn.Parameter) -> Optional[MatrixOptimizerInfo]:
+    return getattr(param, MATRIX_OPTIMIZER_INFO_ATTR, None)
+
+
+def get_matrix_optimizer_owner(param: torch.nn.Parameter) -> str:
+    info = get_matrix_optimizer_info(param)
+    if info is None:
+        return MATRIX_OPTIMIZER_OWNER_NONE
+    return info.owner
+
+
+def is_matrix_optimizer_owned_parameter(param: torch.nn.Parameter) -> bool:
+    return get_matrix_optimizer_owner(param) in (
+        MATRIX_OPTIMIZER_OWNER_MUON,
+        MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
+    )
+
+
 def input_preconditioner_scope_for(
     approximation: MatrixPreconditionerApproximation,
     tp_layout: str,
+    *,
+    is_feature_axis_sharded: bool = False,
 ) -> MatrixPreconditionerScope:
     """Infer the factor scope implied by approximation and TP layout.
 
@@ -157,7 +505,7 @@ def input_preconditioner_scope_for(
     than a global exact or generic diagonal approximation.
     """
 
-    if tp_layout == "row_parallel":
+    if tp_layout == "row_parallel" and is_feature_axis_sharded:
         return MatrixPreconditionerScope.TP_LOCAL_BLOCK_DIAG
     if approximation == MatrixPreconditionerApproximation.BLOCK_DIAG:
         return MatrixPreconditionerScope.BLOCK_DIAG_APPROX
@@ -169,6 +517,8 @@ def input_preconditioner_scope_for(
 def output_preconditioner_scope_for(
     approximation: MatrixPreconditionerApproximation,
     tp_layout: str,
+    *,
+    is_output_axis_sharded: bool = False,
 ) -> MatrixPreconditionerScope:
     """Infer output-side factor scope implied by approximation and TP layout.
 
@@ -178,7 +528,7 @@ def output_preconditioner_scope_for(
     output-side factor for each input shard.
     """
 
-    if tp_layout == "column_parallel":
+    if tp_layout == "column_parallel" and is_output_axis_sharded:
         return MatrixPreconditionerScope.TP_LOCAL_BLOCK_DIAG
     if approximation == MatrixPreconditionerApproximation.BLOCK_DIAG:
         return MatrixPreconditionerScope.BLOCK_DIAG_APPROX
@@ -204,23 +554,25 @@ def set_linear_weight_info(
 
     if param is None:
         return
+    info = LinearWeightInfo(
+        param=param,
+        logical_shape=logical_shape,
+        local_shape=tuple(param.shape),
+        tp_layout=tp_layout,
+        sequence_parallel=sequence_parallel,
+        expert_parallel=expert_parallel,
+        has_bias=has_bias,
+        is_affine_weight=True,
+        is_embedding=is_embedding,
+        is_lm_head=is_lm_head,
+        role=role,
+    )
     setattr(
         param,
         "_mcore_linear_weight_info",
-        LinearWeightInfo(
-            param=param,
-            logical_shape=logical_shape,
-            local_shape=tuple(param.shape),
-            tp_layout=tp_layout,
-            sequence_parallel=sequence_parallel,
-            expert_parallel=expert_parallel,
-            has_bias=has_bias,
-            is_affine_weight=True,
-            is_embedding=is_embedding,
-            is_lm_head=is_lm_head,
-            role=role,
-        ),
+        info,
     )
+    set_matrix_shard_spec(param, matrix_shard_spec_from_linear_weight_info(info))
     setattr(param, "_feature_gram_collector", collector)
 
 
@@ -269,6 +621,24 @@ def _output_dim(param: torch.nn.Parameter) -> int:
     return info.local_shape[0]
 
 
+def _is_row_parallel_feature_axis_sharded(info: LinearWeightInfo) -> bool:
+    return (
+        info.tp_layout == "row_parallel"
+        and len(info.local_shape) == 2
+        and len(info.logical_shape) == 2
+        and info.local_shape[1] != info.logical_shape[1]
+    )
+
+
+def _is_column_parallel_output_axis_sharded(info: LinearWeightInfo) -> bool:
+    return (
+        info.tp_layout == "column_parallel"
+        and len(info.local_shape) == 2
+        and len(info.logical_shape) == 2
+        and info.local_shape[0] != info.logical_shape[0]
+    )
+
+
 def _feature_gram_shape(param: torch.nn.Parameter, recipe: MatrixInputPreconditionerRecipe) -> tuple[int, ...]:
     dim = _feature_dim(param)
     if recipe.approximation == MatrixPreconditionerApproximation.FULL:
@@ -304,10 +674,22 @@ def _validate_feature_gram_recipe(param: torch.nn.Parameter, recipe: MatrixInput
         raise ValueError("matrix-input-preconditioner-refresh-interval must be >= 1")
     if recipe.block_size < 1:
         raise ValueError("matrix-input-preconditioner-block-size must be >= 1")
+    if recipe.ridge < 0.0:
+        raise ValueError("matrix-input-preconditioner-ridge must be >= 0")
     if recipe.token_sample_size is not None and recipe.token_sample_size < 1:
         raise ValueError("matrix-input-preconditioner-token-sample-size must be >= 1 when set")
+    feature_dim = _feature_dim(param)
+    if (
+        recipe.approximation == MatrixPreconditionerApproximation.BLOCK_DIAG
+        and feature_dim % recipe.block_size != 0
+        and recipe.ridge == 0.0
+    ):
+        raise ValueError(
+            "block_diag FEATURE_GRAM with a non-divisible feature dimension requires "
+            "matrix-input-preconditioner-ridge > 0; otherwise padded coordinates make the "
+            "last block singular."
+        )
     if recipe.min_samples_per_feature is not None and recipe.token_sample_size is not None:
-        feature_dim = _feature_dim(param)
         min_samples = recipe.min_samples_per_feature * feature_dim
         if (
             recipe.approximation == MatrixPreconditionerApproximation.FULL
@@ -324,10 +706,22 @@ def _validate_grad_gram_recipe(param: torch.nn.Parameter, recipe: MatrixOutputPr
         raise ValueError("matrix-output-preconditioner-refresh-interval must be >= 1")
     if recipe.block_size < 1:
         raise ValueError("matrix-output-preconditioner-block-size must be >= 1")
+    if recipe.ridge < 0.0:
+        raise ValueError("matrix-output-preconditioner-ridge must be >= 0")
     if recipe.token_sample_size is not None and recipe.token_sample_size < 1:
         raise ValueError("matrix-output-preconditioner-token-sample-size must be >= 1 when set")
+    output_dim = _output_dim(param)
+    if (
+        recipe.approximation == MatrixPreconditionerApproximation.BLOCK_DIAG
+        and output_dim % recipe.block_size != 0
+        and recipe.ridge == 0.0
+    ):
+        raise ValueError(
+            "block_diag GRAD_GRAM with a non-divisible output dimension requires "
+            "matrix-output-preconditioner-ridge > 0; otherwise padded coordinates make the "
+            "last block singular."
+        )
     if recipe.min_samples_per_feature is not None and recipe.token_sample_size is not None:
-        output_dim = _output_dim(param)
         min_samples = recipe.min_samples_per_feature * output_dim
         if (
             recipe.approximation == MatrixPreconditionerApproximation.FULL
@@ -395,15 +789,18 @@ def finalize_feature_gram_buffers(
     """
 
     groups = tuple(process_groups)
-    params = list(params)
+    params = [
+        param
+        for param in params
+        if hasattr(param, "main_grad_feature_gram")
+        and not getattr(param, "_feature_gram_finalized", False)
+    ]
     if any(getattr(param, "_feature_gram_finalization_required", False) for param in params) and not groups:
         raise RuntimeError(
             "FEATURE_GRAM finalization requires explicit process_groups for these parameters."
         )
 
     for param in params:
-        if not hasattr(param, "main_grad_feature_gram"):
-            continue
         for group in groups:
             torch.distributed.all_reduce(
                 param.main_grad_feature_gram, op=torch.distributed.ReduceOp.SUM, group=group
@@ -426,15 +823,18 @@ def finalize_grad_gram_buffers(
     """Reduce output-side GRAD_GRAM buffers across caller-specified groups."""
 
     groups = tuple(process_groups)
-    params = list(params)
+    params = [
+        param
+        for param in params
+        if hasattr(param, "main_grad_grad_gram")
+        and not getattr(param, "_grad_gram_finalized", False)
+    ]
     if any(getattr(param, "_grad_gram_finalization_required", False) for param in params) and not groups:
         raise RuntimeError(
             "GRAD_GRAM finalization requires explicit process_groups for these parameters."
         )
 
     for param in params:
-        if not hasattr(param, "main_grad_grad_gram"):
-            continue
         for group in groups:
             torch.distributed.all_reduce(
                 param.main_grad_grad_gram, op=torch.distributed.ReduceOp.SUM, group=group
@@ -575,7 +975,11 @@ def recipe_from_optimizer_config(config, info: LinearWeightInfo) -> MatrixInputP
     """Build a feature Gram recipe from an ``OptimizerConfig``-like object."""
 
     approximation = _enum_from_string(MatrixPreconditionerApproximation, config.matrix_input_preconditioner_approximation)
-    scope = input_preconditioner_scope_for(approximation, info.tp_layout)
+    scope = input_preconditioner_scope_for(
+        approximation,
+        info.tp_layout,
+        is_feature_axis_sharded=_is_row_parallel_feature_axis_sharded(info),
+    )
     normalization = _enum_from_string(
         MatrixPreconditionerNormalization, config.matrix_input_preconditioner_normalization
     )
@@ -599,7 +1003,11 @@ def output_recipe_from_optimizer_config(config, info: LinearWeightInfo) -> Matri
     """Build a grad Gram recipe from an ``OptimizerConfig``-like object."""
 
     approximation = _enum_from_string(MatrixPreconditionerApproximation, config.matrix_output_preconditioner_approximation)
-    scope = output_preconditioner_scope_for(approximation, info.tp_layout)
+    scope = output_preconditioner_scope_for(
+        approximation,
+        info.tp_layout,
+        is_output_axis_sharded=_is_column_parallel_output_axis_sharded(info),
+    )
     normalization = _enum_from_string(
         MatrixPreconditionerNormalization, config.matrix_output_preconditioner_normalization
     )
@@ -657,6 +1065,12 @@ def configure_model_matrix_updates(modules: Iterable[torch.nn.Module], config) -
         input_recipe = None
         output_recipe = None
         factors = ExtraWgradFactor.NONE
+        set_matrix_optimizer_info(
+            param,
+            owner=MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
+            update_family=matrix_update_family_from_optimizer_name(config.matrix_optimizer),
+            requires_layerwise_layout=True,
+        )
         if config.matrix_input_preconditioner == "feature_gram":
             collector = getattr(param, "_feature_gram_collector", "unknown")
             if collector == "transformer_engine":
@@ -673,7 +1087,7 @@ def configure_model_matrix_updates(modules: Iterable[torch.nn.Module], config) -
                 )
             recipe = recipe_from_optimizer_config(config, info)
             if (
-                info.tp_layout == "row_parallel"
+                _is_row_parallel_feature_axis_sharded(info)
                 and recipe.approximation == MatrixPreconditionerApproximation.FULL
             ):
                 raise RuntimeError(
@@ -698,7 +1112,7 @@ def configure_model_matrix_updates(modules: Iterable[torch.nn.Module], config) -
                 )
             recipe = output_recipe_from_optimizer_config(config, info)
             if (
-                info.tp_layout == "column_parallel"
+                _is_column_parallel_output_axis_sharded(info)
                 and recipe.approximation == MatrixPreconditionerApproximation.FULL
             ):
                 raise RuntimeError(

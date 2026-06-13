@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, get_args
 import torch
 from torch.optim.optimizer import ParamsT
 
+from megatron.core.matrix_update import MATRIX_OPTIMIZER_OWNER_MUON
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_pg_size, log_single_rank
 
@@ -140,6 +141,9 @@ def _create_emerging_optimizer(config, param_groups, eopt_name, model_chunks, pg
 
 def _is_nonlinear_or_embedding(param):
     """True for parameters that should NOT use the emerging optimizer."""
+    matrix_optimizer_info = getattr(param, '_mcore_matrix_optimizer_info', None)
+    if matrix_optimizer_info is not None:
+        return getattr(matrix_optimizer_info, 'owner', None) != MATRIX_OPTIMIZER_OWNER_MUON
     return getattr(param, 'is_embedding_or_output_parameter', False) or len(param.shape) != 2
 
 

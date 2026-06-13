@@ -10,6 +10,15 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedStateDict
 from megatron.core.distributed.param_and_grad_buffer import group_params_for_buffers
+from megatron.core.matrix_update import (
+    MATRIX_OPTIMIZER_OWNER_FALLBACK,
+    MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
+    MATRIX_OPTIMIZER_OWNER_MUON,
+    get_matrix_optimizer_info,
+    is_matrix_update_eligible,
+    matrix_update_family_from_optimizer_name,
+    set_matrix_optimizer_info,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
 
@@ -43,6 +52,12 @@ def is_managed_by_layer_wise_optimizer(param: torch.nn.Parameter) -> bool:
     Mirrors the routing rule applied by ``_get_param_groups`` /
     ``default_param_overrides`` for Muon.
     """
+    matrix_optimizer_info = getattr(param, '_mcore_matrix_optimizer_info', None)
+    if matrix_optimizer_info is not None:
+        return (
+            getattr(matrix_optimizer_info, 'owner', None) in ('muon', 'matrix_function')
+            and getattr(matrix_optimizer_info, 'requires_layerwise_layout', False)
+        )
     if not param.dim() == 2:
         return False
     if getattr(param, 'is_embedding_or_output_parameter', False):
@@ -68,7 +83,67 @@ def _bucket_is_managed_by_layer_wise_optimizer(bucket, default_for_untagged: boo
     return param.is_managed_by_layer_wise_optimizer
 
 
-def tag_params_for_buffer_routing(model_chunks) -> None:
+def _resolve_layerwise_matrix_optimizer_info(
+    param: torch.nn.Parameter,
+    *,
+    optimizer_type: Optional[str],
+    matrix_optimizer_type: Optional[str],
+    matrix_min_dim: int,
+    requires_layerwise_layout: bool,
+) -> None:
+    """Attach explicit matrix-optimizer ownership before DDP buffer grouping.
+
+    This is intentionally additive to ``parameterization_role``. The latter
+    remains model/scaling semantics; this metadata is optimizer/buffer routing
+    state that must exist before :class:`BufferKey` grouping.
+    """
+
+    if get_matrix_optimizer_info(param) is not None:
+        return
+    matrix_optimizer_type = matrix_optimizer_type or "none"
+    if matrix_optimizer_type != "none":
+        is_matrix_param = is_matrix_update_eligible(param, min_matrix_dim=matrix_min_dim)
+        update_family = (
+            matrix_update_family_from_optimizer_name(matrix_optimizer_type)
+            if is_matrix_param
+            else "none"
+        )
+        set_matrix_optimizer_info(
+            param,
+            owner=(
+                MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION
+                if is_matrix_param
+                else MATRIX_OPTIMIZER_OWNER_FALLBACK
+            ),
+            update_family=update_family,
+            requires_layerwise_layout=requires_layerwise_layout and is_matrix_param,
+        )
+        return
+    optimizer_type_lower = optimizer_type.lower() if optimizer_type else ""
+    if "muon" not in optimizer_type_lower:
+        return
+    is_muon_matrix = param.dim() == 2 and not getattr(
+        param, 'is_embedding_or_output_parameter', False
+    )
+    update_family = "none"
+    if is_muon_matrix:
+        update_family = "muon"
+    set_matrix_optimizer_info(
+        param,
+        owner=MATRIX_OPTIMIZER_OWNER_MUON if is_muon_matrix else MATRIX_OPTIMIZER_OWNER_FALLBACK,
+        update_family=update_family,
+        requires_layerwise_layout=requires_layerwise_layout and is_muon_matrix,
+    )
+
+
+def tag_params_for_buffer_routing(
+    model_chunks,
+    *,
+    optimizer_type: Optional[str] = None,
+    matrix_optimizer_type: Optional[str] = None,
+    matrix_min_dim: int = 1,
+    requires_layerwise_layout: bool = True,
+) -> None:
     """Tag every requires-grad param with ``is_managed_by_layer_wise_optimizer``.
 
     Run this once on the un-DDP-wrapped model chunks before
@@ -81,6 +156,13 @@ def tag_params_for_buffer_routing(model_chunks) -> None:
         for param in model_chunk.parameters():
             if not param.requires_grad:
                 continue
+            _resolve_layerwise_matrix_optimizer_info(
+                param,
+                optimizer_type=optimizer_type,
+                matrix_optimizer_type=matrix_optimizer_type,
+                matrix_min_dim=matrix_min_dim,
+                requires_layerwise_layout=requires_layerwise_layout,
+            )
             param.is_managed_by_layer_wise_optimizer = is_managed_by_layer_wise_optimizer(param)
 
 

@@ -36,8 +36,637 @@ except ImportError:
     # Megatron-LM is not installed, use Megatron-FSDP as a standalone module.
     from .distributed_data_parallel_config import DistributedDataParallelConfig
 
+try:
+    from megatron.core.matrix_update import (
+        MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
+        MATRIX_OPTIMIZER_OWNER_MUON,
+        get_matrix_optimizer_info,
+        get_matrix_shard_spec,
+        matrix_small_gram_side_for_spec,
+        set_matrix_shard_spec,
+    )
+
+    HAVE_MCORE_MATRIX_UPDATE = True
+except ImportError:
+    HAVE_MCORE_MATRIX_UPDATE = False
+
 
 logger = logging.getLogger(__name__)
+
+MATRIX_OPTIMIZER_STATE_METADATA_KEY = "_mcore_matrix_optimizer_state"
+MATRIX_OPTIMIZER_STATE_METADATA_VERSION = 6
+MATRIX_OPTIMIZER_SAME_SHARD_STATE_LAYOUT = "same_as_param"
+MATRIX_OPTIMIZER_DP_SHARD_LAYOUT_ROW_CONTIGUOUS = "row_contiguous_flat_buffer"
+
+
+def _is_matrix_optimizer_owned_param(param: torch.Tensor) -> bool:
+    if not HAVE_MCORE_MATRIX_UPDATE:
+        return False
+    matrix_optimizer_info = get_matrix_optimizer_info(param)
+    return matrix_optimizer_info is not None and getattr(matrix_optimizer_info, "owner", None) in (
+        MATRIX_OPTIMIZER_OWNER_MUON,
+        MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
+    )
+
+
+def _matrix_shard_spec_to_checkpoint_dict(spec) -> dict:
+    return {
+        "logical_shape": list(spec.logical_shape),
+        "local_shape": list(spec.local_shape),
+        "pre_dp_local_shape": (
+            list(spec.pre_dp_local_shape) if spec.pre_dp_local_shape is not None else None
+        ),
+        "tp_layout": spec.tp_layout,
+        "tp_shard_axis": spec.tp_shard_axis,
+        "dp_shard_axis": spec.dp_shard_axis,
+        "dp_shard_layout": _matrix_dp_shard_layout_to_checkpoint_value(spec),
+        "dp_local_start": spec.dp_local_start,
+        "dp_local_end": spec.dp_local_end,
+        "small_gram_side": matrix_small_gram_side_for_spec(spec),
+    }
+
+
+def _matrix_shard_global_contract_to_checkpoint_dict(spec) -> dict:
+    """Return MatrixShardSpec fields that must match across checkpoint resume.
+
+    ``dp_local_start`` and ``dp_local_end`` are rank-local residency metadata.
+    They are useful to save for debugging, but they are not stable under DP
+    resharding and should not be used as the global checkpoint compatibility
+    contract. ``local_shape`` is also saved in the full spec, but after FSDP
+    row slicing it describes this rank's current matrix rows and is therefore
+    not a global resume key.
+    """
+
+    return {
+        "logical_shape": list(spec.logical_shape),
+        "tp_layout": spec.tp_layout,
+        "tp_shard_axis": spec.tp_shard_axis,
+        "dp_shard_axis": spec.dp_shard_axis,
+        "dp_shard_layout": _matrix_dp_shard_layout_to_checkpoint_value(spec),
+        "small_gram_side": matrix_small_gram_side_for_spec(spec),
+    }
+
+
+def _matrix_shard_global_contract_from_checkpoint_dict(metadata: dict) -> dict:
+    return {
+        "logical_shape": metadata.get("logical_shape"),
+        "tp_layout": metadata.get("tp_layout"),
+        "tp_shard_axis": metadata.get("tp_shard_axis"),
+        "dp_shard_axis": metadata.get("dp_shard_axis"),
+        "dp_shard_layout": metadata.get("dp_shard_layout"),
+        "small_gram_side": metadata.get("small_gram_side"),
+    }
+
+
+def _matrix_shard_spec_matches_checkpoint_dict(spec, metadata: dict) -> bool:
+    return _matrix_shard_global_contract_to_checkpoint_dict(
+        spec
+    ) == _matrix_shard_global_contract_from_checkpoint_dict(metadata)
+
+
+def _validate_matrix_shape_checkpoint_field(
+    metadata: dict, field_name: str, param_idx: str
+) -> None:
+    shape = metadata.get(field_name)
+    if not isinstance(shape, list) or not all(isinstance(dim, int) for dim in shape):
+        raise RuntimeError(
+            "[MegatronFSDP] Matrix optimizer checkpoint metadata field "
+            f"{field_name!r} for optimizer state index {param_idx} must be a list of integers."
+        )
+
+
+def _validate_optional_matrix_shape_checkpoint_field(
+    metadata: dict, field_name: str, param_idx: str
+) -> None:
+    shape = metadata.get(field_name)
+    if shape is None:
+        return
+    if not isinstance(shape, list) or not all(isinstance(dim, int) for dim in shape):
+        raise RuntimeError(
+            "[MegatronFSDP] Matrix optimizer checkpoint metadata field "
+            f"{field_name!r} for optimizer state index {param_idx} must be None or "
+            "a list of integers."
+        )
+
+
+def _validate_matrix_shard_spec_checkpoint_metadata(
+    metadata: object, param_idx: str, field_name: str
+) -> None:
+    if not isinstance(metadata, dict):
+        raise RuntimeError(
+            "[MegatronFSDP] Matrix optimizer checkpoint metadata field "
+            f"{field_name!r} for optimizer state index {param_idx} must be a dict."
+        )
+    _validate_matrix_shape_checkpoint_field(metadata, "logical_shape", param_idx)
+    _validate_matrix_shape_checkpoint_field(metadata, "local_shape", param_idx)
+    _validate_optional_matrix_shape_checkpoint_field(
+        metadata, "pre_dp_local_shape", param_idx
+    )
+    logical_shape = metadata.get("logical_shape")
+    local_shape = metadata.get("local_shape")
+    pre_dp_local_shape = metadata.get("pre_dp_local_shape")
+    if len(logical_shape) != 2 or len(local_shape) != 2:
+        raise RuntimeError(
+            "[MegatronFSDP] Matrix optimizer checkpoint metadata shapes must be 2D "
+            f"for optimizer state index {param_idx}: logical_shape={logical_shape}, "
+            f"local_shape={local_shape}."
+        )
+    if pre_dp_local_shape is not None:
+        if len(pre_dp_local_shape) != 2:
+            raise RuntimeError(
+                "[MegatronFSDP] Matrix optimizer checkpoint metadata pre_dp_local_shape "
+                f"must be 2D for optimizer state index {param_idx}: "
+                f"pre_dp_local_shape={pre_dp_local_shape}."
+            )
+        if local_shape[0] > pre_dp_local_shape[0] or local_shape[1:] != pre_dp_local_shape[1:]:
+            raise RuntimeError(
+                "[MegatronFSDP] Matrix optimizer checkpoint metadata local_shape is "
+                f"inconsistent with pre_dp_local_shape for optimizer state index {param_idx}: "
+                f"local_shape={local_shape}, pre_dp_local_shape={pre_dp_local_shape}."
+            )
+    dp_shard_axis = metadata.get("dp_shard_axis")
+    dp_shard_layout = metadata.get("dp_shard_layout")
+    if dp_shard_axis is None:
+        if dp_shard_layout is not None:
+            raise RuntimeError(
+                "[MegatronFSDP] Matrix optimizer checkpoint metadata has a DP shard "
+                f"layout without a DP shard axis for optimizer state index {param_idx}."
+            )
+    elif dp_shard_axis == 0:
+        if dp_shard_layout != MATRIX_OPTIMIZER_DP_SHARD_LAYOUT_ROW_CONTIGUOUS:
+            raise RuntimeError(
+                "[MegatronFSDP] Matrix optimizer checkpoint metadata has unsupported "
+                f"DP shard layout {dp_shard_layout!r} for optimizer state index {param_idx}."
+            )
+    else:
+        raise RuntimeError(
+            "[MegatronFSDP] Matrix optimizer checkpoint metadata has unsupported DP "
+            f"shard axis {dp_shard_axis!r} for optimizer state index {param_idx}."
+        )
+    dp_local_start = metadata.get("dp_local_start")
+    dp_local_end = metadata.get("dp_local_end")
+    if (dp_local_start is None) != (dp_local_end is None):
+        raise RuntimeError(
+            "[MegatronFSDP] Matrix optimizer checkpoint metadata dp_local_start and "
+            f"dp_local_end must be set together for optimizer state index {param_idx}."
+        )
+    if dp_local_start is not None:
+        if not isinstance(dp_local_start, int) or not isinstance(dp_local_end, int):
+            raise RuntimeError(
+                "[MegatronFSDP] Matrix optimizer checkpoint metadata DP local row "
+                f"range must use integer offsets for optimizer state index {param_idx}."
+            )
+        if dp_shard_axis != 0 or dp_local_start < 0 or dp_local_end < dp_local_start:
+            raise RuntimeError(
+                "[MegatronFSDP] Matrix optimizer checkpoint metadata has an invalid "
+                f"DP local row range for optimizer state index {param_idx}: "
+                f"axis={dp_shard_axis}, start={dp_local_start}, end={dp_local_end}."
+            )
+        if local_shape[0] != dp_local_end - dp_local_start:
+            raise RuntimeError(
+                "[MegatronFSDP] Matrix optimizer checkpoint metadata local_shape row "
+                f"count does not match DP local row range for optimizer state index "
+                f"{param_idx}: local_shape={local_shape}, start={dp_local_start}, "
+                f"end={dp_local_end}."
+            )
+        if pre_dp_local_shape is not None and dp_local_end > pre_dp_local_shape[0]:
+            raise RuntimeError(
+                "[MegatronFSDP] Matrix optimizer checkpoint metadata DP local row "
+                f"range exceeds pre_dp_local_shape for optimizer state index {param_idx}: "
+                f"end={dp_local_end}, pre_dp_local_shape={pre_dp_local_shape}."
+            )
+
+
+def _validate_matrix_shard_contract_checkpoint_metadata(
+    metadata: object, param_idx: str
+) -> None:
+    if not isinstance(metadata, dict):
+        raise RuntimeError(
+            "[MegatronFSDP] Matrix optimizer checkpoint metadata field "
+            f"'matrix_shard_contract' for optimizer state index {param_idx} must be a dict."
+        )
+    _validate_matrix_shape_checkpoint_field(metadata, "logical_shape", param_idx)
+    logical_shape = metadata.get("logical_shape")
+    if len(logical_shape) != 2:
+        raise RuntimeError(
+            "[MegatronFSDP] Matrix optimizer checkpoint metadata logical_shape must "
+            f"be 2D for optimizer state index {param_idx}: logical_shape={logical_shape}."
+        )
+    for axis_name in ("tp_shard_axis", "dp_shard_axis"):
+        axis = metadata.get(axis_name)
+        if axis is not None and axis not in (0, 1):
+            raise RuntimeError(
+                "[MegatronFSDP] Matrix optimizer checkpoint metadata field "
+                f"{axis_name!r} for optimizer state index {param_idx} must be None, 0, or 1."
+            )
+    tp_shard_axis = metadata.get("tp_shard_axis")
+    dp_shard_axis = metadata.get("dp_shard_axis")
+    if tp_shard_axis is not None and dp_shard_axis is not None and tp_shard_axis != dp_shard_axis:
+        raise RuntimeError(
+            "[MegatronFSDP] Matrix optimizer checkpoint metadata has conflicting TP/DP "
+            f"matrix shard axes for optimizer state index {param_idx}: "
+            f"tp_shard_axis={tp_shard_axis}, dp_shard_axis={dp_shard_axis}."
+        )
+    dp_shard_layout = metadata.get("dp_shard_layout")
+    if dp_shard_axis is None:
+        if dp_shard_layout is not None:
+            raise RuntimeError(
+                "[MegatronFSDP] Matrix optimizer checkpoint metadata has a DP shard "
+                f"layout without a DP shard axis for optimizer state index {param_idx}."
+            )
+    elif dp_shard_axis == 0:
+        if dp_shard_layout != MATRIX_OPTIMIZER_DP_SHARD_LAYOUT_ROW_CONTIGUOUS:
+            raise RuntimeError(
+                "[MegatronFSDP] Matrix optimizer checkpoint metadata has unsupported "
+                f"DP shard layout {dp_shard_layout!r} for optimizer state index {param_idx}."
+            )
+    else:
+        raise RuntimeError(
+            "[MegatronFSDP] Matrix optimizer checkpoint metadata has unsupported DP "
+            f"shard axis {dp_shard_axis!r} for optimizer state index {param_idx}."
+        )
+    if metadata.get("small_gram_side") not in ("right", "left"):
+        raise RuntimeError(
+            "[MegatronFSDP] Matrix optimizer checkpoint metadata field "
+            f"'small_gram_side' for optimizer state index {param_idx} must be 'right' or 'left'."
+        )
+
+
+def _matrix_dp_shard_layout_to_checkpoint_value(spec) -> Optional[str]:
+    if spec.dp_shard_axis is None:
+        return None
+    if spec.dp_shard_axis == 0:
+        return MATRIX_OPTIMIZER_DP_SHARD_LAYOUT_ROW_CONTIGUOUS
+    raise RuntimeError(
+        "[MegatronFSDP] Matrix optimizer checkpoint metadata cannot represent "
+        f"unsupported DP matrix shard axis {spec.dp_shard_axis}."
+    )
+
+
+def _optimizer_param_state_indices(optimizer: torch.optim.Optimizer) -> dict:
+    """Return the param-id to state-index map used by Optimizer.state_dict()."""
+
+    param_state_idx = {}
+    idx = 0
+    for param_group in optimizer.param_groups:
+        for param in param_group["params"]:
+            if id(param) not in param_state_idx:
+                param_state_idx[id(param)] = idx
+                idx += 1
+    return param_state_idx
+
+
+def _matrix_state_tensor_matches_param_shape(state_value: torch.Tensor, param: DTensor) -> bool:
+    state_shape = tuple(state_value.shape)
+    param_global_shape = tuple(param.shape)
+    param_local_shape = (
+        tuple(param._local_tensor.shape) if hasattr(param, "_local_tensor") else None
+    )
+    return state_shape == param_global_shape or state_shape == param_local_shape
+
+
+def _is_same_shard_matrix_state_tensor(state_value: object, param: DTensor) -> bool:
+    return (
+        isinstance(state_value, torch.Tensor)
+        and state_value.numel() > 1
+        and isinstance(param, DTensor)
+        and _matrix_state_tensor_matches_param_shape(state_value, param)
+    )
+
+
+def _raise_if_uncontracted_matrix_state_sidecar(
+    state_name: str, state_value: object, param: DTensor
+) -> None:
+    if (
+        isinstance(state_value, torch.Tensor)
+        and state_value.numel() > 1
+        and isinstance(param, DTensor)
+        and not _matrix_state_tensor_matches_param_shape(state_value, param)
+    ):
+        _raise_unsupported_matrix_sidecar_state(state_name, state_value)
+
+
+def _matrix_state_names_sharded_like_param(state: dict, param: DTensor) -> list[str]:
+    return sorted(
+        state_name
+        for state_name, state_value in state.items()
+        if _is_same_shard_matrix_state_tensor(state_value, param)
+    )
+
+
+def _matrix_same_shard_state_metadata(state: dict, param: DTensor) -> tuple[list[str], dict]:
+    state_names = []
+    for state_name, state_value in state.items():
+        _raise_if_uncontracted_matrix_state_sidecar(state_name, state_value, param)
+        if _is_same_shard_matrix_state_tensor(state_value, param):
+            state_names.append(state_name)
+    state_names = sorted(state_names)
+    state_shapes = {state_name: list(state[state_name].shape) for state_name in state_names}
+    return state_names, state_shapes
+
+
+def _raise_unsupported_matrix_sidecar_state(state_name: str, state_value: torch.Tensor) -> None:
+    raise RuntimeError(
+        "[MegatronFSDP] Matrix optimizer tensor state that is not shaped like its "
+        f"parameter is not supported yet. State {state_name!r} has shape "
+        f"{tuple(state_value.shape)}. Add an explicit sidecar sharding/checkpoint "
+        "contract before using this state with matrix-sharded FSDP."
+    )
+
+
+def _dtensor_layout_matches_param(state_value: DTensor, param: DTensor) -> bool:
+    if state_value.placements != param.placements:
+        return False
+    state_mesh = state_value.device_mesh
+    param_mesh = param.device_mesh
+    state_dim_names = tuple(getattr(state_mesh, "mesh_dim_names", ()) or ())
+    param_dim_names = tuple(getattr(param_mesh, "mesh_dim_names", ()) or ())
+    if state_dim_names != param_dim_names:
+        return False
+    state_mesh_tensor = getattr(state_mesh, "mesh", None)
+    param_mesh_tensor = getattr(param_mesh, "mesh", None)
+    if state_mesh_tensor is None or param_mesh_tensor is None:
+        return state_mesh == param_mesh
+    return torch.equal(state_mesh_tensor, param_mesh_tensor)
+
+
+def _validate_matrix_optimizer_state_sharding(
+    optimizer: torch.optim.Optimizer, mfsdp_model: MegatronFSDP
+) -> None:
+    """Validate same-shaped matrix optimizer state follows parameter sharding.
+
+    Muon momentum and mixed-precision master parameters are matrix-shaped state
+    tensors and must be sharded exactly like the matrix parameter they belong
+    to. Megatron-FSDP initializes optimizer state via a dummy optimizer step;
+    checking immediately after that step prevents plain local tensors from
+    being checkpointed as if they were valid matrix-axis shards.
+    """
+
+    if not HAVE_MCORE_MATRIX_UPDATE:
+        return
+    if (
+        mfsdp_model.param_and_grad_buffer.bucketing_policy.data_parallel_sharding_strategy
+        == "no_shard"
+    ):
+        return
+    for param_group in optimizer.param_groups:
+        for param in param_group["params"]:
+            if not _is_matrix_optimizer_owned_param(param):
+                continue
+            matrix_shard_spec = get_matrix_shard_spec(param)
+            if matrix_shard_spec is None:
+                raise RuntimeError(
+                    "[MegatronFSDP] Matrix optimizer-owned optimizer parameter is missing "
+                    "MatrixShardSpec metadata after FSDP parameter replacement."
+                )
+            if not isinstance(param, DTensor):
+                raise RuntimeError(
+                    "[MegatronFSDP] Matrix optimizer-owned parameters require DTensor optimizer "
+                    "parameters so momentum/master state is sharded by matrix axis."
+                )
+            for state_name, state_value in optimizer.state.get(param, {}).items():
+                if not isinstance(state_value, torch.Tensor) or state_value.numel() <= 1:
+                    continue
+                _raise_if_uncontracted_matrix_state_sidecar(state_name, state_value, param)
+                if not isinstance(state_value, DTensor):
+                    raise RuntimeError(
+                        "[MegatronFSDP] Matrix optimizer state must be DTensor-sharded with "
+                        f"the same matrix spec as its parameter. State {state_name!r} for "
+                        f"shape {tuple(state_value.shape)} is a local tensor."
+                    )
+                if not _dtensor_layout_matches_param(state_value, param):
+                    raise RuntimeError(
+                        "[MegatronFSDP] Matrix optimizer state DTensor placement does not "
+                        f"match its parameter for state {state_name!r}: "
+                        f"state placements={state_value.placements}, "
+                        f"param placements={param.placements}."
+                    )
+                set_matrix_shard_spec(state_value, matrix_shard_spec)
+
+
+def _matrix_optimizer_checkpoint_metadata(
+    optimizer: torch.optim.Optimizer, mfsdp_model: MegatronFSDP
+) -> dict:
+    if not HAVE_MCORE_MATRIX_UPDATE:
+        return {}
+    if (
+        mfsdp_model.param_and_grad_buffer.bucketing_policy.data_parallel_sharding_strategy
+        == "no_shard"
+    ):
+        return {}
+
+    param_state_indices = _optimizer_param_state_indices(optimizer)
+    metadata = {}
+    for param_group in optimizer.param_groups:
+        for param in param_group["params"]:
+            if not _is_matrix_optimizer_owned_param(param):
+                continue
+            matrix_shard_spec = get_matrix_shard_spec(param)
+            matrix_optimizer_info = get_matrix_optimizer_info(param)
+            if matrix_shard_spec is None or matrix_optimizer_info is None:
+                raise RuntimeError(
+                    "[MegatronFSDP] Matrix optimizer-owned parameter is missing matrix "
+                    "metadata while writing optimizer checkpoint metadata."
+                )
+            state_names, state_shapes = _matrix_same_shard_state_metadata(
+                optimizer.state.get(param, {}), param
+            )
+            if not state_names:
+                continue
+            metadata[str(param_state_indices[id(param)])] = {
+                "owner": matrix_optimizer_info.owner,
+                "update_family": matrix_optimizer_info.update_family,
+                "matrix_shard_contract": _matrix_shard_global_contract_to_checkpoint_dict(
+                    matrix_shard_spec
+                ),
+                "matrix_shard_spec": _matrix_shard_spec_to_checkpoint_dict(matrix_shard_spec),
+                "same_shard_state_layout": MATRIX_OPTIMIZER_SAME_SHARD_STATE_LAYOUT,
+                "same_shard_state_names": sorted(state_names),
+                "same_shard_state_shapes": state_shapes,
+            }
+    return metadata
+
+
+def _add_matrix_optimizer_checkpoint_metadata(
+    optimizer: torch.optim.Optimizer, mfsdp_model: MegatronFSDP, state_dict: dict
+) -> None:
+    _validate_matrix_optimizer_state_sharding(optimizer, mfsdp_model)
+    metadata = _matrix_optimizer_checkpoint_metadata(optimizer, mfsdp_model)
+    if metadata:
+        state_dict[MATRIX_OPTIMIZER_STATE_METADATA_KEY] = {
+            "version": MATRIX_OPTIMIZER_STATE_METADATA_VERSION,
+            "params": metadata,
+        }
+    else:
+        state_dict.pop(MATRIX_OPTIMIZER_STATE_METADATA_KEY, None)
+
+
+def _validate_matrix_optimizer_checkpoint_metadata(
+    optimizer: torch.optim.Optimizer, mfsdp_model: MegatronFSDP, state_dict: dict
+) -> None:
+    if not HAVE_MCORE_MATRIX_UPDATE:
+        return
+    if (
+        mfsdp_model.param_and_grad_buffer.bucketing_policy.data_parallel_sharding_strategy
+        == "no_shard"
+    ):
+        return
+
+    metadata_block = state_dict.get(MATRIX_OPTIMIZER_STATE_METADATA_KEY)
+    metadata = None
+    if metadata_block is not None:
+        if not isinstance(metadata_block, dict):
+            raise RuntimeError(
+                "[MegatronFSDP] Matrix optimizer checkpoint metadata must be a dict."
+            )
+        if metadata_block.get("version") != MATRIX_OPTIMIZER_STATE_METADATA_VERSION:
+            raise RuntimeError(
+                "[MegatronFSDP] Unsupported matrix optimizer checkpoint metadata version: "
+                f"{metadata_block.get('version')!r}."
+            )
+        metadata = metadata_block.get("params")
+        if not isinstance(metadata, dict):
+            raise RuntimeError(
+                "[MegatronFSDP] Matrix optimizer checkpoint metadata is missing params."
+            )
+    param_state_indices = _optimizer_param_state_indices(optimizer)
+    for param_group in optimizer.param_groups:
+        for param in param_group["params"]:
+            if not _is_matrix_optimizer_owned_param(param):
+                continue
+            matrix_shard_spec = get_matrix_shard_spec(param)
+            matrix_optimizer_info = get_matrix_optimizer_info(param)
+            if matrix_shard_spec is None:
+                raise RuntimeError(
+                    "[MegatronFSDP] Matrix optimizer-owned parameter is missing "
+                    "MatrixShardSpec metadata while loading optimizer state."
+                )
+            if matrix_optimizer_info is None:
+                raise RuntimeError(
+                    "[MegatronFSDP] Matrix optimizer-owned parameter is missing "
+                    "MatrixOptimizerInfo metadata while loading optimizer state."
+                )
+            param_idx = str(param_state_indices[id(param)])
+            loaded_state_by_idx = state_dict.get("state", {})
+            loaded_state = loaded_state_by_idx.get(
+                int(param_idx), loaded_state_by_idx.get(param_idx, {})
+            )
+            if not isinstance(loaded_state, dict):
+                continue
+            for state_name, state_value in loaded_state.items():
+                _raise_if_uncontracted_matrix_state_sidecar(state_name, state_value, param)
+                if (
+                    _is_same_shard_matrix_state_tensor(state_value, param)
+                    and not isinstance(state_value, DTensor)
+                ):
+                    raise RuntimeError(
+                        "[MegatronFSDP] Matrix optimizer checkpoint contains local tensor "
+                        f"state {state_name!r} for optimizer state index {param_idx}; "
+                        "matrix-shaped Muon state must be checkpointed as a DTensor."
+                    )
+            same_shape_state_names = _matrix_state_names_sharded_like_param(loaded_state, param)
+            if not same_shape_state_names:
+                continue
+            if metadata is None or param_idx not in metadata:
+                raise RuntimeError(
+                    "[MegatronFSDP] Matrix optimizer checkpoint is missing matrix-shard "
+                    f"metadata for optimizer state index {param_idx}."
+                )
+            param_metadata = metadata[param_idx]
+            if not isinstance(param_metadata, dict):
+                raise RuntimeError(
+                    "[MegatronFSDP] Matrix optimizer checkpoint metadata for optimizer "
+                    f"state index {param_idx} must be a dict."
+                )
+            matrix_shard_contract = param_metadata.get("matrix_shard_contract")
+            if not isinstance(matrix_shard_contract, dict):
+                raise RuntimeError(
+                    "[MegatronFSDP] Matrix optimizer checkpoint metadata is missing "
+                    f"matrix_shard_contract for optimizer state index {param_idx}."
+                )
+            _validate_matrix_shard_contract_checkpoint_metadata(
+                matrix_shard_contract, param_idx
+            )
+            if not _matrix_shard_spec_matches_checkpoint_dict(
+                matrix_shard_spec, matrix_shard_contract
+            ):
+                raise RuntimeError(
+                    "[MegatronFSDP] Matrix optimizer checkpoint shard metadata does not "
+                    f"match the current MatrixShardSpec for optimizer state index {param_idx}."
+                )
+            matrix_shard_spec_metadata = param_metadata.get("matrix_shard_spec")
+            if matrix_shard_spec_metadata is not None:
+                _validate_matrix_shard_spec_checkpoint_metadata(
+                    matrix_shard_spec_metadata, param_idx, "matrix_shard_spec"
+                )
+            if param_metadata.get("owner") != matrix_optimizer_info.owner:
+                raise RuntimeError(
+                    "[MegatronFSDP] Matrix optimizer checkpoint owner does not match "
+                    f"the current MatrixOptimizerInfo for optimizer state index {param_idx}: "
+                    f"checkpoint={param_metadata.get('owner')!r}, "
+                    f"current={matrix_optimizer_info.owner!r}."
+                )
+            if param_metadata.get("update_family") != matrix_optimizer_info.update_family:
+                raise RuntimeError(
+                    "[MegatronFSDP] Matrix optimizer checkpoint update family does not match "
+                    f"the current MatrixOptimizerInfo for optimizer state index {param_idx}: "
+                    f"checkpoint={param_metadata.get('update_family')!r}, "
+                    f"current={matrix_optimizer_info.update_family!r}."
+                )
+            if (
+                param_metadata.get("same_shard_state_layout")
+                != MATRIX_OPTIMIZER_SAME_SHARD_STATE_LAYOUT
+            ):
+                raise RuntimeError(
+                    "[MegatronFSDP] Matrix optimizer checkpoint state layout contract does "
+                    f"not match for optimizer state index {param_idx}: "
+                    f"checkpoint={param_metadata.get('same_shard_state_layout')!r}, "
+                    f"current={MATRIX_OPTIMIZER_SAME_SHARD_STATE_LAYOUT!r}."
+                )
+            metadata_state_names = param_metadata.get("same_shard_state_names")
+            if not isinstance(metadata_state_names, list):
+                raise RuntimeError(
+                    "[MegatronFSDP] Matrix optimizer checkpoint metadata is missing "
+                    f"same_shard_state_names for optimizer state index {param_idx}."
+                )
+            metadata_state_names = sorted(metadata_state_names)
+            if same_shape_state_names != metadata_state_names:
+                raise RuntimeError(
+                    "[MegatronFSDP] Matrix optimizer checkpoint state names do not match "
+                    f"the matrix-sharded metadata for optimizer state index {param_idx}: "
+                    f"checkpoint={metadata_state_names}, loaded={same_shape_state_names}."
+                )
+            metadata_state_shapes = param_metadata.get("same_shard_state_shapes")
+            if not isinstance(metadata_state_shapes, dict):
+                raise RuntimeError(
+                    "[MegatronFSDP] Matrix optimizer checkpoint metadata is missing "
+                    f"same_shard_state_shapes for optimizer state index {param_idx}."
+                )
+            if sorted(metadata_state_shapes) != metadata_state_names:
+                raise RuntimeError(
+                    "[MegatronFSDP] Matrix optimizer checkpoint state shape keys do not "
+                    f"match same_shard_state_names for optimizer state index {param_idx}: "
+                    f"names={metadata_state_names}, shape_keys={sorted(metadata_state_shapes)}."
+                )
+            for state_name, state_shape in metadata_state_shapes.items():
+                if not isinstance(state_shape, list) or not all(
+                    isinstance(dim, int) for dim in state_shape
+                ):
+                    raise RuntimeError(
+                        "[MegatronFSDP] Matrix optimizer checkpoint state shape metadata "
+                        f"for state {state_name!r} at optimizer state index {param_idx} "
+                        "must be a list of integers."
+                    )
+            loaded_state_shapes = {
+                state_name: list(loaded_state[state_name].shape)
+                for state_name in same_shape_state_names
+            }
+            if loaded_state_shapes != metadata_state_shapes:
+                raise RuntimeError(
+                    "[MegatronFSDP] Matrix optimizer checkpoint state shapes do not match "
+                    f"the matrix-sharded metadata for optimizer state index {param_idx}: "
+                    f"checkpoint={metadata_state_shapes}, loaded={loaded_state_shapes}."
+                )
 
 
 class ShardingStrategy(IntEnum):
@@ -489,7 +1118,22 @@ def fully_shard_optimizer(
             param.grad = torch.zeros_like(param)
     # Non-lazy optimizer state initialization.
     optimizer.step()
+    _validate_matrix_optimizer_state_sharding(optimizer, mfsdp_model)
     optimizer.zero_grad()
+
+    def add_matrix_optimizer_checkpoint_metadata(optimizer, state_dict):
+        _add_matrix_optimizer_checkpoint_metadata(optimizer, mfsdp_model, state_dict)
+
+    def validate_matrix_optimizer_load_state_dict(optimizer, state_dict):
+        _validate_matrix_optimizer_checkpoint_metadata(optimizer, mfsdp_model, state_dict)
+        return state_dict
+
+    def restore_matrix_optimizer_loaded_state_metadata(optimizer):
+        _validate_matrix_optimizer_state_sharding(optimizer, mfsdp_model)
+
+    optimizer.register_state_dict_post_hook(add_matrix_optimizer_checkpoint_metadata)
+    optimizer.register_load_state_dict_pre_hook(validate_matrix_optimizer_load_state_dict)
+    optimizer.register_load_state_dict_post_hook(restore_matrix_optimizer_loaded_state_metadata)
 
     # Define a new optimizer.step() method that distributes optimizer state and gradients,
     # waits for asynchronous gradient reduce-scatter work to be completed, and updates

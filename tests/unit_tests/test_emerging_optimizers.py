@@ -21,6 +21,7 @@ from megatron.core.optimizer.emerging_optimizers import (
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
+from megatron.training.arguments import parse_args, validate_args
 from tests.unit_tests.test_utilities import Utils
 
 if HAVE_EMERGING_OPTIMIZERS:
@@ -1208,6 +1209,20 @@ class TestAdaptiveMuonOptimizerMultiRank:
 
         with pytest.raises(Exception, match='emerging optimizer with fp16 is not supported'):
             get_megatron_optimizer(config=optimizer_config_fp16, model_chunks=[model])
+
+
+def test_adaptive_muon_fsdp_rejected_by_args(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["test"])
+    args = parse_args(ignore_unknown_args=True)
+    args.optimizer = "adaptive_muon"
+    args.use_megatron_fsdp = True
+    args.use_torch_fsdp2 = False
+    args.matrix_optimizer = "none"
+    args.matrix_input_preconditioner = "none"
+    args.matrix_output_preconditioner = "none"
+
+    with pytest.raises(ValueError, match="sidecar optimizer state"):
+        validate_args(args)
 
 
 @pytest.mark.skipif(

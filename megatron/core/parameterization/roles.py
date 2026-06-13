@@ -147,6 +147,11 @@ def is_hidden_matrix_parameter(param: Any, param_name: Optional[str] = None) -> 
 
 
 def is_muon_managed_matrix_parameter(param: Any, *, optimizer_type: str) -> bool:
+    matrix_optimizer_info = getattr(param, '_mcore_matrix_optimizer_info', None)
+    if matrix_optimizer_info is not None:
+        return getattr(matrix_optimizer_info, 'owner', None) == 'muon'
     if 'muon' not in optimizer_type.lower():
         return False
+    if get_parameterization_role(param) == ROLE_MUON_MANAGED_MATRIX:
+        return True
     return param.dim() == 2 and not is_embedding_or_output_parameter(param)

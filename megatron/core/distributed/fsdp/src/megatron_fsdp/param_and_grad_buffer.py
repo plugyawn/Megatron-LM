@@ -60,6 +60,45 @@ logger = logging.getLogger(__name__)
 
 
 try:
+    from megatron.core.matrix_update import (
+        MATRIX_OPTIMIZER_INFO_ATTR,
+        MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
+        MATRIX_OPTIMIZER_OWNER_MUON,
+        MATRIX_SHARD_SPEC_ATTR,
+        get_matrix_optimizer_info,
+        get_matrix_shard_spec,
+        matrix_fsdp_shard_axis_for_spec,
+        matrix_shard_spec_with_dp_axis,
+        set_matrix_shard_spec,
+    )
+
+    HAVE_MCORE_MATRIX_UPDATE = True
+except ImportError:
+    HAVE_MCORE_MATRIX_UPDATE = False
+    MATRIX_OPTIMIZER_INFO_ATTR = "_mcore_matrix_optimizer_info"
+    MATRIX_SHARD_SPEC_ATTR = "_mcore_matrix_shard_spec"
+
+
+def _is_matrix_optimizer_owned_param(param: torch.nn.Parameter) -> bool:
+    if not HAVE_MCORE_MATRIX_UPDATE:
+        return False
+    matrix_optimizer_info = get_matrix_optimizer_info(param)
+    return matrix_optimizer_info is not None and getattr(matrix_optimizer_info, "owner", None) in (
+        MATRIX_OPTIMIZER_OWNER_MUON,
+        MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
+    )
+
+
+def _matrix_optimizer_dp_shard_axis(param: torch.nn.Parameter) -> Optional[int]:
+    if not _is_matrix_optimizer_owned_param(param):
+        return None
+    matrix_shard_spec = get_matrix_shard_spec(param)
+    if matrix_shard_spec is None:
+        return None
+    return matrix_fsdp_shard_axis_for_spec(matrix_shard_spec)
+
+
+try:
     # Default to Megatron-LM FW.
     from megatron.core.distributed.distributed_data_parallel_config import (
         DistributedDataParallelConfig,
@@ -924,6 +963,66 @@ class DataParallelBuffer:
 
         # Count all parameters in this buffer and store their enumerated index.
         self.param_idx = {p: i for i, p in enumerate(self.params)}
+        self._set_matrix_optimizer_shard_specs()
+
+    def _set_matrix_optimizer_shard_specs(self) -> None:
+        """Attach row-aligned DP shard metadata for matrix-owned parameters.
+
+        Megatron-FSDP stores parameters in flat bucket shards. A matrix optimizer
+        can only consume the resulting local tensor as a row shard when the
+        parameter/bucket intersection begins and ends on full-row boundaries.
+        Anything else would make ``local_tensor.view(-1, cols)`` a partial-row
+        patch rather than a principled matrix shard.
+        """
+
+        if (
+            not HAVE_MCORE_MATRIX_UPDATE
+            or self.ddp_config.data_parallel_sharding_strategy == "no_shard"
+        ):
+            return
+        for param, item_id in self.param_idx.items():
+            if not _is_matrix_optimizer_owned_param(param):
+                continue
+            matrix_shard_spec = get_matrix_shard_spec(param)
+            if matrix_shard_spec is None:
+                raise RuntimeError(
+                    "[Megatron-FSDP] Matrix optimizer-owned parameter is missing "
+                    "MatrixShardSpec metadata. Configure matrix metadata before FSDP sharding."
+            )
+            dp_shard_axis = matrix_fsdp_shard_axis_for_spec(matrix_shard_spec)
+            if dp_shard_axis != 0:
+                raise NotImplementedError(
+                    "[Megatron-FSDP] Matrix optimizer-owned parameters that require "
+                    f"FSDP sharding on matrix axis {dp_shard_axis} are not supported by "
+                    "the current flat row-contiguous buffer planner. Supporting this "
+                    "requires an explicit matrix-axis packing path; silently using the "
+                    "flat buffer shard would violate the small-Gram Muon contract."
+                )
+
+            local_shape = to_local_if_dtensor(param).shape
+            if len(local_shape) < 2:
+                raise RuntimeError(
+                    "[Megatron-FSDP] Matrix optimizer-owned parameter must have a 2D local "
+                    f"shape, got {tuple(local_shape)}."
+                )
+            row_stride = local_shape[1:].numel()
+            slice_start, slice_end = self._get_item_slice_in_shard(item_id)
+            if slice_start % row_stride != 0 or slice_end % row_stride != 0:
+                raise RuntimeError(
+                    "[Megatron-FSDP] Matrix optimizer-owned parameter shard is not row-aligned: "
+                    f"bucket_id={self.bucket_id}, item_id={item_id}, local_shape={tuple(local_shape)}, "
+                    f"slice=({slice_start}, {slice_end}), row_stride={row_stride}. "
+                    "Matrix-aware FSDP must shard this parameter on complete matrix rows."
+                )
+            set_matrix_shard_spec(
+                param,
+                matrix_shard_spec_with_dp_axis(
+                    matrix_shard_spec,
+                    dp_shard_axis=dp_shard_axis,
+                    dp_local_start=slice_start // row_stride,
+                    dp_local_end=slice_end // row_stride,
+                ),
+            )
 
     def init_data(self, data: torch.Tensor):
         """Allocate a buffer Tensor to persistently store the data for this
@@ -1300,6 +1399,12 @@ class ParameterGroup:
         is_expert_param (bool):
             Indicates if this group contains expert parameters
             (e.g., in mixture-of-experts).
+        matrix_optimizer_owned (bool):
+            Indicates if this group contains parameters owned by a matrix optimizer.
+            These groups must not be mixed with fallback optimizer parameters because
+            matrix optimizers consume matrix-axis shard metadata.
+        matrix_dp_shard_axis (Optional[int]):
+            Matrix axis selected for FSDP sharding for matrix-owned parameters.
         requires_grad (Optional[bool]):
             Specifies if gradients should be computed for these parameters.
         fsdp_unit_id (Optional[int]):
@@ -1333,6 +1438,8 @@ class ParameterGroup:
     params: List[torch.nn.Parameter]
     dtype: Optional[torch.dtype] = None
     is_expert_param: bool = False
+    matrix_optimizer_owned: bool = False
+    matrix_dp_shard_axis: Optional[int] = None
     requires_grad: Optional[bool] = None
     fsdp_unit_id: Optional[int] = None
     chunk_size_factor: int = 1
@@ -1398,8 +1505,11 @@ def _get_parameter_groups(
         the DP reduce-scatter to be before the embedding all-reduce.
         """
         return (
-            getattr(param, "shared_embedding", False)
-            and policy.data_parallel_sharding_strategy != "no_shard"
+            policy.data_parallel_sharding_strategy != "no_shard"
+            and (
+                getattr(param, "shared_embedding", False)
+                or _is_matrix_optimizer_owned_param(param)
+            )
         )
 
     is_expert_parameter = lambda n, p: ".experts." in n
@@ -1412,9 +1522,28 @@ def _get_parameter_groups(
         # We need this information to correctly dynamically allocate Tensors!
         is_fp8 = is_float8tensor(param)
         is_fp8_meta_device_init = meta_device_init_fp8_params.get(name, (False, False))[0]
+        matrix_optimizer_owned = _is_matrix_optimizer_owned_param(param)
+        matrix_dp_shard_axis = _matrix_optimizer_dp_shard_axis(param)
+        if (
+            policy.data_parallel_sharding_strategy != "no_shard"
+            and matrix_optimizer_owned
+        ):
+            if matrix_dp_shard_axis is None:
+                raise RuntimeError(
+                    "[Megatron-FSDP] Matrix optimizer-owned parameter is missing "
+                    f"MatrixShardSpec metadata before FSDP grouping: {name}."
+                )
+            if matrix_dp_shard_axis != 0:
+                raise NotImplementedError(
+                    "[Megatron-FSDP] Matrix optimizer-owned parameters that require "
+                    f"FSDP sharding on matrix axis {matrix_dp_shard_axis} are not "
+                    f"supported by the current row-sharded FSDP buffer planner: {name}."
+                )
         param_attrs = dict(
             dtype="float8" if (is_fp8 or is_fp8_meta_device_init) else param.dtype,
             is_expert_param=is_expert_parameter(name, param),
+            matrix_optimizer_owned=matrix_optimizer_owned,
+            matrix_dp_shard_axis=matrix_dp_shard_axis,
             requires_grad=param.requires_grad,
             fsdp_unit_id=None,
         )
@@ -1453,7 +1582,15 @@ def _get_parameter_groups(
         basic_attrs = {
             key: value
             for key, value in group.__dict__.items()
-            if key in ["dtype", "is_expert_param", "requires_grad", "fsdp_unit_id"]
+            if key
+            in [
+                "dtype",
+                "is_expert_param",
+                "matrix_optimizer_owned",
+                "matrix_dp_shard_axis",
+                "requires_grad",
+                "fsdp_unit_id",
+            ]
         }
         for param in group.params:
             if _does_param_require_new_bucket(param):
@@ -1494,6 +1631,37 @@ def _get_parameter_groups(
     # Step 3: Split parameter groups to meet communication segmentation requirements.
     new_bucket_groups = []
     for group in bucket_groups:
+        if group.matrix_optimizer_owned:
+            assert len(group.params) == 1, (
+                "[Megatron-FSDP] Matrix optimizer-owned parameters must be singleton "
+                "buckets so DP shards can be interpreted as matrix-axis shards."
+            )
+            param_shape = to_local_if_dtensor(group.params[0]).shape
+            if len(param_shape) < 2:
+                raise RuntimeError(
+                    "[Megatron-FSDP] Matrix optimizer-owned parameter must have a 2D "
+                    f"local shape, got {tuple(param_shape)}."
+                )
+            if group.matrix_dp_shard_axis != 0:
+                raise NotImplementedError(
+                    "[Megatron-FSDP] Matrix optimizer-owned parameters that require "
+                    f"FSDP sharding on matrix axis {group.matrix_dp_shard_axis} are not "
+                    "supported by the current row-contiguous buffer planner."
+                )
+            new_bucket_groups.append(
+                ParameterGroup(
+                    group.params,
+                    dtype=group.dtype,
+                    is_expert_param=group.is_expert_param,
+                    matrix_optimizer_owned=group.matrix_optimizer_owned,
+                    matrix_dp_shard_axis=group.matrix_dp_shard_axis,
+                    requires_grad=group.requires_grad,
+                    fsdp_unit_id=group.fsdp_unit_id,
+                    chunk_size_factor=param_shape[1:].numel(),
+                )
+            )
+            continue
+
         params = sorted(
             group.params, key=lambda p: to_local_if_dtensor(p).shape[1:].numel(), reverse=True
         )
@@ -1522,6 +1690,8 @@ def _get_parameter_groups(
                     same_factor_params,
                     dtype=group.dtype,
                     is_expert_param=group.is_expert_param,
+                    matrix_optimizer_owned=group.matrix_optimizer_owned,
+                    matrix_dp_shard_axis=group.matrix_dp_shard_axis,
                     requires_grad=group.requires_grad,
                     fsdp_unit_id=group.fsdp_unit_id,
                     chunk_size_factor=chunk_size_factor,
@@ -2896,6 +3066,8 @@ class ParamAndGradBuffer:
                             "parameterization_shared_group",
                             "parameterization_tags",
                             "_tensor_parallel_mode",
+                            MATRIX_OPTIMIZER_INFO_ATTR,
+                            MATRIX_SHARD_SPEC_ATTR,
                         ]:
                             if hasattr(orig_param, attr_name):
                                 setattr(param, attr_name, getattr(orig_param, attr_name))
@@ -4635,6 +4807,37 @@ def make_fsdp_dtensor(
     # Save original parameter for later use
     orig_param = param
 
+    if HAVE_MCORE_MATRIX_UPDATE and is_sharded_param:
+        matrix_optimizer_info = get_matrix_optimizer_info(orig_param)
+        if matrix_optimizer_info is not None and getattr(
+            matrix_optimizer_info, "owner", None
+        ) in ("muon", "matrix_function"):
+            matrix_shard_spec = get_matrix_shard_spec(orig_param)
+            if matrix_shard_spec is None:
+                raise RuntimeError(
+                    "[Megatron-FSDP] Matrix optimizer-owned parameter is missing "
+                    "MatrixShardSpec metadata. Configure matrix metadata before FSDP sharding."
+                )
+            dp_shard_axis = matrix_fsdp_shard_axis_for_spec(matrix_shard_spec)
+            if dp_shard_axis != 0:
+                raise NotImplementedError(
+                    "[Megatron-FSDP] Matrix optimizer-owned parameters that require "
+                    f"FSDP sharding on matrix axis {dp_shard_axis} are not supported yet. "
+                    "Current Megatron-FSDP parameter buffers shard local tensors with "
+                    "Shard(0); using that for this parameter would create 2D TP/FSDP "
+                    "patches and break the small-Gram Muon contract."
+                )
+            if matrix_shard_spec.dp_shard_axis is None:
+                matrix_shard_spec = matrix_shard_spec_with_dp_axis(
+                    matrix_shard_spec, dp_shard_axis=dp_shard_axis
+                )
+                set_matrix_shard_spec(orig_param, matrix_shard_spec)
+            elif matrix_shard_spec.dp_shard_axis != dp_shard_axis:
+                raise RuntimeError(
+                    "[Megatron-FSDP] MatrixShardSpec has inconsistent DP shard axis: "
+                    f"metadata={matrix_shard_spec.dp_shard_axis}, required={dp_shard_axis}."
+                )
+
     # Handle tensor model parallel specific logic
     if not isinstance(param, DTensor) and using_tensor_parallel(
         dist_index, is_expert_parallel=is_expert_param
@@ -4707,5 +4910,13 @@ def make_fsdp_dtensor(
     # Update metadata if uneven sharding is expected
     if update_uneven_dtensor_chunk_meta:
         update_uneven_dtensor_chunk_metadata(fsdp_tensor)
+
+    if HAVE_MCORE_MATRIX_UPDATE:
+        matrix_optimizer_info = get_matrix_optimizer_info(orig_param)
+        matrix_shard_spec = get_matrix_shard_spec(orig_param)
+        if matrix_optimizer_info is not None:
+            setattr(fsdp_tensor, MATRIX_OPTIMIZER_INFO_ATTR, matrix_optimizer_info)
+        if matrix_shard_spec is not None:
+            set_matrix_shard_spec(fsdp_tensor, matrix_shard_spec)
 
     return fsdp_tensor

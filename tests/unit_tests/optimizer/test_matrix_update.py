@@ -8,7 +8,12 @@ from megatron.core.optimizer.matrix_function_optimizer import (
     MatrixFunctionOptimizer,
     default_matrix_apply_plan,
 )
+from megatron.core.optimizer.layer_wise_optimizer import tag_params_for_buffer_routing
 from megatron.core.optimizer.matrix_update import (
+    MATRIX_OPTIMIZER_OWNER_FALLBACK,
+    MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
+    MATRIX_OPTIMIZER_OWNER_MUON,
+    MatrixShardSpec,
     MatrixPreconditionerApproximation,
     MatrixPreconditionerKind,
     MatrixPreconditionerNormalization,
@@ -18,26 +23,35 @@ from megatron.core.optimizer.matrix_update import (
     TPUpdateMode,
     configure_model_matrix_updates,
     configure_matrix_update_param,
-    input_preconditioner_scope_for,
     finalize_feature_gram_buffers,
     finalize_grad_gram_buffers,
     get_feature_gram_for_optimizer,
     get_grad_gram_for_optimizer,
+    get_matrix_optimizer_info,
+    get_matrix_shard_spec,
+    input_preconditioner_scope_for,
     is_matrix_update_eligible,
+    matrix_fsdp_shard_axis_for_spec,
+    matrix_shard_spec_with_dp_axis,
+    matrix_small_gram_side_for_spec,
+    matrix_update_family_from_optimizer_name,
     maybe_accumulate_feature_gram,
     maybe_accumulate_grad_gram,
     output_preconditioner_scope_for,
     set_feature_gram_finalization_required,
     set_grad_gram_finalization_required,
     set_linear_weight_info,
+    set_matrix_optimizer_info,
 )
 
 
-def _param_with_info(tp_layout="column_parallel"):
-    param = torch.nn.Parameter(torch.empty(4, 3))
+def _param_with_info(tp_layout="column_parallel", shape=(4, 3), logical_shape=None):
+    if logical_shape is None:
+        logical_shape = shape
+    param = torch.nn.Parameter(torch.empty(*shape))
     set_linear_weight_info(
         param,
-        logical_shape=(4, 3),
+        logical_shape=logical_shape,
         tp_layout=tp_layout,
         sequence_parallel=False,
         expert_parallel=False,
@@ -113,6 +127,7 @@ def test_block_diag_feature_gram_accumulates_padded_blocks():
     param = _param_with_info()
     recipe = _recipe(approximation=MatrixPreconditionerApproximation.BLOCK_DIAG)
     recipe.block_size = 2
+    recipe.ridge = 1e-6
     configure_matrix_update_param(param, recipe=recipe)
     x = torch.tensor([[1.0, 2.0, 3.0], [3.0, 5.0, 7.0]])
 
@@ -152,6 +167,7 @@ def test_block_diag_grad_gram_accumulates_padded_blocks():
     param = _param_with_info()
     recipe = _output_recipe(approximation=MatrixPreconditionerApproximation.BLOCK_DIAG)
     recipe.block_size = 3
+    recipe.ridge = 1e-6
     configure_matrix_update_param(param, output_recipe=recipe)
     dy = torch.tensor([[1.0, 2.0, 3.0, 4.0], [3.0, 5.0, 7.0, 11.0]])
 
@@ -218,17 +234,17 @@ def test_token_sample_size_caps_total_collection_window():
     torch.testing.assert_close(param.main_grad_feature_count, torch.tensor(3.0, dtype=torch.float64))
 
 
-def test_row_parallel_feature_gram_scope_is_tp_local_block_diag_even_for_diag():
+def test_row_parallel_feature_gram_scope_is_diag_approx_for_diag():
     assert (
         input_preconditioner_scope_for(MatrixPreconditionerApproximation.DIAG, "row_parallel")
-        == MatrixPreconditionerScope.TP_LOCAL_BLOCK_DIAG
+        == MatrixPreconditionerScope.DIAG_APPROX
     )
 
 
-def test_column_parallel_grad_gram_scope_is_tp_local_block_diag_even_for_diag():
+def test_column_parallel_grad_gram_scope_is_diag_approx_for_diag():
     assert (
         output_preconditioner_scope_for(MatrixPreconditionerApproximation.DIAG, "column_parallel")
-        == MatrixPreconditionerScope.TP_LOCAL_BLOCK_DIAG
+        == MatrixPreconditionerScope.DIAG_APPROX
     )
 
 
@@ -256,6 +272,218 @@ def test_lm_head_marker_excludes_matrix_update_eligibility():
     param.is_embedding_or_output_parameter = True
 
     assert not is_matrix_update_eligible(param, min_matrix_dim=2)
+
+
+def test_matrix_shard_spec_records_actual_tp_shard_axis():
+    param = _param_with_info(tp_layout="column_parallel", shape=(2, 3), logical_shape=(4, 3))
+
+    spec = get_matrix_shard_spec(param)
+
+    assert spec.logical_shape == (4, 3)
+    assert spec.local_shape == (2, 3)
+    assert spec.tp_layout == "column_parallel"
+    assert spec.tp_shard_axis == 0
+
+
+def test_matrix_shard_spec_does_not_infer_shard_axis_from_tp1_layout_label():
+    param = _param_with_info(tp_layout="column_parallel", shape=(4, 3), logical_shape=(4, 3))
+
+    spec = get_matrix_shard_spec(param)
+
+    assert spec.tp_shard_axis is None
+
+
+def test_matrix_fsdp_shard_axis_aligns_with_tp_axis():
+    row_sharded = _param_with_info(
+        tp_layout="column_parallel", shape=(2, 3), logical_shape=(4, 3)
+    )
+    col_sharded = _param_with_info(
+        tp_layout="row_parallel", shape=(4, 2), logical_shape=(4, 4)
+    )
+    unsharded = _param_with_info(tp_layout="column_parallel", shape=(4, 3), logical_shape=(4, 3))
+    wide_unsharded = _param_with_info(tp_layout="none", shape=(3, 8), logical_shape=(3, 8))
+
+    assert matrix_fsdp_shard_axis_for_spec(get_matrix_shard_spec(row_sharded)) == 0
+    assert matrix_fsdp_shard_axis_for_spec(get_matrix_shard_spec(col_sharded)) == 1
+    assert matrix_fsdp_shard_axis_for_spec(get_matrix_shard_spec(unsharded)) == 0
+    assert matrix_fsdp_shard_axis_for_spec(get_matrix_shard_spec(wide_unsharded)) == 1
+
+
+def test_matrix_shard_spec_small_gram_side():
+    row_sharded = _param_with_info(
+        tp_layout="column_parallel", shape=(2, 3), logical_shape=(4, 3)
+    )
+    col_sharded = _param_with_info(
+        tp_layout="row_parallel", shape=(4, 2), logical_shape=(4, 4)
+    )
+    tall_unsharded = _param_with_info(tp_layout="none", shape=(8, 3), logical_shape=(8, 3))
+    wide_unsharded = _param_with_info(tp_layout="none", shape=(3, 8), logical_shape=(3, 8))
+
+    assert matrix_small_gram_side_for_spec(get_matrix_shard_spec(row_sharded)) == "right"
+    assert matrix_small_gram_side_for_spec(get_matrix_shard_spec(col_sharded)) == "left"
+    assert matrix_small_gram_side_for_spec(get_matrix_shard_spec(tall_unsharded)) == "right"
+    assert matrix_small_gram_side_for_spec(get_matrix_shard_spec(wide_unsharded)) == "left"
+    assert get_matrix_shard_spec(row_sharded).small_gram_side == "right"
+
+
+def test_matrix_shard_spec_rejects_conflicting_tp_dp_axes():
+    col_sharded = _param_with_info(
+        tp_layout="row_parallel", shape=(4, 2), logical_shape=(4, 4)
+    )
+    spec = get_matrix_shard_spec(col_sharded)
+
+    with pytest.raises(ValueError, match="differs from the TP shard axis"):
+        matrix_shard_spec_with_dp_axis(spec, dp_shard_axis=0)
+
+
+def test_matrix_shard_spec_dp_row_range_updates_local_shape():
+    param = _param_with_info(tp_layout="none", shape=(8, 3), logical_shape=(8, 3))
+    spec = matrix_shard_spec_with_dp_axis(
+        get_matrix_shard_spec(param),
+        dp_shard_axis=0,
+        dp_local_start=2,
+        dp_local_end=5,
+    )
+
+    assert spec.local_shape == (3, 3)
+    assert spec.pre_dp_local_shape == (8, 3)
+    assert spec.dp_local_start == 2
+    assert spec.dp_local_end == 5
+    assert spec.small_gram_side == "right"
+
+
+def test_matrix_shard_spec_dp_row_range_uses_pre_dp_shape_when_present():
+    param = _param_with_info(tp_layout="none", shape=(8, 3), logical_shape=(8, 3))
+    spec = matrix_shard_spec_with_dp_axis(
+        get_matrix_shard_spec(param),
+        dp_shard_axis=0,
+        dp_local_start=2,
+        dp_local_end=5,
+    )
+    resliced = matrix_shard_spec_with_dp_axis(
+        spec,
+        dp_shard_axis=0,
+        dp_local_start=6,
+        dp_local_end=8,
+    )
+
+    assert resliced.local_shape == (2, 3)
+    assert resliced.pre_dp_local_shape == (8, 3)
+    assert resliced.dp_local_start == 6
+    assert resliced.dp_local_end == 8
+
+
+def test_matrix_shard_spec_rejects_inconsistent_pre_dp_shape():
+    with pytest.raises(ValueError, match="cannot have more rows"):
+        MatrixShardSpec(
+            logical_shape=(8, 3),
+            local_shape=(9, 3),
+            tp_layout="none",
+            dp_shard_axis=0,
+            pre_dp_local_shape=(8, 3),
+        )
+
+
+def test_matrix_shard_spec_direct_constructor_rejects_partial_dp_range():
+    with pytest.raises(ValueError, match="must be set together"):
+        MatrixShardSpec(
+            logical_shape=(8, 3),
+            local_shape=(2, 3),
+            tp_layout="none",
+            dp_shard_axis=0,
+            dp_local_start=2,
+        )
+
+
+def test_matrix_shard_spec_direct_constructor_rejects_row_range_shape_mismatch():
+    with pytest.raises(ValueError, match="row count must match"):
+        MatrixShardSpec(
+            logical_shape=(8, 3),
+            local_shape=(3, 3),
+            tp_layout="none",
+            dp_shard_axis=0,
+            dp_local_start=2,
+            dp_local_end=4,
+            pre_dp_local_shape=(8, 3),
+        )
+
+
+def test_matrix_shard_spec_direct_constructor_allows_dp_local_shape_without_pre_dp_shape():
+    spec = MatrixShardSpec(
+        logical_shape=(8, 3),
+        local_shape=(2, 3),
+        tp_layout="none",
+        dp_shard_axis=0,
+        dp_local_start=6,
+        dp_local_end=8,
+    )
+
+    assert spec.local_shape == (2, 3)
+    assert spec.pre_dp_local_shape is None
+    assert spec.dp_local_start == 6
+    assert spec.dp_local_end == 8
+
+
+def test_matrix_shard_spec_dp_empty_row_range_is_valid():
+    param = _param_with_info(tp_layout="none", shape=(8, 3), logical_shape=(8, 3))
+    spec = matrix_shard_spec_with_dp_axis(
+        get_matrix_shard_spec(param),
+        dp_shard_axis=0,
+        dp_local_start=4,
+        dp_local_end=4,
+    )
+
+    assert spec.local_shape == (0, 3)
+    assert spec.pre_dp_local_shape == (8, 3)
+    assert spec.dp_local_start == 4
+    assert spec.dp_local_end == 4
+    assert spec.small_gram_side == "right"
+
+
+def test_matrix_shard_spec_dp_row_range_requires_complete_range():
+    param = _param_with_info(tp_layout="none", shape=(8, 3), logical_shape=(8, 3))
+
+    with pytest.raises(ValueError, match="provided together"):
+        matrix_shard_spec_with_dp_axis(
+            get_matrix_shard_spec(param),
+            dp_shard_axis=0,
+            dp_local_start=2,
+        )
+
+
+def test_matrix_shard_spec_dp_row_range_rejects_out_of_bounds_range():
+    param = _param_with_info(tp_layout="none", shape=(8, 3), logical_shape=(8, 3))
+
+    with pytest.raises(ValueError, match="exceeds the pre-DP local matrix shape"):
+        matrix_shard_spec_with_dp_axis(
+            get_matrix_shard_spec(param),
+            dp_shard_axis=0,
+            dp_local_start=7,
+            dp_local_end=9,
+        )
+
+
+def test_layerwise_buffer_routing_marks_matrix_optimizer_owned_params():
+    module = torch.nn.Module()
+    module.weight = _param_with_info()
+    module.bias = torch.nn.Parameter(torch.empty(4))
+
+    tag_params_for_buffer_routing(
+        [module],
+        optimizer_type="adam",
+        matrix_optimizer_type="muon",
+        matrix_min_dim=2,
+        requires_layerwise_layout=True,
+    )
+
+    weight_info = get_matrix_optimizer_info(module.weight)
+    bias_info = get_matrix_optimizer_info(module.bias)
+    assert weight_info.owner == MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION
+    assert weight_info.update_family == "muon"
+    assert weight_info.requires_layerwise_layout
+    assert module.weight.is_managed_by_layer_wise_optimizer
+    assert bias_info.owner == MATRIX_OPTIMIZER_OWNER_FALLBACK
+    assert not module.bias.is_managed_by_layer_wise_optimizer
 
 
 def test_fp8_dequant_source_fails_closed_in_native_collector():
@@ -577,6 +805,42 @@ def test_matrix_function_optimizer_uses_inplace_update_rule_when_available():
     assert calls == [1]
 
 
+def test_matrix_inplace_update_rule_uses_two_sided_diag_sgd():
+    from types import SimpleNamespace
+
+    import megatron.core.optimizer.matrix_optimizer as matrix_optimizer_module
+
+    if not matrix_optimizer_module.HAVE_EMERGING_MATRIX_OPTIMIZERS:
+        pytest.skip("emerging_optimizers is not installed")
+
+    param = _param_with_info()
+    param.data.fill_(1.0)
+    grad = torch.tensor(
+        [[2.0, 4.0, 6.0], [1.0, 2.0, 3.0], [0.5, 1.0, 1.5], [3.0, 6.0, 9.0]]
+    )
+    feature_gram = torch.tensor([1.0, 3.0, 5.0])
+    grad_gram = torch.tensor([1.0, 4.0, 9.0, 16.0])
+    config = OptimizerConfig(
+        matrix_optimizer="sgd",
+        matrix_input_preconditioner="feature_gram",
+        matrix_input_preconditioner_approximation="diag",
+        matrix_input_preconditioner_ridge=0.5,
+        matrix_output_preconditioner="grad_gram",
+        matrix_output_preconditioner_approximation="diag",
+        matrix_output_preconditioner_ridge=1.0,
+    )
+    rule = matrix_optimizer_module._make_matrix_inplace_update_rule(
+        config, SimpleNamespace(tp=None)
+    )
+
+    with torch.no_grad():
+        assert rule(param, grad, feature_gram, grad_gram, param, 0.1, 0.2, True)
+
+    expected_direction = grad / (grad_gram + 1.0)[:, None] / (feature_gram + 0.5)
+    expected = torch.ones_like(param) * 0.98 - 0.1 * expected_direction
+    torch.testing.assert_close(param, expected)
+
+
 def test_matrix_inplace_update_rule_uses_diag_muon_for_local_matrix(monkeypatch):
     from types import SimpleNamespace
 
@@ -631,7 +895,9 @@ def test_matrix_inplace_update_rule_uses_diag_muon_for_local_matrix(monkeypatch)
 def test_row_parallel_nonexact_feature_scope_gets_approximation_label():
     param = _param_with_info(tp_layout="row_parallel")
     recipe = _recipe(approximation=MatrixPreconditionerApproximation.DIAG)
-    recipe.scope = input_preconditioner_scope_for(recipe.approximation, "row_parallel")
+    recipe.scope = input_preconditioner_scope_for(
+        recipe.approximation, "row_parallel", is_feature_axis_sharded=True
+    )
     configure_matrix_update_param(param, recipe=recipe)
 
     plan = default_matrix_apply_plan(
@@ -645,7 +911,9 @@ def test_row_parallel_nonexact_feature_scope_gets_approximation_label():
 def test_column_parallel_nonexact_grad_scope_gets_approximation_label():
     param = _param_with_info(tp_layout="column_parallel")
     recipe = _output_recipe(approximation=MatrixPreconditionerApproximation.DIAG)
-    recipe.scope = output_preconditioner_scope_for(recipe.approximation, "column_parallel")
+    recipe.scope = output_preconditioner_scope_for(
+        recipe.approximation, "column_parallel", is_output_axis_sharded=True
+    )
     configure_matrix_update_param(param, output_recipe=recipe)
 
     plan = default_matrix_apply_plan(
@@ -688,6 +956,26 @@ def test_grad_gram_finalization_requires_explicit_process_groups():
 
     with pytest.raises(RuntimeError, match="explicit process_groups"):
         finalize_grad_gram_buffers([param])
+
+
+def test_feature_gram_finalization_skips_cached_finalized_buffer_without_groups():
+    param = _param_with_info()
+    configure_matrix_update_param(param, recipe=_recipe())
+    maybe_accumulate_feature_gram(param, torch.ones(2, 3))
+    set_feature_gram_finalization_required([param], required=True)
+    param._feature_gram_finalized = True
+
+    finalize_feature_gram_buffers([param])
+
+
+def test_grad_gram_finalization_skips_cached_finalized_buffer_without_groups():
+    param = _param_with_info()
+    configure_matrix_update_param(param, output_recipe=_output_recipe())
+    maybe_accumulate_grad_gram(param, torch.ones(2, 4))
+    set_grad_gram_finalization_required([param], required=True)
+    param._grad_gram_finalized = True
+
+    finalize_grad_gram_buffers([param])
 
 
 def test_optimizer_config_rejects_standard_distopt_with_matrix_optimizer():
@@ -766,6 +1054,49 @@ def test_optimizer_config_exposes_muon_ns_coefficients():
     assert config.muon_ns_coefficients == "simple"
 
 
+def test_matrix_update_family_rejects_optimizer_variants():
+    assert matrix_update_family_from_optimizer_name(None) == "none"
+    assert matrix_update_family_from_optimizer_name("sgd") == "sgd"
+    assert matrix_update_family_from_optimizer_name("muon") == "muon"
+
+    with pytest.raises(ValueError, match="stable matrix update_family"):
+        matrix_update_family_from_optimizer_name("adaptive_muon")
+
+    with pytest.raises(ValueError, match="stable matrix update_family"):
+        matrix_update_family_from_optimizer_name("newton_muon")
+
+
+def test_matrix_optimizer_info_owner_family_invariants():
+    param = torch.nn.Parameter(torch.empty(2, 2))
+
+    set_matrix_optimizer_info(
+        param,
+        owner=MATRIX_OPTIMIZER_OWNER_MUON,
+        update_family="muon",
+    )
+
+    with pytest.raises(ValueError, match="owner 'muon' requires update_family='muon'"):
+        set_matrix_optimizer_info(
+            param,
+            owner=MATRIX_OPTIMIZER_OWNER_MUON,
+            update_family="sgd",
+        )
+
+    with pytest.raises(ValueError, match="owner 'fallback' requires update_family='none'"):
+        set_matrix_optimizer_info(
+            param,
+            owner=MATRIX_OPTIMIZER_OWNER_FALLBACK,
+            update_family="muon",
+        )
+
+    with pytest.raises(ValueError, match="owner 'matrix_function' requires an active"):
+        set_matrix_optimizer_info(
+            param,
+            owner=MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
+            update_family="none",
+        )
+
+
 def test_configure_model_matrix_updates_rejects_native_fp8_dequant_source():
     module = torch.nn.Module()
     module.weight = _param_with_info()
@@ -779,14 +1110,16 @@ def test_configure_model_matrix_updates_rejects_native_fp8_dequant_source():
 
 def test_configure_model_matrix_updates_rejects_row_parallel_full_gram():
     module = torch.nn.Module()
-    module.weight = _param_with_info(tp_layout="row_parallel")
+    module.weight = _param_with_info(
+        tp_layout="row_parallel", shape=(4, 2), logical_shape=(4, 4)
+    )
     config = OptimizerConfig(matrix_optimizer="muon", matrix_input_preconditioner="feature_gram", matrix_input_preconditioner_approximation="full")
 
     with pytest.raises(RuntimeError, match="row-parallel"):
         configure_model_matrix_updates([module], config)
 
 
-def test_configure_model_matrix_updates_rejects_column_parallel_full_grad_gram():
+def test_configure_model_matrix_updates_allows_unsharded_column_parallel_full_grad_gram():
     module = torch.nn.Module()
     module.weight = _param_with_info(tp_layout="column_parallel")
     config = OptimizerConfig(
@@ -795,8 +1128,40 @@ def test_configure_model_matrix_updates_rejects_column_parallel_full_grad_gram()
         matrix_output_preconditioner_approximation="full",
     )
 
+    configure_model_matrix_updates([module], config)
+
+
+def test_configure_model_matrix_updates_rejects_sharded_column_parallel_full_grad_gram():
+    module = torch.nn.Module()
+    module.weight = _param_with_info(
+        tp_layout="column_parallel", shape=(2, 3), logical_shape=(4, 3)
+    )
+    config = OptimizerConfig(
+        matrix_optimizer="muon",
+        matrix_output_preconditioner="grad_gram",
+        matrix_output_preconditioner_approximation="full",
+    )
+
     with pytest.raises(RuntimeError, match="column-parallel"):
         configure_model_matrix_updates([module], config)
+
+
+def test_configure_matrix_update_rejects_padded_block_diag_grad_gram_without_ridge():
+    param = _param_with_info(shape=(3, 2), logical_shape=(3, 2))
+    recipe = _output_recipe(approximation=MatrixPreconditionerApproximation.BLOCK_DIAG)
+    recipe.block_size = 2
+
+    with pytest.raises(ValueError, match="non-divisible output dimension"):
+        configure_matrix_update_param(param, output_recipe=recipe)
+
+
+def test_configure_matrix_update_accepts_padded_block_diag_grad_gram_with_ridge():
+    param = _param_with_info(shape=(3, 2), logical_shape=(3, 2))
+    recipe = _output_recipe(approximation=MatrixPreconditionerApproximation.BLOCK_DIAG)
+    recipe.block_size = 2
+    recipe.ridge = 1e-6
+
+    configure_matrix_update_param(param, output_recipe=recipe)
 
 
 def test_configure_model_matrix_updates_rejects_grouped_expert_weights():
