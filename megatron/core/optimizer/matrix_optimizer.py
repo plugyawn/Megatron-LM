@@ -43,14 +43,10 @@ try:
         apply_diag_newton_muon_update_,
         apply_diag_left_preconditioned_update_,
         apply_diag_right_preconditioned_update_,
+        apply_diag_two_sided_preconditioned_update_,
         factorize_feature_gram,
         newton_schulz_orthogonalize,
         right_precondition_with_factorized_feature_gram,
-    )
-    from emerging_optimizers.triton_kernels.feature_gram import (
-        apply_matrix_update_kernel_,
-        diag_left_precondition_matrix,
-        diag_right_precondition_matrix,
     )
     from emerging_optimizers.utils import fp32_matmul_precision
 
@@ -233,23 +229,14 @@ def _make_matrix_inplace_update_rule(
             return False
         if config.matrix_optimizer == "sgd":
             if input_requested and output_requested:
-                direction = diag_left_precondition_matrix(
+                apply_diag_two_sided_preconditioned_update_(
+                    param,
                     grad,
                     grad_gram,
-                    param=param,
-                    ridge=config.matrix_output_preconditioner_ridge,
-                    weight_decay=weight_decay,
-                    decoupled_weight_decay=decoupled_weight_decay,
-                )
-                direction = diag_right_precondition_matrix(
-                    direction,
                     feature_gram,
-                    ridge=config.matrix_input_preconditioner_ridge,
-                )
-                apply_matrix_update_kernel_(
-                    param,
-                    direction,
                     lr=lr,
+                    ridge_left=config.matrix_output_preconditioner_ridge,
+                    ridge_right=config.matrix_input_preconditioner_ridge,
                     update_scale=1.0,
                     weight_decay=weight_decay,
                     decoupled_weight_decay=decoupled_weight_decay,
