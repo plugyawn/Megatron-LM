@@ -14,7 +14,7 @@ from megatron.core.optimizer.matrix_function_optimizer import (
 )
 from megatron.core.optimizer.optimizer import ChainedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import tag_params_for_buffer_routing
-from megatron.core.optimizer.matrix_update import (
+from megatron.core.matrix_update import (
     MATRIX_OPTIMIZER_OWNER_FALLBACK,
     MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
     MATRIX_OPTIMIZER_OWNER_MUON,
@@ -716,6 +716,70 @@ def test_matrix_function_muon_metadata_counts_as_muon_managed_for_scaling():
     assert is_muon_managed_matrix_parameter(param, optimizer_type="muon")
 
 
+def test_matrix_function_optimizer_materializes_momentum_buffer_for_muon_rule():
+    param = torch.nn.Parameter(torch.ones(2, 3))
+    param.grad = torch.ones_like(param)
+    optimizer = MatrixFunctionOptimizer(
+        [param],
+        lr=0.1,
+        update_rule=lambda grad, feature_gram, grad_gram, model_param: -grad,
+        momentum=0.9,
+    )
+
+    optimizer.step()
+
+    assert "momentum_buffer" in optimizer.state[param]
+    torch.testing.assert_close(optimizer.state[param]["momentum_buffer"], torch.ones_like(param))
+
+
+def test_matrix_function_optimizer_state_uses_model_param_shard_spec():
+    model_param = _param_with_info(shape=(2, 3))
+    register_matrix_optimizer_param(
+        model_param,
+        owner=MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
+        update_family="muon",
+        requires_layerwise_layout=True,
+    )
+    main_param = torch.nn.Parameter(torch.ones_like(model_param))
+    main_param._matrix_update_model_param = model_param
+    main_param.grad = torch.ones_like(main_param)
+    optimizer = MatrixFunctionOptimizer(
+        [main_param],
+        lr=0.1,
+        update_rule=lambda grad, feature_gram, grad_gram, model_param: -grad,
+        momentum=0.9,
+    )
+
+    optimizer.step()
+
+    assert get_matrix_shard_spec(optimizer.state[main_param]["momentum_buffer"]) == (
+        get_matrix_shard_spec(model_param)
+    )
+
+    reloaded = MatrixFunctionOptimizer(
+        [main_param],
+        lr=0.1,
+        update_rule=lambda grad, feature_gram, grad_gram, model_param: -grad,
+        momentum=0.9,
+    )
+    reloaded.load_state_dict(optimizer.state_dict())
+
+    assert get_matrix_shard_spec(reloaded.state[main_param]["momentum_buffer"]) == (
+        get_matrix_shard_spec(model_param)
+    )
+
+
+def test_muon_managed_matrix_role_rejects_substring_optimizer_variants():
+    from megatron.core.parameterization.roles import is_muon_managed_matrix_parameter
+
+    param = torch.nn.Parameter(torch.empty(6, 4))
+
+    assert is_muon_managed_matrix_parameter(param, optimizer_type="muon")
+    assert is_muon_managed_matrix_parameter(param, optimizer_type="dist_muon")
+    assert not is_muon_managed_matrix_parameter(param, optimizer_type="adaptive_muon")
+    assert not is_muon_managed_matrix_parameter(param, optimizer_type="newton_muon")
+
+
 def test_matrix_optimizer_split_routes_fallback_to_standard_distopt(monkeypatch):
     import copy
     import types
@@ -890,6 +954,155 @@ def test_chained_optimizer_uses_explicit_chain_config_without_mutating_child_con
     assert first.config is top_config
     assert second.config is child_config
     assert second.config.matrix_optimizer == "none"
+
+
+def test_matrix_optimizer_megatron_fsdp_splits_child_optimizers_by_owner(monkeypatch):
+    import types
+
+    import megatron.core.optimizer.matrix_optimizer as matrix_optimizer_module
+
+    owner_a = object()
+    owner_b = object()
+    matrix_a = torch.nn.Parameter(torch.ones(2, 2))
+    matrix_b = torch.nn.Parameter(torch.ones(2, 2))
+    fallback_a = torch.nn.Parameter(torch.ones(2))
+    fallback_b = torch.nn.Parameter(torch.ones(2))
+    matrix_a._megatron_fsdp_model = owner_a
+    fallback_a._megatron_fsdp_model = owner_a
+    matrix_b._megatron_fsdp_model = owner_b
+    fallback_b._megatron_fsdp_model = owner_b
+
+    class DummyFSDPChunk:
+        ddp_config = types.SimpleNamespace(use_megatron_fsdp=True)
+
+        def __init__(self, matrix_param, fallback_param):
+            self.matrix_param = matrix_param
+            self.fallback_param = fallback_param
+
+        def parameters(self):
+            return [self.matrix_param, self.fallback_param]
+
+        def named_parameters(self):
+            return [("matrix", self.matrix_param), ("fallback", self.fallback_param)]
+
+    class FakeMatrixFunctionOptimizer:
+        def __init__(self, param_groups, **kwargs):
+            self.param_groups = param_groups
+            self.config = None
+            self.state = {}
+
+        def step(self, *args, **kwargs):
+            return None
+
+        def zero_grad(self, *args, **kwargs):
+            return None
+
+    class FakeTorchOptimizer:
+        def __init__(self, param_groups, config):
+            self.param_groups = param_groups
+            self.config = config
+            self.state = {}
+
+        def step(self, *args, **kwargs):
+            return None
+
+        def zero_grad(self, *args, **kwargs):
+            return None
+
+    class FakeMegatronFSDPOptimizer:
+        def __init__(self, optimizer, config, pg_collection):
+            self.optimizer = optimizer
+            self.config = config
+            self.pg_collection = pg_collection
+
+    class FakeChainedOptimizer:
+        def __init__(self, chained_optimizers):
+            self.chained_optimizers = chained_optimizers
+
+    def fake_get_param_groups(model_chunks, config, config_overrides=None, param_filter=None):
+        params = [
+            param
+            for model_chunk in model_chunks
+            for name, param in model_chunk.named_parameters()
+            if param_filter is None or param_filter(name, param)
+        ]
+        return [{"params": params}]
+
+    def fake_fully_shard_optimizer(optimizer):
+        optimizer.fully_sharded = True
+        return optimizer
+
+    def fake_fallback_optimizer(**kwargs):
+        return FakeTorchOptimizer(kwargs["param_groups"], kwargs["config"]), None
+
+    monkeypatch.setattr(matrix_optimizer_module, "HAVE_EMERGING_MATRIX_OPTIMIZERS", True)
+    monkeypatch.setattr(
+        matrix_optimizer_module,
+        "_configured_fsdp_matrix_params",
+        lambda model_chunks, config: [matrix_a, matrix_b],
+    )
+    monkeypatch.setattr(matrix_optimizer_module, "get_pg_size", lambda group: 1)
+    monkeypatch.setattr(matrix_optimizer_module, "_get_param_groups", fake_get_param_groups)
+    monkeypatch.setattr(
+        matrix_optimizer_module,
+        "_make_matrix_update_rule",
+        lambda config, pg_collection: object(),
+    )
+    monkeypatch.setattr(
+        matrix_optimizer_module,
+        "MatrixFunctionOptimizer",
+        FakeMatrixFunctionOptimizer,
+    )
+    monkeypatch.setattr(
+        matrix_optimizer_module,
+        "megatron_fsdp_fully_shard_optimizer",
+        fake_fully_shard_optimizer,
+    )
+    monkeypatch.setattr(
+        matrix_optimizer_module,
+        "MegatronFSDPOptimizer",
+        FakeMegatronFSDPOptimizer,
+    )
+    monkeypatch.setattr(matrix_optimizer_module, "ChainedOptimizer", FakeChainedOptimizer)
+    monkeypatch.setattr(
+        matrix_optimizer_module,
+        "_get_megatron_optimizer_based_on_param_groups",
+        fake_fallback_optimizer,
+    )
+
+    config = OptimizerConfig(
+        optimizer="adam",
+        lr=1e-3,
+        matrix_optimizer="muon",
+        use_distributed_optimizer=True,
+        use_megatron_fsdp=True,
+    )
+    pg_collection = types.SimpleNamespace(dp_cp=object())
+
+    optimizer = matrix_optimizer_module.get_megatron_matrix_optimizer(
+        config,
+        [DummyFSDPChunk(matrix_a, fallback_a), DummyFSDPChunk(matrix_b, fallback_b)],
+        pg_collection=pg_collection,
+    )
+
+    assert isinstance(optimizer, FakeChainedOptimizer)
+    assert len(optimizer.chained_optimizers) == 2
+    child_param_groups = [child.optimizer.param_groups for child in optimizer.chained_optimizers]
+    assert child_param_groups == [
+        [{"params": [matrix_a]}, {"params": [fallback_a]}],
+        [{"params": [matrix_b]}, {"params": [fallback_b]}],
+    ]
+    child_algorithm_groups = [
+        [child_optimizer.param_groups for child_optimizer in child.optimizer.optimizers]
+        for child in optimizer.chained_optimizers
+    ]
+    assert child_algorithm_groups == [
+        [[{"params": [matrix_a]}], [{"params": [fallback_a]}]],
+        [[{"params": [matrix_b]}], [{"params": [fallback_b]}]],
+    ]
+    assert all(child.optimizer.fully_sharded for child in optimizer.chained_optimizers)
+    assert optimizer.chained_optimizers[0].config is config
+    assert optimizer.chained_optimizers[0].optimizer.optimizers[1].config.matrix_optimizer == "none"
 
 
 def test_matrix_optimizer_split_rejects_expert_parallel_fallback(monkeypatch):
@@ -1203,7 +1416,7 @@ def test_matrix_function_optimizer_does_not_refinalize_cached_grams(monkeypatch)
         [param],
         lr=0.1,
         update_rule=update_rule,
-        feature_gram_process_groups=(process_group,),
+        gram_process_groups=(process_group,),
     )
     x0 = torch.tensor([[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]])
     dy0 = torch.tensor([[1.0, 0.0, 0.0, 0.0], [0.0, 2.0, 0.0, 0.0]])
@@ -1447,6 +1660,14 @@ def test_matrix_update_rule_supports_two_sided_diag_muon_preconditioning(monkeyp
     ).unsqueeze(0)
     expected = -preconditioned * ((grad.size(0) / grad.size(1)) ** 0.5)
     torch.testing.assert_close(rule(grad, feature_gram, grad_gram, param), expected)
+
+
+def test_matrix_muon_scale_mode_none_matches_eo_contract():
+    import megatron.core.optimizer.matrix_optimizer as matrix_optimizer_module
+
+    config = OptimizerConfig(matrix_optimizer="muon", muon_scale_mode="none")
+
+    assert matrix_optimizer_module._muon_scale_factor(8, 3, config) == pytest.approx(1.0)
 
 
 def test_matrix_inplace_update_rule_routes_output_only_diag_sgd_to_left_kernel(monkeypatch):
@@ -1759,6 +1980,70 @@ def test_matrix_update_rule_uses_fsdp_small_gram_and_logical_scale(monkeypatch):
     assert seen_config is config
 
 
+@pytest.mark.parametrize(
+    ("tp_mode", "expected_scale"),
+    [
+        ("allgather", (4 / 2) ** 0.5),
+        ("small_gram_ns", (4 / 2) ** 0.5),
+        ("block_local", 1.0),
+    ],
+)
+def test_matrix_update_rule_uses_logical_scale_for_exact_tp_muon(monkeypatch, tp_mode, expected_scale):
+    import contextlib
+    from types import SimpleNamespace
+
+    import megatron.core.optimizer.matrix_optimizer as matrix_optimizer_module
+
+    param = _param_with_info(tp_layout="column_parallel", shape=(2, 2), logical_shape=(4, 2))
+    register_matrix_optimizer_param(
+        param,
+        owner=MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
+        update_family="muon",
+        requires_layerwise_layout=True,
+    )
+    update_matrix_shard_spec(param, _spec_from_info(param))
+    grad = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+    config = OptimizerConfig(
+        matrix_optimizer="muon",
+        matrix_tp_update_mode=tp_mode,
+        muon_scale_mode="unit_rms_norm",
+        muon_extra_scale_factor=1.0,
+    )
+
+    def fake_update(matrix, *args, **kwargs):
+        return matrix + 1.0
+
+    monkeypatch.setattr(
+        matrix_optimizer_module,
+        "tp_allgather_logical_matrix_update",
+        fake_update,
+    )
+    monkeypatch.setattr(
+        matrix_optimizer_module,
+        "tp_small_gram_newton_schulz_allreduce",
+        fake_update,
+    )
+    monkeypatch.setattr(
+        matrix_optimizer_module,
+        "tp_block_local_approx",
+        fake_update,
+    )
+    monkeypatch.setattr(
+        matrix_optimizer_module,
+        "fp32_matmul_precision",
+        lambda precision: contextlib.nullcontext(),
+        raising=False,
+    )
+    rule = matrix_optimizer_module._make_matrix_update_rule(
+        config,
+        SimpleNamespace(tp=None, dp_cp=None),
+    )
+
+    update = rule(grad, None, None, param)
+
+    torch.testing.assert_close(update, -(grad + 1.0) * expected_scale)
+
+
 def test_matrix_function_optimizer_state_dict_does_not_serialize_update_rule():
     param = _param_with_info()
 
@@ -2005,7 +2290,7 @@ def test_row_parallel_nonexact_feature_scope_gets_approximation_label():
     )
 
     assert plan.requires_full_logical_gradient
-    assert plan.approximation_label == "tp_local_block_diag_feature_gram"
+    assert plan.approximation_label == "tp_local_feature_gram"
 
 
 def test_column_parallel_nonexact_grad_scope_gets_approximation_label():
@@ -2021,7 +2306,7 @@ def test_column_parallel_nonexact_grad_scope_gets_approximation_label():
     )
 
     assert plan.requires_full_logical_gradient
-    assert plan.approximation_label == "tp_local_block_diag_grad_gram"
+    assert plan.approximation_label == "tp_local_grad_gram"
 
 
 def test_matrix_function_optimizer_fails_when_grad_has_no_feature_rows():
@@ -2216,6 +2501,10 @@ def test_configure_model_matrix_updates_rejects_native_fp8_dequant_source():
 
     with pytest.raises(RuntimeError, match="native linears cannot dequantize FP8"):
         configure_model_matrix_updates([module], config)
+
+    assert get_matrix_optimizer_info(module.weight) is None
+    assert get_matrix_shard_spec(module.weight) is None
+    assert not getattr(module.weight, "is_managed_by_layer_wise_optimizer", False)
 
 
 def test_configure_model_matrix_updates_rejects_row_parallel_full_gram():

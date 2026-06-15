@@ -356,6 +356,10 @@ def test_public_matrix_optimizer_builder_steps_megatron_fsdp_dtensor_shard(
     after_local = matrix_param.to_local().detach()
     assert update_successful
     assert torch.linalg.vector_norm(after_local - before_local) > 0
+    fsdp_optimizer = optimizer.chained_optimizers[0]
+    state = fsdp_optimizer.optimizer.state[matrix_param]
+    assert isinstance(state["momentum_buffer"], DTensor)
+    assert get_matrix_shard_spec(state["momentum_buffer"]) == get_matrix_shard_spec(matrix_param)
     dist.barrier()
 
 
@@ -439,16 +443,14 @@ def test_public_matrix_optimizer_builder_routes_fsdp_fallback_param(
     assert torch.linalg.vector_norm(fallback_after - fallback_before) > 0
 
     state_dict = optimizer.state_dict()
-    assert isinstance(state_dict, list)
-    assert len(state_dict) == 2
-    matrix_state_dict, fallback_state_dict = state_dict
-    metadata = matrix_state_dict[MATRIX_OPTIMIZER_STATE_METADATA_KEY]["params"]["0"]
+    assert isinstance(state_dict, dict)
+    metadata = state_dict[MATRIX_OPTIMIZER_STATE_METADATA_KEY]["params"]["0"]
     assert metadata["owner"] == "matrix_function"
     assert metadata["update_family"] == "muon"
     assert metadata["matrix_shard_contract"]["small_gram_side"] == "right"
-    assert matrix_state_dict["matrix_step"] == 1
-    assert len(fallback_state_dict["state"]) == 1
-    saved_fallback_state = next(iter(fallback_state_dict["state"].values()))
+    assert state_dict["matrix_step"] == 1
+    assert len(state_dict["state"]) == 1
+    saved_fallback_state = next(iter(state_dict["state"].values()))
     saved_momentum = _state_tensor_to_local(saved_fallback_state["momentum_buffer"]).detach().clone()
 
     reloaded_optimizer = get_megatron_matrix_optimizer(
@@ -459,13 +461,11 @@ def test_public_matrix_optimizer_builder_routes_fsdp_fallback_param(
     )
     reloaded_optimizer.load_state_dict(state_dict)
     reloaded_state_dict = reloaded_optimizer.state_dict()
-    reloaded_matrix_state_dict, reloaded_fallback_state_dict = reloaded_state_dict
-    assert reloaded_matrix_state_dict["matrix_step"] == matrix_state_dict["matrix_step"]
-    reloaded_metadata = reloaded_matrix_state_dict[MATRIX_OPTIMIZER_STATE_METADATA_KEY][
-        "params"
-    ]["0"]
+    assert isinstance(reloaded_state_dict, dict)
+    assert reloaded_state_dict["matrix_step"] == state_dict["matrix_step"]
+    reloaded_metadata = reloaded_state_dict[MATRIX_OPTIMIZER_STATE_METADATA_KEY]["params"]["0"]
     assert reloaded_metadata["matrix_shard_contract"] == metadata["matrix_shard_contract"]
-    reloaded_fallback_state = next(iter(reloaded_fallback_state_dict["state"].values()))
+    reloaded_fallback_state = next(iter(reloaded_state_dict["state"].values()))
     reloaded_momentum = _state_tensor_to_local(reloaded_fallback_state["momentum_buffer"])
     torch.testing.assert_close(reloaded_momentum, saved_momentum)
     dist.barrier()

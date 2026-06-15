@@ -593,6 +593,10 @@ class OptimizerConfig:
             )
         if self.muon_fp32_matmul_prec not in ("highest", "high", "medium"):
             raise ValueError("muon_fp32_matmul_prec must be one of: highest, high, medium")
+        if self.muon_momentum < 0.0:
+            raise ValueError("muon_momentum must be non-negative")
+        if self.muon_nesterov and self.muon_momentum == 0.0:
+            raise ValueError("muon_nesterov requires nonzero muon_momentum")
         if self.muon_ns_coefficients not in (
             "simple",
             "quintic",
@@ -658,8 +662,14 @@ class OptimizerConfig:
                     "matrix_output_preconditioner-specific options require "
                     "matrix_output_preconditioner=grad_gram"
                 )
-        if self.matrix_optimizer != "none" and "muon" in self.optimizer:
-            raise ValueError("matrix_optimizer cannot be combined with optimizer=muon/dist_muon.")
+        if self.matrix_optimizer != "none" and self.optimizer in (
+            "muon",
+            "dist_muon",
+            "adaptive_muon",
+        ):
+            raise ValueError(
+                "matrix_optimizer cannot be combined with optimizer=muon/dist_muon/adaptive_muon."
+            )
         if (
             self.matrix_optimizer != "none"
             and self.use_distributed_optimizer

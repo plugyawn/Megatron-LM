@@ -467,6 +467,11 @@ def _matrix_state_tensor_matches_param_shape(state_value: torch.Tensor, param: D
     param_local_shape = (
         tuple(param._local_tensor.shape) if hasattr(param, "_local_tensor") else None
     )
+    if isinstance(state_value, DTensor):
+        state_local_shape = (
+            tuple(state_value._local_tensor.shape) if hasattr(state_value, "_local_tensor") else None
+        )
+        return state_shape == param_global_shape and state_local_shape == param_local_shape
     return state_shape == param_global_shape or state_shape == param_local_shape
 
 
@@ -737,8 +742,6 @@ def _validate_matrix_optimizer_checkpoint_metadata(
                     )
             same_shape_state_names = _matrix_state_names_sharded_like_param(loaded_state, param)
             if metadata is None or param_idx not in metadata:
-                if not same_shape_state_names:
-                    continue
                 raise RuntimeError(
                     "[MegatronFSDP] Matrix optimizer checkpoint is missing matrix-shard "
                     f"metadata for optimizer state index {param_idx}."
@@ -813,24 +816,28 @@ def _validate_matrix_optimizer_checkpoint_metadata(
                     f"checkpoint={param_metadata.get('same_shard_state_layout')!r}, "
                     f"current={MATRIX_OPTIMIZER_SAME_SHARD_STATE_LAYOUT!r}."
                 )
+            if "declared_same_shard_state_names" not in param_metadata:
+                raise RuntimeError(
+                    "[MegatronFSDP] Matrix optimizer checkpoint metadata is missing "
+                    f"declared_same_shard_state_names for optimizer state index {param_idx}."
+                )
             declared_state_names = param_metadata.get("declared_same_shard_state_names")
-            if declared_state_names is not None:
-                if not isinstance(declared_state_names, list) or not all(
-                    isinstance(state_name, str) for state_name in declared_state_names
-                ):
-                    raise RuntimeError(
-                        "[MegatronFSDP] Matrix optimizer checkpoint metadata field "
-                        f"declared_same_shard_state_names for optimizer state index {param_idx} "
-                        "must be a list of strings."
-                    )
-                expected_declared_state_names = _matrix_declared_same_shard_state_names(param)
-                if sorted(declared_state_names) != expected_declared_state_names:
-                    raise RuntimeError(
-                        "[MegatronFSDP] Matrix optimizer checkpoint declared state contract "
-                        f"does not match current optimizer state contract for optimizer state "
-                        f"index {param_idx}: checkpoint={sorted(declared_state_names)}, "
-                        f"expected={expected_declared_state_names}."
-                    )
+            if not isinstance(declared_state_names, list) or not all(
+                isinstance(state_name, str) for state_name in declared_state_names
+            ):
+                raise RuntimeError(
+                    "[MegatronFSDP] Matrix optimizer checkpoint metadata field "
+                    f"declared_same_shard_state_names for optimizer state index {param_idx} "
+                    "must be a list of strings."
+                )
+            expected_declared_state_names = _matrix_declared_same_shard_state_names(param)
+            if sorted(declared_state_names) != expected_declared_state_names:
+                raise RuntimeError(
+                    "[MegatronFSDP] Matrix optimizer checkpoint declared state contract "
+                    f"does not match current optimizer state contract for optimizer state "
+                    f"index {param_idx}: checkpoint={sorted(declared_state_names)}, "
+                    f"expected={expected_declared_state_names}."
+                )
             metadata_state_names = param_metadata.get("same_shard_state_names")
             if not isinstance(metadata_state_names, list):
                 raise RuntimeError(
@@ -1309,6 +1316,16 @@ def fully_shard_optimizer(
             "before initializing the optimizer on the MegatronFSDP model. "
         )
     mfsdp_model = first_mfsdp_param._megatron_fsdp_model
+    for param_group in optimizer.param_groups:
+        for param in param_group.get("params", []):
+            candidate = getattr(param, "_megatron_fsdp_model", None)
+            if candidate is not None and candidate is not mfsdp_model:
+                raise RuntimeError(
+                    "[MegatronFSDP fully_shard_optimizer()] Provided optimizer spans "
+                    "multiple MegatronFSDP owners. Matrix optimizer state/checkpoint "
+                    "routing is only supported for a single MegatronFSDP owner per "
+                    "optimizer until multi-chunk FSDP optimizer routing is implemented."
+                )
 
     # Save a reference to the optimizer.step() and optimizer.zero_grad() methods.
     optimizer_step_base_func = type(optimizer).step
@@ -1326,7 +1343,16 @@ def fully_shard_optimizer(
         _add_matrix_optimizer_checkpoint_metadata(optimizer, mfsdp_model, state_dict)
 
     def validate_matrix_optimizer_load_state_dict(optimizer, state_dict):
-        _validate_matrix_optimizer_checkpoint_metadata(optimizer, mfsdp_model, state_dict)
+        def param_name_fn(param):
+            return _matrix_optimizer_param_checkpoint_identity(param, mfsdp_model)
+
+        _validate_matrix_optimizer_checkpoint_metadata(
+            optimizer,
+            mfsdp_model,
+            _matrix_optimizer_checkpoint_state_dict_for_validation(
+                optimizer, state_dict, param_name_fn
+            ),
+        )
         return state_dict
 
     def restore_matrix_optimizer_loaded_state_metadata(optimizer):

@@ -335,6 +335,19 @@ def validate_depth_mup_optimizer_support(args) -> None:
         )
 
 
+def validate_mup_optimizer_support(args) -> None:
+    """Enforce standard MuP optimizer combinations that need explicit scaling rules."""
+
+    if _resolve_validation_attr(args, 'scaling_recipe') != SCALING_RECIPE_MUP:
+        return
+    if _resolve_validation_attr(args, 'optimizer') == 'adaptive_muon':
+        raise ValueError(
+            "scaling_recipe='mup' does not yet support optimizer='adaptive_muon'. "
+            "Adaptive Muon has second-moment/epsilon scaling semantics that need an "
+            "explicit MuP rule before this combination can be enabled."
+        )
+
+
 def validate_matrix_optimizer_fsdp_support(args) -> None:
     """Enforce the public FSDP support surface for matrix optimizers."""
     if _resolve_validation_attr(args, 'matrix_optimizer') in (None, 'none'):
@@ -360,6 +373,15 @@ def validate_matrix_optimizer_fsdp_support(args) -> None:
             "matrix-optimizer with Megatron-FSDP currently supports no-sidecar "
             "matrix updates only. FEATURE_GRAM and GRAD_GRAM collection under FSDP "
             "need explicit sidecar buffer routing."
+        )
+    if _resolve_validation_attr(args, 'use_megatron_fsdp') and (
+        (_resolve_validation_attr(args, 'num_distributed_optimizer_instances') or 1) > 1
+        or _resolve_validation_attr(args, 'enable_full_sharding_in_hsdp')
+    ):
+        raise ValueError(
+            "matrix-optimizer with Megatron-FSDP does not support hybrid FSDP/HSDP "
+            "yet. MatrixShardSpec records one matrix-axis DP shard range; add an "
+            "explicit HSDP matrix shard contract before enabling this combination."
         )
 
 
@@ -1832,8 +1854,11 @@ def validate_args(args, defaults={}):
         )
 
     if args.matrix_optimizer != 'none':
-        if 'muon' in args.optimizer:
-            raise ValueError("--matrix-optimizer cannot be combined with --optimizer muon/dist_muon.")
+        if args.optimizer in ('muon', 'dist_muon', 'adaptive_muon'):
+            raise ValueError(
+                "--matrix-optimizer cannot be combined with "
+                "--optimizer muon/dist_muon/adaptive_muon."
+            )
         validate_matrix_optimizer_fsdp_support(args)
         if args.use_distributed_optimizer and not args.use_megatron_fsdp:
             raise ValueError(
@@ -2010,6 +2035,7 @@ def validate_args(args, defaults={}):
         assert args.num_experts is not None, "MoE latent projections are applicable only for MoE models."
 
     validate_depth_mup_optimizer_support(args)
+    validate_mup_optimizer_support(args)
     validate_muon_scalar_optimizer_support(args)
     warn_deprecated_mup_aliases(args)
     sync_legacy_mup_fields(args, build_scaling_context(args))

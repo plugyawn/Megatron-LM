@@ -1,7 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import pytest
 import torch
 
-from megatron.core.optimizer.optimizer_config import ParamKey, ParamPredicate
+from megatron.core.optimizer.optimizer_config import OptimizerConfig, ParamKey, ParamPredicate
 
 
 def test_paramkey_matches():
@@ -36,3 +37,11 @@ def test_paramkey_matches():
     #  it has the attribute.
     setattr(p_with_attr, "is_embedding_or_output_parameter", False)
     assert not has_attr.matches(p_with_attr, "interesting.bias")
+
+
+def test_matrix_muon_momentum_config_validation():
+    with pytest.raises(ValueError, match="muon_momentum must be non-negative"):
+        OptimizerConfig(matrix_optimizer="muon", muon_momentum=-0.1)
+
+    with pytest.raises(ValueError, match="muon_nesterov requires nonzero muon_momentum"):
+        OptimizerConfig(matrix_optimizer="muon", muon_momentum=0.0, muon_nesterov=True)

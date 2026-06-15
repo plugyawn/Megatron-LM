@@ -44,7 +44,7 @@ class TrainingScalingPolicy:
 
     @property
     def is_muon_optimizer(self) -> bool:
-        return 'muon' in self.optimizer_type_lower
+        return self.optimizer_type_lower in {'muon', 'dist_muon'}
 
     @property
     def hidden_lr_width_power(self) -> float:

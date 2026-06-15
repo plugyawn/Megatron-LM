@@ -138,7 +138,6 @@ def _resolve_layerwise_matrix_optimizer_info(
             ),
             update_family=update_family,
             requires_layerwise_layout=requires_layerwise_layout and is_matrix_param,
-            ensure_shard_spec=is_matrix_param,
         )
         return
     if not _is_canonical_muon_optimizer_type(optimizer_type):
@@ -152,7 +151,6 @@ def _resolve_layerwise_matrix_optimizer_info(
         owner=MATRIX_OPTIMIZER_OWNER_MUON if is_muon_matrix else MATRIX_OPTIMIZER_OWNER_FALLBACK,
         update_family=update_family,
         requires_layerwise_layout=requires_layerwise_layout and is_muon_matrix,
-        ensure_shard_spec=is_muon_matrix,
     )
 
 

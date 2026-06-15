@@ -45,6 +45,30 @@ def test_matrix_optimizer_megatron_fsdp_sidecar_rejected_until_buffer_routing():
         validate_matrix_optimizer_fsdp_support(args)
 
 
+@pytest.mark.parametrize(
+    "hsdp_kwargs",
+    [
+        {"num_distributed_optimizer_instances": 2},
+        {"enable_full_sharding_in_hsdp": True},
+    ],
+)
+def test_matrix_optimizer_megatron_fsdp_hsdp_rejected_until_matrix_contract(hsdp_kwargs):
+    args_kwargs = dict(
+        matrix_optimizer="muon",
+        matrix_input_preconditioner="none",
+        matrix_output_preconditioner="none",
+        use_megatron_fsdp=True,
+        use_torch_fsdp2=False,
+        num_distributed_optimizer_instances=1,
+        enable_full_sharding_in_hsdp=False,
+    )
+    args_kwargs.update(hsdp_kwargs)
+    args = SimpleNamespace(**args_kwargs)
+
+    with pytest.raises(ValueError, match="hybrid FSDP/HSDP"):
+        validate_matrix_optimizer_fsdp_support(args)
+
+
 def test_matrix_optimizer_megatron_fsdp_preserves_distributed_optimizer_flag():
     args = SimpleNamespace(
         matrix_optimizer="muon",

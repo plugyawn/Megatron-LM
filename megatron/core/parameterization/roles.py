@@ -160,7 +160,7 @@ def is_muon_update_family_matrix_parameter(param: Any, *, optimizer_type: str) -
             getattr(matrix_optimizer_info, 'owner', None) == 'muon'
             or getattr(matrix_optimizer_info, 'update_family', None) == 'muon'
         )
-    if 'muon' not in optimizer_type.lower():
+    if optimizer_type.lower() not in {'muon', 'dist_muon'}:
         return False
     if get_parameterization_role(param) == ROLE_MUON_MANAGED_MATRIX:
         return True

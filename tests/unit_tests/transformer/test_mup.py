@@ -55,6 +55,7 @@ from megatron.core.utils import init_method_normal, mup_scaled_init_method_norma
 from megatron.training.arguments import (
     add_megatron_arguments,
     validate_depth_mup_optimizer_support,
+    validate_mup_optimizer_support,
     validate_muon_scalar_optimizer_support,
 )
 from megatron.training.yaml_arguments import core_config_from_args
@@ -364,6 +365,19 @@ class TestMuPConfigValidation:
         validate_muon_scalar_optimizer_support(SimpleNamespace(muon_scalar_optimizer='adam'))
         validate_muon_scalar_optimizer_support(SimpleNamespace(muon_scalar_optimizer='lion'))
         validate_muon_scalar_optimizer_support(SimpleNamespace())
+
+    def test_mup_rejects_adaptive_muon_until_scaling_rule_exists(self):
+        with pytest.raises(ValueError, match='adaptive_muon'):
+            validate_mup_optimizer_support(
+                SimpleNamespace(scaling_recipe='mup', optimizer='adaptive_muon')
+            )
+
+    def test_mup_optimizer_gate_accepts_supported_or_unrelated_values(self):
+        validate_mup_optimizer_support(SimpleNamespace(scaling_recipe='mup', optimizer='adam'))
+        validate_mup_optimizer_support(SimpleNamespace(scaling_recipe='mup', optimizer='muon'))
+        validate_mup_optimizer_support(
+            SimpleNamespace(scaling_recipe='depth_mup', optimizer='adaptive_muon')
+        )
 
 
 class TestScalingRecipeSurfaces:
@@ -1636,6 +1650,22 @@ class TestMuPOptimizerTypeHandling:
                 assert 'eps' not in override
 
     @pytest.mark.parametrize('optimizer_type', ['muon', 'dist_muon'])
+    def test_training_policy_exact_muon_family_names(self, optimizer_type):
+        policy = build_legacy_mup_training_policy(
+            mup_width_mult=4.0, optimizer_type=optimizer_type
+        )
+
+        assert policy.is_muon_optimizer
+
+    @pytest.mark.parametrize('optimizer_type', ['adaptive_muon', 'newton_muon'])
+    def test_training_policy_rejects_muon_substring_variants(self, optimizer_type):
+        policy = build_legacy_mup_training_policy(
+            mup_width_mult=4.0, optimizer_type=optimizer_type
+        )
+
+        assert not policy.is_muon_optimizer
+
+    @pytest.mark.parametrize('optimizer_type', ['muon', 'dist_muon'])
     def test_muon_excludes_muon_managed_matrices_from_mup_overrides(self, optimizer_type):
         """Muon-managed 2D params should use Muon scaling only, not MuP LR overrides."""
         optimizer_config = OptimizerConfig(lr=1e-3, min_lr=1e-5, muon_scale_mode='unit_rms_norm')
@@ -1842,6 +1872,61 @@ class TestMuPOptimizerTypeHandling:
         assert 'max_lr' not in matrix_override
         assert 'min_lr' not in matrix_override
         assert 'eps' not in matrix_override
+
+    @pytest.mark.parametrize('matrix_optimizer', ['sgd', 'muon'])
+    def test_matrix_preconditioner_sidecars_do_not_change_mup_override_policy(
+        self, matrix_optimizer
+    ):
+        """Right/left/both preconditioners change matrix math, not MuP ownership."""
+        fallback_policy = build_legacy_mup_training_policy(
+            mup_width_mult=4.0, optimizer_type='adam'
+        )
+        previous_overrides = None
+        for input_preconditioner, output_preconditioner in (
+            ('none', 'none'),
+            ('feature_gram', 'none'),
+            ('none', 'grad_gram'),
+            ('feature_gram', 'grad_gram'),
+        ):
+            optimizer_config = OptimizerConfig(
+                optimizer='adam',
+                matrix_optimizer=matrix_optimizer,
+                matrix_input_preconditioner=input_preconditioner,
+                matrix_output_preconditioner=output_preconditioner,
+                muon_scale_mode='unit_rms_norm',
+                lr=1e-3,
+                min_lr=1e-5,
+                adam_eps=1e-8,
+            )
+            fallback_overrides = get_standard_config_overrides(
+                config=optimizer_config, scaling_policy=fallback_policy
+            )
+            fallback_overrides.update(
+                get_scaling_config_overrides(
+                    config=optimizer_config, scaling_policy=fallback_policy
+                )
+            )
+            matrix_overrides = get_matrix_optimizer_config_overrides(
+                config=optimizer_config,
+                fallback_config_overrides=fallback_overrides,
+                scaling_policy=fallback_policy,
+            )
+
+            param = torch.nn.Parameter(torch.zeros(10, 10))
+            set_parameterization_metadata(param, role=ROLE_HIDDEN_MATRIX)
+            register_matrix_optimizer_param(
+                param,
+                owner=MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
+                update_family=matrix_optimizer,
+                requires_layerwise_layout=False,
+            )
+            override = _combined_override_for_param(
+                matrix_overrides, param, 'decoder.layers.0.self_attention.linear_qkv.weight'
+            )
+            if previous_overrides is None:
+                previous_overrides = override
+            else:
+                assert override == previous_overrides
 
     @pytest.mark.parametrize('optimizer_type', ['muon', 'dist_muon'])
     def test_muon_warns_for_spectral_scale_mode(self, optimizer_type):

@@ -970,7 +970,6 @@ def _get_megatron_emerging_optimizer(
                     ),
                     update_family='muon' if is_muon_matrix else 'none',
                     requires_layerwise_layout=use_layer_wise and is_muon_matrix,
-                    ensure_shard_spec=is_muon_matrix,
                 )
 
     # Apply optimizer-specific param overrides (e.g. muon: non-linear -> scalar optimizer).

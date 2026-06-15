@@ -37,6 +37,7 @@ from megatron.core.matrix_update import (
     update_matrix_optimizer_state_spec,
     update_matrix_shard_spec,
 )
+from megatron.core.parameterization.roles import set_parameterization_metadata
 
 
 class _FakeDTensor(torch.nn.Parameter):
@@ -68,6 +69,10 @@ class _FakeDistIndex:
     def get_submesh(self, mesh_dim_names, is_expert_parallel=False):
         del mesh_dim_names, is_expert_parallel
         return _fake_mesh()
+
+
+class _FakeHybridDistIndex(_FakeDistIndex):
+    use_hybrid_fsdp = True
 
 
 def _fake_mesh():
@@ -262,6 +267,7 @@ def test_matrix_optimizer_checkpoint_metadata_round_trip_contract(monkeypatch):
     assert metadata["0"]["param_identity"] == "layers.0.weight"
     assert metadata["0"]["update_family"] == "muon"
     assert metadata["0"]["same_shard_state_layout"] == "same_as_param"
+    assert metadata["0"]["declared_same_shard_state_names"] == ["master_param", "momentum_buffer"]
     assert metadata["0"]["same_shard_state_names"] == ["momentum_buffer"]
     assert metadata["0"]["same_shard_state_shapes"] == {"momentum_buffer": [2, 3]}
     assert metadata["0"]["matrix_shard_contract"]["dp_shard_axis"] == 0
@@ -280,6 +286,17 @@ def test_matrix_optimizer_checkpoint_metadata_round_trip_contract(monkeypatch):
     fully_shard_module._validate_matrix_optimizer_checkpoint_metadata(
         optimizer, _fake_mfsdp_model(), load_state_dict
     )
+
+
+def test_matrix_optimizer_checkpoint_rejects_missing_metadata_for_no_state_param():
+    param = _matrix_param()
+    optimizer = torch.optim.SGD([param], lr=0.1)
+    load_state_dict = {"state": {}, "param_groups": []}
+
+    with pytest.raises(RuntimeError, match="missing matrix-shard metadata"):
+        fully_shard_module._validate_matrix_optimizer_checkpoint_metadata(
+            optimizer, _fake_mfsdp_model(), load_state_dict
+        )
 
 
 def test_matrix_shard_checkpoint_spec_records_pre_dp_local_shape():
@@ -1070,24 +1087,47 @@ def test_matrix_optimizer_checkpoint_rejects_declared_state_contract_mismatch(mo
         )
 
 
-def test_matrix_optimizer_checkpoint_allows_legacy_missing_declared_state_names(monkeypatch):
+def test_matrix_optimizer_checkpoint_rejects_missing_declared_state_names(monkeypatch):
     monkeypatch.setattr(fully_shard_module, "DTensor", _FakeDTensor)
     param = _matrix_param()
     optimizer = torch.optim.SGD([param], lr=0.1)
     metadata = _metadata_for_param(param)
     metadata.pop("declared_same_shard_state_names")
 
-    fully_shard_module._validate_matrix_optimizer_checkpoint_metadata(
-        optimizer,
-        _fake_mfsdp_model(),
-        {
-            "state": {0: {"momentum_buffer": _fake_dtensor_state()}},
-            "param_groups": [],
-            fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_KEY: {
-                "version": fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_VERSION,
-                "params": {"0": metadata},
+    with pytest.raises(RuntimeError, match="declared_same_shard_state_names"):
+        fully_shard_module._validate_matrix_optimizer_checkpoint_metadata(
+            optimizer,
+            _fake_mfsdp_model(),
+            {
+                "state": {0: {"momentum_buffer": _fake_dtensor_state()}},
+                "param_groups": [],
+                fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_KEY: {
+                    "version": fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_VERSION,
+                    "params": {"0": metadata},
+                },
             },
+        )
+
+
+def test_matrix_optimizer_checkpoint_validation_view_accepts_named_state(monkeypatch):
+    monkeypatch.setattr(fully_shard_module, "DTensor", _FakeDTensor)
+    param = _matrix_param()
+    optimizer = torch.optim.SGD([param], lr=0.1)
+    state_dict = {
+        "state": {param.megatron_fsdp_param_name: {"momentum_buffer": _fake_dtensor_state()}},
+        "param_groups": [],
+        fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_KEY: {
+            "version": fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_VERSION,
+            "params": {"0": _metadata_for_param(param)},
         },
+    }
+
+    validation_state_dict = fully_shard_module._matrix_optimizer_checkpoint_state_dict_for_validation(
+        optimizer, state_dict, lambda current_param: current_param.megatron_fsdp_param_name
+    )
+
+    fully_shard_module._validate_matrix_optimizer_checkpoint_metadata(
+        optimizer, _fake_mfsdp_model(), validation_state_dict
     )
 
 
@@ -1113,6 +1153,19 @@ def test_matrix_optimizer_checkpoint_rejects_state_shape_mismatch(monkeypatch):
                 },
             },
         )
+
+
+def test_matrix_optimizer_dtensor_state_must_match_global_and_local_shape(monkeypatch):
+    monkeypatch.setattr(fully_shard_module, "DTensor", _FakeDTensor)
+    param = _matrix_param(shape=(2, 3))
+    bad_state = _FakeDTensor(torch.ones(1, 3), requires_grad=False)
+    bad_state._local_tensor = torch.ones(1, 3)
+    bad_state.device_mesh = param.device_mesh
+    bad_state.placements = param.placements
+
+    assert not fully_shard_module._matrix_state_tensor_matches_param_shape(
+        bad_state, param
+    )
 
 
 def test_matrix_optimizer_checkpoint_rejects_state_shape_key_mismatch(monkeypatch):
@@ -1822,6 +1875,39 @@ def test_matrix_optimizer_axis1_fsdp_buffer_planner_sets_column_spec(monkeypatch
     assert matrix_shard_spec.small_gram_side == "left"
 
 
+def test_matrix_optimizer_fsdp_buffer_rejects_dp_range_without_pre_dp_shape(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    param = torch.nn.Parameter(torch.zeros(4, 3))
+    register_matrix_optimizer_param(
+        param,
+        owner=MATRIX_OPTIMIZER_OWNER_MUON,
+        update_family="muon",
+        requires_layerwise_layout=True,
+    )
+    update_matrix_shard_spec(
+        param,
+        MatrixShardSpec(
+            logical_shape=(4, 3),
+            local_shape=(2, 3),
+            tp_layout="none",
+            dp_shard_axis=0,
+            dp_local_start=0,
+            dp_local_end=2,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="pre_dp_local_shape"):
+        DataParallelBuffer(
+            ddp_config=SimpleNamespace(data_parallel_sharding_strategy="optim"),
+            params=[param],
+            is_data_distributed=True,
+            bucket_id=0,
+            data_parallel_group=None,
+            chunk_size_factor=1,
+        )
+
+
 def test_matrix_optimizer_unsharded_buffer_virtual_axis1_shard_uses_column_plan(monkeypatch):
     monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
@@ -1883,6 +1969,10 @@ def test_make_fsdp_dtensor_preserves_matrix_metadata(monkeypatch):
     monkeypatch.setattr(param_buffer_module, "DTensor", _FakeFSDPDTensor)
     monkeypatch.setattr(param_buffer_module, "using_tensor_parallel", lambda *args, **kwargs: False)
     param = _tag_muon_matrix_param(torch.nn.Parameter(torch.zeros(4, 3)))
+    set_parameterization_metadata(
+        param, role="output_matrix", shared_group="lm_head", tags=("tied",)
+    )
+    param.is_embedding_or_output_parameter = True
     update_matrix_shard_spec(
         param,
         param_buffer_module.matrix_shard_spec_with_dp_axis(
@@ -1904,6 +1994,10 @@ def test_make_fsdp_dtensor_preserves_matrix_metadata(monkeypatch):
     assert get_matrix_shard_spec(fsdp_param) == get_matrix_shard_spec(param)
     assert get_matrix_shard_spec(fsdp_param).dp_shard_axis == 0
     assert get_matrix_shard_spec(fsdp_param).small_gram_side == "right"
+    assert fsdp_param.parameterization_role == "output_matrix"
+    assert fsdp_param.parameterization_shared_group == "lm_head"
+    assert fsdp_param.parameterization_tags == ("tied",)
+    assert fsdp_param.is_embedding_or_output_parameter
 
 
 def test_make_fsdp_dtensor_rejects_unplanned_matrix_metadata(monkeypatch):
@@ -1916,6 +2010,29 @@ def test_make_fsdp_dtensor_rejects_unplanned_matrix_metadata(monkeypatch):
             local_tensor=torch.zeros(6),
             param=param,
             dist_index=_FakeDistIndex(),
+            is_sharded_param=True,
+        )
+
+
+def test_make_fsdp_dtensor_rejects_hybrid_fsdp_matrix_owned_param(monkeypatch):
+    monkeypatch.setattr(param_buffer_module, "DTensor", _FakeFSDPDTensor)
+    monkeypatch.setattr(param_buffer_module, "using_tensor_parallel", lambda *args, **kwargs: False)
+    param = _tag_muon_matrix_param(torch.nn.Parameter(torch.zeros(4, 3)))
+    update_matrix_shard_spec(
+        param,
+        param_buffer_module.matrix_shard_spec_with_dp_axis(
+            get_matrix_shard_spec(param),
+            dp_shard_axis=0,
+            dp_local_start=0,
+            dp_local_end=2,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="hybrid FSDP/HSDP"):
+        param_buffer_module.make_fsdp_dtensor(
+            local_tensor=torch.zeros(6),
+            param=param,
+            dist_index=_FakeHybridDistIndex(),
             is_sharded_param=True,
         )
 

@@ -54,7 +54,7 @@ class MatrixPreconditionerScope(enum.Enum):
     """Semantic scope of a collected matrix preconditioner."""
 
     GLOBAL_EXACT = "global_exact"
-    TP_LOCAL_BLOCK_DIAG = "tp_local_block_diag"
+    TP_LOCAL = "tp_local"
     BLOCK_DIAG_APPROX = "block_diag_approx"
     DIAG_APPROX = "diag_approx"
 
@@ -250,10 +250,6 @@ class MatrixShardSpec:
 
 
 MatrixSmallGramSide = Literal["right", "left"]
-# Backwards-compatible name for older local tests/helpers. "Side" is the stable
-# contract term: it records whether the small Gram is applied on the right
-# (M.T @ M) or left (M @ M.T).
-MatrixSmallGramOrientation = MatrixSmallGramSide
 
 
 @dataclass
@@ -610,7 +606,7 @@ def is_matrix_optimizer_fallback_parameter(param: torch.nn.Parameter) -> bool:
     return get_matrix_optimizer_owner(param) == MATRIX_OPTIMIZER_OWNER_FALLBACK
 
 
-def register_matrix_optimizer_param(
+def _register_matrix_optimizer_param(
     param: torch.nn.Parameter,
     *,
     owner: Literal["none", "muon", "matrix_function", "fallback"],
@@ -640,6 +636,30 @@ def register_matrix_optimizer_param(
     return info
 
 
+def register_matrix_optimizer_param(
+    param: torch.nn.Parameter,
+    *,
+    owner: Literal["none", "muon", "matrix_function", "fallback"],
+    update_family: Literal["none", "sgd", "muon"],
+    requires_layerwise_layout: bool = False,
+) -> MatrixOptimizerInfo:
+    """Register matrix-optimizer ownership and derived routing metadata.
+
+    This is the single public boundary for optimizer ownership metadata. Owned
+    matrix parameters always leave this function with MatrixShardSpec metadata;
+    callers that need to copy pre-existing metadata should use
+    ``copy_matrix_optimizer_registration``.
+    """
+
+    return _register_matrix_optimizer_param(
+        param,
+        owner=owner,
+        update_family=update_family,
+        requires_layerwise_layout=requires_layerwise_layout,
+        ensure_shard_spec=True,
+    )
+
+
 def copy_matrix_optimizer_registration(
     src_param: torch.nn.Parameter,
     dst_param: torch.Tensor,
@@ -651,7 +671,7 @@ def copy_matrix_optimizer_registration(
     info = get_matrix_optimizer_info(src_param)
     copied_info = None
     if info is not None:
-        copied_info = register_matrix_optimizer_param(
+        copied_info = _register_matrix_optimizer_param(
             dst_param,
             owner=info.owner,
             update_family=info.update_family,
@@ -681,7 +701,7 @@ def input_preconditioner_scope_for(
     """
 
     if tp_layout == "row_parallel" and is_feature_axis_sharded:
-        return MatrixPreconditionerScope.TP_LOCAL_BLOCK_DIAG
+        return MatrixPreconditionerScope.TP_LOCAL
     if approximation == MatrixPreconditionerApproximation.BLOCK_DIAG:
         return MatrixPreconditionerScope.BLOCK_DIAG_APPROX
     if approximation == MatrixPreconditionerApproximation.DIAG:
@@ -704,7 +724,7 @@ def output_preconditioner_scope_for(
     """
 
     if tp_layout == "column_parallel" and is_output_axis_sharded:
-        return MatrixPreconditionerScope.TP_LOCAL_BLOCK_DIAG
+        return MatrixPreconditionerScope.TP_LOCAL
     if approximation == MatrixPreconditionerApproximation.BLOCK_DIAG:
         return MatrixPreconditionerScope.BLOCK_DIAG_APPROX
     if approximation == MatrixPreconditionerApproximation.DIAG:
@@ -1038,6 +1058,10 @@ def allocate_feature_gram_buffers(param: torch.nn.Parameter, recipe: MatrixInput
         )
     if not hasattr(param, "main_grad_feature_count"):
         param.main_grad_feature_count = torch.zeros((), device=param.device, dtype=torch.float64)
+    if not hasattr(param, "_feature_gram_has_rows"):
+        param._feature_gram_has_rows = False
+    if not hasattr(param, "_feature_gram_collected_rows"):
+        param._feature_gram_collected_rows = 0
     if getattr(param, "_extra_wgrad_factors", ExtraWgradFactor.NONE) & ExtraWgradFactor.FEATURE_SUM:
         if not hasattr(param, "main_grad_feature_sum"):
             param.main_grad_feature_sum = torch.zeros(
@@ -1069,6 +1093,10 @@ def allocate_grad_gram_buffers(param: torch.nn.Parameter, recipe: MatrixOutputPr
         )
     if not hasattr(param, "main_grad_grad_count"):
         param.main_grad_grad_count = torch.zeros((), device=param.device, dtype=torch.float64)
+    if not hasattr(param, "_grad_gram_has_rows"):
+        param._grad_gram_has_rows = False
+    if not hasattr(param, "_grad_gram_collected_rows"):
+        param._grad_gram_collected_rows = 0
     param._grad_gram_recipe = recipe
     param._grad_gram_scope = recipe.scope
     if not hasattr(param, "_grad_gram_generation"):
@@ -1093,6 +1121,8 @@ def reset_feature_gram_buffers(
     if zero and hasattr(param, "main_grad_feature_sum"):
         param.main_grad_feature_sum.zero_()
     if zero:
+        param._feature_gram_has_rows = False
+        param._feature_gram_collected_rows = 0
         param._feature_gram_generation = getattr(param, "_feature_gram_generation", 0) + 1
         _mark_feature_gram_unfinalized(param)
     param._feature_gram_active = active
@@ -1108,6 +1138,8 @@ def reset_grad_gram_buffers(
     if zero and hasattr(param, "main_grad_grad_count"):
         param.main_grad_grad_count.zero_()
     if zero:
+        param._grad_gram_has_rows = False
+        param._grad_gram_collected_rows = 0
         param._grad_gram_generation = getattr(param, "_grad_gram_generation", 0) + 1
         _mark_grad_gram_unfinalized(param)
     param._grad_gram_active = active
@@ -1239,12 +1271,6 @@ def configure_model_matrix_updates(modules: Iterable[torch.nn.Module], config) -
         input_recipe = None
         output_recipe = None
         factors = ExtraWgradFactor.NONE
-        register_matrix_optimizer_param(
-            param,
-            owner=MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
-            update_family=matrix_update_family_from_optimizer_name(config.matrix_optimizer),
-            requires_layerwise_layout=True,
-        )
         if config.matrix_input_preconditioner == "feature_gram":
             collector = getattr(param, "_feature_gram_collector", "unknown")
             if collector == "transformer_engine":
@@ -1297,6 +1323,12 @@ def configure_model_matrix_updates(modules: Iterable[torch.nn.Module], config) -
                 )
             output_recipe = recipe
             factors |= ExtraWgradFactor.GRAD_GRAM
+        register_matrix_optimizer_param(
+            param,
+            owner=MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
+            update_family=matrix_update_family_from_optimizer_name(config.matrix_optimizer),
+            requires_layerwise_layout=True,
+        )
         if factors != ExtraWgradFactor.NONE:
             configure_matrix_update_param(
                 param, recipe=input_recipe, output_recipe=output_recipe, factors=factors
@@ -1408,7 +1440,9 @@ def maybe_accumulate_feature_gram(weight: torch.Tensor, inputmat: torch.Tensor) 
         inputmat = inputmat.reshape(-1, inputmat.shape[-1])
     x = _cast_feature_input(inputmat, recipe)
     if recipe.token_sample_size is not None:
-        remaining = recipe.token_sample_size - int(weight.main_grad_feature_count.item())
+        remaining = recipe.token_sample_size - int(
+            getattr(weight, "_feature_gram_collected_rows", 0)
+        )
         if remaining <= 0:
             return
         # Deterministic prefix sampling keeps collection graph-safe and testable.
@@ -1432,6 +1466,11 @@ def maybe_accumulate_feature_gram(weight: torch.Tensor, inputmat: torch.Tensor) 
             f"FEATURE_GRAM approximation {recipe.approximation.value!r} is not implemented yet."
         )
     weight.main_grad_feature_count.add_(float(x.shape[0]))
+    if x.shape[0] > 0:
+        weight._feature_gram_has_rows = True
+        weight._feature_gram_collected_rows = (
+            int(getattr(weight, "_feature_gram_collected_rows", 0)) + int(x.shape[0])
+        )
     _mark_feature_gram_unfinalized(weight)
     if flags & ExtraWgradFactor.FEATURE_SUM:
         if not hasattr(weight, "main_grad_feature_sum"):
@@ -1455,7 +1494,9 @@ def maybe_accumulate_grad_gram(weight: torch.Tensor, grad_output: torch.Tensor) 
         grad_output = grad_output.reshape(-1, grad_output.shape[-1])
     dy = _cast_grad_output(grad_output, recipe)
     if recipe.token_sample_size is not None:
-        remaining = recipe.token_sample_size - int(weight.main_grad_grad_count.item())
+        remaining = recipe.token_sample_size - int(
+            getattr(weight, "_grad_gram_collected_rows", 0)
+        )
         if remaining <= 0:
             return
         if dy.shape[0] > remaining:
@@ -1478,6 +1519,11 @@ def maybe_accumulate_grad_gram(weight: torch.Tensor, grad_output: torch.Tensor) 
             f"GRAD_GRAM approximation {recipe.approximation.value!r} is not implemented yet."
         )
     weight.main_grad_grad_count.add_(float(dy.shape[0]))
+    if dy.shape[0] > 0:
+        weight._grad_gram_has_rows = True
+        weight._grad_gram_collected_rows = (
+            int(getattr(weight, "_grad_gram_collected_rows", 0)) + int(dy.shape[0])
+        )
     _mark_grad_gram_unfinalized(weight)
 
 
@@ -1493,7 +1539,9 @@ def get_feature_gram_for_optimizer(param: torch.nn.Parameter) -> torch.Tensor:
             "finalize_feature_gram_buffers before optimizer consumption."
         )
     gram = param.main_grad_feature_gram
-    if param.main_grad_feature_count.item() <= 0.0:
+    if not getattr(param, "_feature_gram_has_rows", False) and (
+        param.main_grad_feature_count.is_cuda or param.main_grad_feature_count.item() <= 0.0
+    ):
         raise RuntimeError(
             "FEATURE_GRAM has zero collected feature rows; ensure the wgrad path collected "
             "main_grad_feature_gram before optimizer consumption."
@@ -1516,7 +1564,9 @@ def get_grad_gram_for_optimizer(param: torch.nn.Parameter) -> torch.Tensor:
             "finalize_grad_gram_buffers before optimizer consumption."
         )
     gram = param.main_grad_grad_gram
-    if param.main_grad_grad_count.item() <= 0.0:
+    if not getattr(param, "_grad_gram_has_rows", False) and (
+        param.main_grad_grad_count.is_cuda or param.main_grad_grad_count.item() <= 0.0
+    ):
         raise RuntimeError(
             "GRAD_GRAM has zero collected grad-output rows; ensure the wgrad path collected "
             "main_grad_grad_gram before optimizer consumption."

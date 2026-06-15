@@ -1244,6 +1244,11 @@ class DataParallelBuffer:
                         f"metadata={matrix_shard_spec.dp_shard_axis}, "
                         f"required={matrix_fsdp_shard_axis_for_spec(matrix_shard_spec)}."
                     )
+                if matrix_shard_spec.pre_dp_local_shape is None:
+                    raise RuntimeError(
+                        "[Megatron-FSDP] MatrixShardSpec with DP local range metadata "
+                        "must also record pre_dp_local_shape before FSDP sharding."
+                    )
                 continue
             dp_shard_axis = matrix_fsdp_shard_axis_for_spec(matrix_shard_spec)
             local_shape = to_local_if_dtensor(param).shape
@@ -5034,6 +5039,17 @@ def _get_fsdp_tensor_spec(
             "[Megatron-FSDP] FSDP tensor shard axis must be 0 or 1, got "
             f"{fsdp_shard_axis}."
         )
+    if (
+        HAVE_MCORE_MATRIX_UPDATE
+        and _is_matrix_optimizer_owned_param(param)
+        and dist_index.use_hybrid_fsdp
+    ):
+        raise RuntimeError(
+            "[Megatron-FSDP] Matrix optimizer-owned parameters do not support hybrid "
+            "FSDP/HSDP yet. MatrixShardSpec currently records one matrix-axis DP "
+            "shard range and cannot describe the additional hybrid FSDP outer "
+            "placement."
+        )
     # Check if the parameter is a DTensor and has more than one shard (TP enabled).
     if isinstance(param, DTensor) and cast(DTensor, param)._spec.num_shards > 1:
         # Retrieve original DTensorSpec (for TP).
@@ -5194,6 +5210,14 @@ def make_fsdp_dtensor(
     if HAVE_MCORE_MATRIX_UPDATE and is_sharded_param:
         matrix_optimizer_info = get_matrix_optimizer_info(orig_param)
         if matrix_optimizer_info is not None and _is_matrix_optimizer_owned_param(orig_param):
+            if dist_index.use_hybrid_fsdp:
+                raise RuntimeError(
+                    "[Megatron-FSDP] Matrix optimizer-owned parameters do not support "
+                    "hybrid FSDP/HSDP yet. MatrixShardSpec records one matrix-axis DP "
+                    "shard range, while hybrid FSDP can add an outer DP shard dimension. "
+                    "Add an explicit hybrid matrix shard contract before enabling this "
+                    "combination."
+                )
             matrix_shard_spec = get_matrix_shard_spec(orig_param)
             if matrix_shard_spec is None:
                 raise RuntimeError(
@@ -5292,6 +5316,17 @@ def make_fsdp_dtensor(
 
     if run_check:
         validate_uneven_dtensor(fsdp_tensor)
+
+    for attr_name in [
+        "is_embedding_or_output_parameter",
+        "is_embedding_parameter",
+        "is_output_parameter",
+        "parameterization_role",
+        "parameterization_shared_group",
+        "parameterization_tags",
+    ]:
+        if hasattr(orig_param, attr_name):
+            setattr(fsdp_tensor, attr_name, getattr(orig_param, attr_name))
 
     if HAVE_MCORE_MATRIX_UPDATE:
         matrix_shard_spec = get_matrix_shard_spec(orig_param)
