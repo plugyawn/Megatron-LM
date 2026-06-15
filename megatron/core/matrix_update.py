@@ -77,6 +77,7 @@ class TPUpdateMode(enum.Enum):
 MATRIX_OPTIMIZER_INFO_ATTR = "_mcore_matrix_optimizer_info"
 MATRIX_SHARD_SPEC_ATTR = "_mcore_matrix_shard_spec"
 MATRIX_OPTIMIZER_STATE_SPEC_ATTR = "_mcore_matrix_optimizer_state_spec"
+MATRIX_SIDECAR_OWNER_ATTR = "_mcore_matrix_sidecar_owner"
 
 MATRIX_OPTIMIZER_OWNER_NONE = "none"
 MATRIX_OPTIMIZER_OWNER_MUON = "muon"
@@ -357,6 +358,25 @@ def update_matrix_shard_spec(param: torch.nn.Parameter, spec: MatrixShardSpec) -
 
 def get_matrix_shard_spec(param: torch.nn.Parameter) -> Optional[MatrixShardSpec]:
     return getattr(param, MATRIX_SHARD_SPEC_ATTR, None)
+
+
+def set_matrix_sidecar_owner(
+    param: torch.nn.Parameter, owner: torch.nn.Parameter
+) -> None:
+    """Route activation/gradient sidecar collection for ``param`` to ``owner``."""
+
+    setattr(param, MATRIX_SIDECAR_OWNER_ATTR, owner)
+
+
+def get_matrix_sidecar_owner(param: torch.Tensor) -> torch.Tensor:
+    return getattr(param, MATRIX_SIDECAR_OWNER_ATTR, param)
+
+
+def _copy_matrix_sidecar_owner(src_param: torch.Tensor, dst_param: torch.Tensor) -> None:
+    owner = getattr(src_param, MATRIX_SIDECAR_OWNER_ATTR, None)
+    if owner is None:
+        return
+    setattr(dst_param, MATRIX_SIDECAR_OWNER_ATTR, dst_param if owner is src_param else owner)
 
 
 def _ensure_matrix_shard_spec(param: torch.nn.Parameter) -> MatrixShardSpec:
@@ -684,6 +704,7 @@ def copy_matrix_optimizer_registration(
     spec = shard_spec if shard_spec is not None else get_matrix_shard_spec(src_param)
     if spec is not None:
         update_matrix_shard_spec(dst_param, spec)
+    _copy_matrix_sidecar_owner(src_param, dst_param)
     return copied_info
 
 
@@ -800,6 +821,11 @@ def is_matrix_update_eligible(
 def _feature_dim(param: torch.nn.Parameter) -> int:
     info = getattr(param, "_mcore_linear_weight_info", None)
     if info is None:
+        spec = get_matrix_shard_spec(param)
+        if spec is not None:
+            if spec.dp_shard_axis == 1 and spec.pre_dp_local_shape is not None:
+                return spec.pre_dp_local_shape[1]
+            return spec.local_shape[1]
         if param.ndim != 2:
             raise ValueError("FEATURE_GRAM requires a 2D affine weight or LinearWeightInfo.")
         return param.shape[1]
@@ -809,10 +835,43 @@ def _feature_dim(param: torch.nn.Parameter) -> int:
 def _output_dim(param: torch.nn.Parameter) -> int:
     info = getattr(param, "_mcore_linear_weight_info", None)
     if info is None:
+        spec = get_matrix_shard_spec(param)
+        if spec is not None:
+            if spec.dp_shard_axis == 0 and spec.pre_dp_local_shape is not None:
+                return spec.pre_dp_local_shape[0]
+            return spec.local_shape[0]
         if param.ndim != 2:
             raise ValueError("GRAD_GRAM requires a 2D affine weight or LinearWeightInfo.")
         return param.shape[0]
     return info.local_shape[0]
+
+
+def _slice_pre_dp_sidecar_axis_for_optimizer(
+    param: torch.Tensor,
+    gram: torch.Tensor,
+    *,
+    axis: int,
+) -> torch.Tensor:
+    spec = get_matrix_shard_spec(param)
+    if spec is None or spec.dp_shard_axis != axis:
+        return gram
+    if spec.dp_local_start is None or spec.dp_local_end is None:
+        return gram
+    local_axis_size = spec.local_shape[axis]
+    if gram.ndim != 1 or gram.shape[0] == local_axis_size:
+        return gram
+    pre_dp_axis_size = (
+        spec.pre_dp_local_shape[axis]
+        if spec.pre_dp_local_shape is not None
+        else spec.logical_shape[axis]
+    )
+    if gram.shape[0] != pre_dp_axis_size:
+        raise RuntimeError(
+            "Matrix sidecar diagonal buffer shape does not match MatrixShardSpec: "
+            f"gram_shape={tuple(gram.shape)}, axis={axis}, "
+            f"pre_dp_axis_size={pre_dp_axis_size}, local_axis_size={local_axis_size}."
+        )
+    return gram[spec.dp_local_start : spec.dp_local_end]
 
 
 def _is_row_parallel_feature_axis_sharded(info: LinearWeightInfo) -> bool:
@@ -1175,6 +1234,8 @@ def configure_matrix_update_param(
     if output_recipe is not None:
         allocate_grad_gram_buffers(param, output_recipe)
         reset_grad_gram_buffers(param, active=True)
+    if enabled_factors != ExtraWgradFactor.NONE:
+        set_matrix_sidecar_owner(param, param)
 
 
 def recipe_from_optimizer_config(config, info: LinearWeightInfo) -> MatrixInputPreconditionerRecipe:
@@ -1428,12 +1489,17 @@ def maybe_accumulate_feature_gram(weight: torch.Tensor, inputmat: torch.Tensor) 
     ``get_feature_gram_for_optimizer``.
     """
 
-    flags = getattr(weight, "_extra_wgrad_factors", ExtraWgradFactor.NONE)
+    sidecar_param = get_matrix_sidecar_owner(weight)
+    flags = getattr(
+        sidecar_param,
+        "_extra_wgrad_factors",
+        getattr(weight, "_extra_wgrad_factors", ExtraWgradFactor.NONE),
+    )
     if not (flags & ExtraWgradFactor.FEATURE_GRAM):
         return
-    if not getattr(weight, "_feature_gram_active", True):
+    if not getattr(sidecar_param, "_feature_gram_active", True):
         return
-    recipe = getattr(weight, "_feature_gram_recipe", None)
+    recipe = getattr(sidecar_param, "_feature_gram_recipe", None)
     if recipe is None:
         raise RuntimeError("FEATURE_GRAM requested without a MatrixInputPreconditionerRecipe.")
     if inputmat.dim() != 2:
@@ -1441,7 +1507,7 @@ def maybe_accumulate_feature_gram(weight: torch.Tensor, inputmat: torch.Tensor) 
     x = _cast_feature_input(inputmat, recipe)
     if recipe.token_sample_size is not None:
         remaining = recipe.token_sample_size - int(
-            getattr(weight, "_feature_gram_collected_rows", 0)
+            getattr(sidecar_param, "_feature_gram_collected_rows", 0)
         )
         if remaining <= 0:
             return
@@ -1449,7 +1515,7 @@ def maybe_accumulate_feature_gram(weight: torch.Tensor, inputmat: torch.Tensor) 
         if x.shape[0] > remaining:
             x = x[:remaining]
 
-    gram = weight.main_grad_feature_gram
+    gram = sidecar_param.main_grad_feature_gram
     if recipe.approximation == MatrixPreconditionerApproximation.FULL:
         gram.add_(x.t().matmul(x))
     elif recipe.approximation == MatrixPreconditionerApproximation.DIAG:
@@ -1458,36 +1524,41 @@ def maybe_accumulate_feature_gram(weight: torch.Tensor, inputmat: torch.Tensor) 
         _accumulate_block_diag_feature_gram(
             gram,
             x,
-            feature_dim=_feature_dim(weight),
+            feature_dim=_feature_dim(sidecar_param),
             block_size=recipe.block_size,
         )
     else:
         raise NotImplementedError(
             f"FEATURE_GRAM approximation {recipe.approximation.value!r} is not implemented yet."
         )
-    weight.main_grad_feature_count.add_(float(x.shape[0]))
+    sidecar_param.main_grad_feature_count.add_(float(x.shape[0]))
     if x.shape[0] > 0:
-        weight._feature_gram_has_rows = True
-        weight._feature_gram_collected_rows = (
-            int(getattr(weight, "_feature_gram_collected_rows", 0)) + int(x.shape[0])
+        sidecar_param._feature_gram_has_rows = True
+        sidecar_param._feature_gram_collected_rows = (
+            int(getattr(sidecar_param, "_feature_gram_collected_rows", 0)) + int(x.shape[0])
         )
-    _mark_feature_gram_unfinalized(weight)
+    _mark_feature_gram_unfinalized(sidecar_param)
     if flags & ExtraWgradFactor.FEATURE_SUM:
-        if not hasattr(weight, "main_grad_feature_sum"):
+        if not hasattr(sidecar_param, "main_grad_feature_sum"):
             raise RuntimeError("FEATURE_SUM requested without a main_grad_feature_sum buffer.")
-        weight.main_grad_feature_sum.add_(x.sum(dim=0))
+        sidecar_param.main_grad_feature_sum.add_(x.sum(dim=0))
 
 
 @torch.no_grad()
 def maybe_accumulate_grad_gram(weight: torch.Tensor, grad_output: torch.Tensor) -> None:
     """Accumulate ``dY.T @ dY`` for a linear weight when requested."""
 
-    flags = getattr(weight, "_extra_wgrad_factors", ExtraWgradFactor.NONE)
+    sidecar_param = get_matrix_sidecar_owner(weight)
+    flags = getattr(
+        sidecar_param,
+        "_extra_wgrad_factors",
+        getattr(weight, "_extra_wgrad_factors", ExtraWgradFactor.NONE),
+    )
     if not (flags & ExtraWgradFactor.GRAD_GRAM):
         return
-    if not getattr(weight, "_grad_gram_active", True):
+    if not getattr(sidecar_param, "_grad_gram_active", True):
         return
-    recipe = getattr(weight, "_grad_gram_recipe", None)
+    recipe = getattr(sidecar_param, "_grad_gram_recipe", None)
     if recipe is None:
         raise RuntimeError("GRAD_GRAM requested without a MatrixOutputPreconditionerRecipe.")
     if grad_output.dim() != 2:
@@ -1495,14 +1566,14 @@ def maybe_accumulate_grad_gram(weight: torch.Tensor, grad_output: torch.Tensor) 
     dy = _cast_grad_output(grad_output, recipe)
     if recipe.token_sample_size is not None:
         remaining = recipe.token_sample_size - int(
-            getattr(weight, "_grad_gram_collected_rows", 0)
+            getattr(sidecar_param, "_grad_gram_collected_rows", 0)
         )
         if remaining <= 0:
             return
         if dy.shape[0] > remaining:
             dy = dy[:remaining]
 
-    gram = weight.main_grad_grad_gram
+    gram = sidecar_param.main_grad_grad_gram
     if recipe.approximation == MatrixPreconditionerApproximation.FULL:
         gram.add_(dy.t().matmul(dy))
     elif recipe.approximation == MatrixPreconditionerApproximation.DIAG:
@@ -1511,25 +1582,26 @@ def maybe_accumulate_grad_gram(weight: torch.Tensor, grad_output: torch.Tensor) 
         _accumulate_block_diag_feature_gram(
             gram,
             dy,
-            feature_dim=_output_dim(weight),
+            feature_dim=_output_dim(sidecar_param),
             block_size=recipe.block_size,
         )
     else:
         raise NotImplementedError(
             f"GRAD_GRAM approximation {recipe.approximation.value!r} is not implemented yet."
         )
-    weight.main_grad_grad_count.add_(float(dy.shape[0]))
+    sidecar_param.main_grad_grad_count.add_(float(dy.shape[0]))
     if dy.shape[0] > 0:
-        weight._grad_gram_has_rows = True
-        weight._grad_gram_collected_rows = (
-            int(getattr(weight, "_grad_gram_collected_rows", 0)) + int(dy.shape[0])
+        sidecar_param._grad_gram_has_rows = True
+        sidecar_param._grad_gram_collected_rows = (
+            int(getattr(sidecar_param, "_grad_gram_collected_rows", 0)) + int(dy.shape[0])
         )
-    _mark_grad_gram_unfinalized(weight)
+    _mark_grad_gram_unfinalized(sidecar_param)
 
 
 def get_feature_gram_for_optimizer(param: torch.nn.Parameter) -> torch.Tensor:
     """Return the feature Gram using the recipe's consumption normalization."""
 
+    param = get_matrix_sidecar_owner(param)
     recipe = getattr(param, "_feature_gram_recipe", None)
     if recipe is None:
         raise RuntimeError("Parameter has no MatrixInputPreconditionerRecipe.")
@@ -1548,13 +1620,14 @@ def get_feature_gram_for_optimizer(param: torch.nn.Parameter) -> torch.Tensor:
         )
     if recipe.normalization == MatrixPreconditionerNormalization.MEAN:
         count = param.main_grad_feature_count.clamp_min(1.0).to(gram.dtype)
-        return gram / count
-    return gram
+        gram = gram / count
+    return _slice_pre_dp_sidecar_axis_for_optimizer(param, gram, axis=1)
 
 
 def get_grad_gram_for_optimizer(param: torch.nn.Parameter) -> torch.Tensor:
     """Return the grad Gram using the recipe's consumption normalization."""
 
+    param = get_matrix_sidecar_owner(param)
     recipe = getattr(param, "_grad_gram_recipe", None)
     if recipe is None:
         raise RuntimeError("Parameter has no MatrixOutputPreconditionerRecipe.")
@@ -1573,5 +1646,5 @@ def get_grad_gram_for_optimizer(param: torch.nn.Parameter) -> torch.Tensor:
         )
     if recipe.normalization == MatrixPreconditionerNormalization.MEAN:
         count = param.main_grad_grad_count.clamp_min(1.0).to(gram.dtype)
-        return gram / count
-    return gram
+        gram = gram / count
+    return _slice_pre_dp_sidecar_axis_for_optimizer(param, gram, axis=0)

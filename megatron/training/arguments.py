@@ -365,15 +365,47 @@ def validate_matrix_optimizer_fsdp_support(args) -> None:
     matrix_output_preconditioner = (
         _resolve_validation_attr(args, 'matrix_output_preconditioner') or 'none'
     )
-    if _resolve_validation_attr(args, 'use_megatron_fsdp') and (
-        matrix_input_preconditioner != 'none'
-        or matrix_output_preconditioner != 'none'
-    ):
-        raise ValueError(
-            "matrix-optimizer with Megatron-FSDP currently supports no-sidecar "
-            "matrix updates only. FEATURE_GRAM and GRAD_GRAM collection under FSDP "
-            "need explicit sidecar buffer routing."
-        )
+    if _resolve_validation_attr(args, 'use_megatron_fsdp'):
+        if matrix_input_preconditioner == 'feature_gram':
+            if (
+                _resolve_validation_attr(args, 'matrix_input_preconditioner_approximation')
+                != 'diag'
+            ):
+                raise ValueError(
+                    "matrix-optimizer with Megatron-FSDP supports FEATURE_GRAM diag "
+                    "sidecars only. full and block_diag require explicit sidecar "
+                    "routing and checkpoint contracts."
+                )
+            if (_resolve_validation_attr(args, 'matrix_input_preconditioner_refresh_interval') or 1) != 1:
+                raise ValueError(
+                    "matrix-optimizer with Megatron-FSDP requires "
+                    "matrix-input-preconditioner-refresh-interval=1."
+                )
+            if _resolve_validation_attr(args, 'matrix_input_preconditioner_ema_beta') is not None:
+                raise ValueError(
+                    "matrix-optimizer with Megatron-FSDP does not support FEATURE_GRAM EMA "
+                    "sidecars yet."
+                )
+        if matrix_output_preconditioner == 'grad_gram':
+            if (
+                _resolve_validation_attr(args, 'matrix_output_preconditioner_approximation')
+                != 'diag'
+            ):
+                raise ValueError(
+                    "matrix-optimizer with Megatron-FSDP supports GRAD_GRAM diag "
+                    "sidecars only. full and block_diag require explicit sidecar "
+                    "routing and checkpoint contracts."
+                )
+            if (_resolve_validation_attr(args, 'matrix_output_preconditioner_refresh_interval') or 1) != 1:
+                raise ValueError(
+                    "matrix-optimizer with Megatron-FSDP requires "
+                    "matrix-output-preconditioner-refresh-interval=1."
+                )
+            if _resolve_validation_attr(args, 'matrix_output_preconditioner_ema_beta') is not None:
+                raise ValueError(
+                    "matrix-optimizer with Megatron-FSDP does not support GRAD_GRAM EMA "
+                    "sidecars yet."
+                )
     if _resolve_validation_attr(args, 'use_megatron_fsdp') and (
         (_resolve_validation_attr(args, 'num_distributed_optimizer_instances') or 1) > 1
         or _resolve_validation_attr(args, 'enable_full_sharding_in_hsdp')

@@ -681,19 +681,37 @@ class OptimizerConfig:
                 "LayerWiseDistributedOptimizer ownership. Disable "
                 "--use-distributed-optimizer to use a local matrix optimizer path."
             )
-        if (
-            self.matrix_optimizer != "none"
-            and self.use_megatron_fsdp
-            and (
-                self.matrix_input_preconditioner != "none"
-                or self.matrix_output_preconditioner != "none"
-            )
-        ):
-            raise ValueError(
-                "Megatron-FSDP matrix optimizers currently support no-sidecar matrix "
-                "updates only. FEATURE_GRAM and GRAD_GRAM collection under FSDP need "
-                "explicit sidecar buffer routing."
-            )
+        if self.matrix_optimizer != "none" and self.use_megatron_fsdp:
+            if self.matrix_input_preconditioner == "feature_gram":
+                if self.matrix_input_preconditioner_approximation != "diag":
+                    raise ValueError(
+                        "Megatron-FSDP FEATURE_GRAM sidecars support diag approximation only; "
+                        "full and block_diag require explicit sidecar routing and checkpoint "
+                        "contracts."
+                    )
+                if self.matrix_input_preconditioner_refresh_interval != 1:
+                    raise ValueError(
+                        "Megatron-FSDP FEATURE_GRAM sidecars require refresh_interval=1."
+                    )
+                if self.matrix_input_preconditioner_ema_beta is not None:
+                    raise ValueError(
+                        "Megatron-FSDP FEATURE_GRAM sidecars do not support EMA state yet."
+                    )
+            if self.matrix_output_preconditioner == "grad_gram":
+                if self.matrix_output_preconditioner_approximation != "diag":
+                    raise ValueError(
+                        "Megatron-FSDP GRAD_GRAM sidecars support diag approximation only; "
+                        "full and block_diag require explicit sidecar routing and checkpoint "
+                        "contracts."
+                    )
+                if self.matrix_output_preconditioner_refresh_interval != 1:
+                    raise ValueError(
+                        "Megatron-FSDP GRAD_GRAM sidecars require refresh_interval=1."
+                    )
+                if self.matrix_output_preconditioner_ema_beta is not None:
+                    raise ValueError(
+                        "Megatron-FSDP GRAD_GRAM sidecars do not support EMA state yet."
+                    )
         if self.matrix_input_preconditioner == "feature_gram" and self.matrix_input_preconditioner_ema_beta is not None:
             raise ValueError(
                 "matrix_input_preconditioner_ema_beta requires persistent input preconditioner state; "

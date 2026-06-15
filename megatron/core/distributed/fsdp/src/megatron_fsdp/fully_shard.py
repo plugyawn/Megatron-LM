@@ -857,7 +857,7 @@ def _validate_matrix_optimizer_checkpoint_metadata(
                     "[MegatronFSDP] Matrix optimizer checkpoint metadata is missing "
                     f"same_shard_state_shapes for optimizer state index {param_idx}."
                 )
-            if sorted(metadata_state_shapes) != metadata_state_names:
+            if metadata_state_shapes and sorted(metadata_state_shapes) != metadata_state_names:
                 raise RuntimeError(
                     "[MegatronFSDP] Matrix optimizer checkpoint state shape keys do not "
                     f"match same_shard_state_names for optimizer state index {param_idx}: "
@@ -876,7 +876,7 @@ def _validate_matrix_optimizer_checkpoint_metadata(
                 state_name: list(loaded_state[state_name].shape)
                 for state_name in same_shape_state_names
             }
-            if loaded_state_shapes != metadata_state_shapes:
+            if metadata_state_shapes and loaded_state_shapes != metadata_state_shapes:
                 raise RuntimeError(
                     "[MegatronFSDP] Matrix optimizer checkpoint state shapes do not match "
                     f"the matrix-sharded metadata for optimizer state index {param_idx}: "
