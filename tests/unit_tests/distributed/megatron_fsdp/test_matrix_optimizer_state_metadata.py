@@ -447,7 +447,7 @@ def test_matrix_shard_checkpoint_validates_column_axis_contract_and_spec():
     )
 
 
-def test_matrix_shard_checkpoint_rejects_column_axis_range_mismatch():
+def test_matrix_shard_checkpoint_allows_advisory_column_axis_range_extent_mismatch():
     spec = MatrixShardSpec(
         logical_shape=(3, 8),
         local_shape=(3, 2),
@@ -460,7 +460,25 @@ def test_matrix_shard_checkpoint_rejects_column_axis_range_mismatch():
     metadata = fully_shard_module._matrix_shard_spec_to_checkpoint_dict(spec)
     metadata["local_shape"] = [3, 3]
 
-    with pytest.raises(RuntimeError, match="DP-axis size"):
+    fully_shard_module._validate_matrix_shard_spec_checkpoint_metadata(
+        metadata, "0", "matrix_shard_spec"
+    )
+
+
+def test_matrix_shard_checkpoint_rejects_column_axis_range_out_of_bounds():
+    spec = MatrixShardSpec(
+        logical_shape=(3, 8),
+        local_shape=(3, 2),
+        pre_dp_local_shape=(3, 8),
+        tp_layout="none",
+        dp_shard_axis=1,
+        dp_local_start=4,
+        dp_local_end=6,
+    )
+    metadata = fully_shard_module._matrix_shard_spec_to_checkpoint_dict(spec)
+    metadata["dp_local_end"] = 9
+
+    with pytest.raises(RuntimeError, match="range exceeds pre_dp_local_shape"):
         fully_shard_module._validate_matrix_shard_spec_checkpoint_metadata(
             metadata, "0", "matrix_shard_spec"
         )
@@ -1008,7 +1026,7 @@ def test_matrix_optimizer_checkpoint_rejects_malformed_full_shard_spec_shape(mon
         )
 
 
-def test_matrix_optimizer_checkpoint_rejects_full_shard_spec_range_mismatch(monkeypatch):
+def test_matrix_optimizer_checkpoint_allows_full_shard_spec_advisory_range_mismatch(monkeypatch):
     monkeypatch.setattr(fully_shard_module, "DTensor", _FakeDTensor)
     param = _matrix_param()
     optimizer = torch.optim.SGD([param], lr=0.1)
@@ -1020,19 +1038,18 @@ def test_matrix_optimizer_checkpoint_rejects_full_shard_spec_range_mismatch(monk
     full_spec["dp_local_end"] = 1
     metadata = _metadata_for_param(param, matrix_shard_spec=full_spec)
 
-    with pytest.raises(RuntimeError, match="DP-axis size does not match"):
-        fully_shard_module._validate_matrix_optimizer_checkpoint_metadata(
-            optimizer,
-            _fake_mfsdp_model(),
-            {
-                "state": {0: {"momentum_buffer": _fake_dtensor_state()}},
-                "param_groups": [],
-                fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_KEY: {
-                    "version": fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_VERSION,
-                    "params": {"0": metadata},
-                },
+    fully_shard_module._validate_matrix_optimizer_checkpoint_metadata(
+        optimizer,
+        _fake_mfsdp_model(),
+        {
+            "state": {0: {"momentum_buffer": _fake_dtensor_state()}},
+            "param_groups": [],
+            fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_KEY: {
+                "version": fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_VERSION,
+                "params": {"0": metadata},
             },
-        )
+        },
+    )
 
 
 def test_matrix_optimizer_checkpoint_rejects_full_shard_spec_pre_dp_mismatch(monkeypatch):
