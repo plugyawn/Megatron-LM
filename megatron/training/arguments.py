@@ -311,13 +311,13 @@ def validate_depth_mup_optimizer_support(args) -> None:
             "scaling_recipe='depth_mup' currently supports optimizer='adam' only. "
             "AdamW semantics should continue to use decoupled_weight_decay. "
             "SGD depth-mup requires explicit hidden-weight, hidden-bias, norm/vector, "
-            "and input/output-bias rules and is intentionally out of scope for v1."
+            "and input/output-bias rules before it can be enabled as a top-level optimizer."
         )
-    if _resolve_validation_attr(args, 'matrix_optimizer') not in (None, 'none'):
+    matrix_optimizer = _resolve_validation_attr(args, 'matrix_optimizer')
+    if matrix_optimizer not in (None, 'none', 'sgd', 'muon'):
         raise ValueError(
-            "scaling_recipe='depth_mup' does not yet support matrix_optimizer. "
-            "Matrix-function update rules need explicit depth-scaling semantics before "
-            "this combination can be enabled."
+            "scaling_recipe='depth_mup' matrix optimizer policy supports only "
+            "matrix_optimizer='sgd' or matrix_optimizer='muon'."
         )
 
     weight_decay = _resolve_validation_attr(args, 'weight_decay')
@@ -366,6 +366,12 @@ def validate_matrix_optimizer_fsdp_support(args) -> None:
         _resolve_validation_attr(args, 'matrix_output_preconditioner') or 'none'
     )
     if _resolve_validation_attr(args, 'use_megatron_fsdp'):
+        if _resolve_validation_attr(args, 'matrix_tp_update_mode') == 'block_local':
+            raise ValueError(
+                "matrix-optimizer with Megatron-FSDP does not support "
+                "matrix-tp-update-mode=block_local. Megatron-FSDP matrix updates "
+                "use MatrixShardSpec-driven small-Gram semantics."
+            )
         if matrix_input_preconditioner == 'feature_gram':
             if (
                 _resolve_validation_attr(args, 'matrix_input_preconditioner_approximation')
@@ -385,6 +391,15 @@ def validate_matrix_optimizer_fsdp_support(args) -> None:
                 raise ValueError(
                     "matrix-optimizer with Megatron-FSDP does not support FEATURE_GRAM EMA "
                     "sidecars yet."
+                )
+            if (
+                _resolve_validation_attr(args, 'matrix_input_preconditioner_activation_dtype')
+                == 'fp8_dequant'
+            ):
+                raise ValueError(
+                    "matrix-optimizer with Megatron-FSDP does not support "
+                    "FEATURE_GRAM activation_dtype=fp8_dequant until TE sidecar "
+                    "collection has an explicit FP8 dequant contract."
                 )
         if matrix_output_preconditioner == 'grad_gram':
             if (

@@ -12,14 +12,28 @@ class TrainingScalingPolicy:
 
     context: ScalingContext
     optimizer_type: str = 'adam'
+    matrix_optimizer_policy: bool = False
 
     def __post_init__(self) -> None:
-        if self.context.is_depth_mup and not self.is_adam_optimizer:
+        if (
+            self.context.is_depth_mup
+            and not self.is_adam_optimizer
+            and not self.matrix_optimizer_policy
+        ):
             raise ValueError(
                 "scaling_recipe='depth_mup' currently supports optimizer='adam' only. "
                 "AdamW semantics should continue to use decoupled_weight_decay. "
                 "SGD depth-mup requires explicit hidden-weight, hidden-bias, norm/vector, "
-                "and input/output-bias rules and is intentionally out of scope for v1."
+                "and input/output-bias rules before it can be enabled as a top-level optimizer."
+            )
+        if (
+            self.context.is_depth_mup
+            and self.matrix_optimizer_policy
+            and not (self.is_sgd_optimizer or self.is_muon_optimizer)
+        ):
+            raise ValueError(
+                "scaling_recipe='depth_mup' matrix optimizer policy supports only "
+                "matrix_optimizer='sgd' or matrix_optimizer='muon'."
             )
 
     @property
@@ -115,8 +129,14 @@ class TrainingScalingPolicy:
         return self.hidden_vector_lr_multiplier
 
 
-def build_training_scaling_policy(config, optimizer_type: str = 'adam') -> TrainingScalingPolicy:
-    return TrainingScalingPolicy(context=build_scaling_context(config), optimizer_type=optimizer_type)
+def build_training_scaling_policy(
+    config, optimizer_type: str = 'adam', matrix_optimizer_policy: bool = False
+) -> TrainingScalingPolicy:
+    return TrainingScalingPolicy(
+        context=build_scaling_context(config),
+        optimizer_type=optimizer_type,
+        matrix_optimizer_policy=matrix_optimizer_policy,
+    )
 
 
 def build_legacy_mup_training_policy(

@@ -76,6 +76,7 @@ class TPUpdateMode(enum.Enum):
 
 MATRIX_OPTIMIZER_INFO_ATTR = "_mcore_matrix_optimizer_info"
 MATRIX_SHARD_SPEC_ATTR = "_mcore_matrix_shard_spec"
+MATRIX_FACTOR_SHARD_SPECS_ATTR = "_mcore_matrix_factor_shard_specs"
 MATRIX_OPTIMIZER_STATE_SPEC_ATTR = "_mcore_matrix_optimizer_state_spec"
 MATRIX_SIDECAR_OWNER_ATTR = "_mcore_matrix_sidecar_owner"
 
@@ -253,6 +254,73 @@ class MatrixShardSpec:
 MatrixSmallGramSide = Literal["right", "left"]
 
 
+@dataclass(frozen=True)
+class MatrixFactorShardSpec:
+    """Internal sidecar-factor layout contract for matrix preconditioners.
+
+    This is the factor-side analogue of ``MatrixShardSpec``. It records the
+    owned storage for a FEATURE_GRAM or GRAD_GRAM sidecar independently from
+    parameter ownership, so FSDP sidecars, checkpoint metadata, and solve/apply
+    code do not infer layout from tensor shape or approximation names.
+    """
+
+    kind: MatrixPreconditionerKind
+    approximation: MatrixPreconditionerApproximation
+    matrix_axis: Literal[0, 1]
+    logical_factor_shape: tuple[int, ...]
+    local_factor_shape: tuple[int, ...]
+    block_size: Optional[int] = None
+    dp_shard_axis: Optional[int] = None
+    dp_local_start: Optional[int] = None
+    dp_local_end: Optional[int] = None
+    padding_mask_required: bool = False
+    checkpoint_key: str = ""
+
+    def __post_init__(self) -> None:
+        if self.kind not in (
+            MatrixPreconditionerKind.FEATURE_GRAM,
+            MatrixPreconditionerKind.GRAD_GRAM,
+        ):
+            raise ValueError(f"MatrixFactorShardSpec requires a sidecar kind, got {self.kind}.")
+        if self.matrix_axis not in (0, 1):
+            raise ValueError(f"MatrixFactorShardSpec matrix_axis must be 0 or 1, got {self.matrix_axis}.")
+        if len(self.logical_factor_shape) == 0 or len(self.local_factor_shape) == 0:
+            raise ValueError("MatrixFactorShardSpec requires non-empty factor shapes.")
+        if len(self.logical_factor_shape) != len(self.local_factor_shape):
+            raise ValueError(
+                "MatrixFactorShardSpec logical/local factor ranks must match: "
+                f"logical={self.logical_factor_shape}, local={self.local_factor_shape}."
+            )
+        if (self.dp_local_start is None) != (self.dp_local_end is None):
+            raise ValueError(
+                "MatrixFactorShardSpec dp_local_start and dp_local_end must be set together."
+            )
+        if self.dp_local_start is not None:
+            if self.dp_shard_axis != self.matrix_axis:
+                raise ValueError(
+                    "MatrixFactorShardSpec DP range must shard the same matrix axis as the "
+                    f"factor: dp_shard_axis={self.dp_shard_axis}, matrix_axis={self.matrix_axis}."
+                )
+            if self.dp_local_start < 0 or self.dp_local_end < self.dp_local_start:
+                raise ValueError(
+                    "MatrixFactorShardSpec has an invalid DP factor range: "
+                    f"start={self.dp_local_start}, end={self.dp_local_end}."
+                )
+        if self.approximation == MatrixPreconditionerApproximation.BLOCK_DIAG:
+            if self.block_size is None or self.block_size <= 0:
+                raise ValueError("MatrixFactorShardSpec block_diag requires block_size > 0.")
+        elif self.block_size is not None and self.block_size <= 0:
+            raise ValueError("MatrixFactorShardSpec block_size must be positive when set.")
+
+
+def _matrix_factor_key(kind: MatrixPreconditionerKind) -> str:
+    if kind == MatrixPreconditionerKind.FEATURE_GRAM:
+        return "feature_gram"
+    if kind == MatrixPreconditionerKind.GRAD_GRAM:
+        return "grad_gram"
+    raise ValueError(f"Matrix factor sidecar kind expected, got {kind}.")
+
+
 @dataclass
 class MatrixInputPreconditionerRecipe:
     """Collection and consumption policy for input-side ``FEATURE_GRAM = X.T @ X``."""
@@ -360,6 +428,29 @@ def get_matrix_shard_spec(param: torch.nn.Parameter) -> Optional[MatrixShardSpec
     return getattr(param, MATRIX_SHARD_SPEC_ATTR, None)
 
 
+def _matrix_factor_specs(param: torch.Tensor) -> dict[str, MatrixFactorShardSpec]:
+    specs = getattr(param, MATRIX_FACTOR_SHARD_SPECS_ATTR, None)
+    if specs is None:
+        specs = {}
+        setattr(param, MATRIX_FACTOR_SHARD_SPECS_ATTR, specs)
+    return specs
+
+
+def set_matrix_factor_shard_spec(
+    param: torch.nn.Parameter, spec: MatrixFactorShardSpec
+) -> None:
+    _matrix_factor_specs(param)[_matrix_factor_key(spec.kind)] = spec
+
+
+def get_matrix_factor_shard_spec(
+    param: torch.Tensor, kind: MatrixPreconditionerKind
+) -> Optional[MatrixFactorShardSpec]:
+    specs = getattr(param, MATRIX_FACTOR_SHARD_SPECS_ATTR, None)
+    if specs is None:
+        return None
+    return specs.get(_matrix_factor_key(kind))
+
+
 def set_matrix_sidecar_owner(
     param: torch.nn.Parameter, owner: torch.nn.Parameter
 ) -> None:
@@ -377,6 +468,13 @@ def _copy_matrix_sidecar_owner(src_param: torch.Tensor, dst_param: torch.Tensor)
     if owner is None:
         return
     setattr(dst_param, MATRIX_SIDECAR_OWNER_ATTR, dst_param if owner is src_param else owner)
+
+
+def _copy_matrix_factor_shard_specs(src_param: torch.Tensor, dst_param: torch.Tensor) -> None:
+    specs = getattr(src_param, MATRIX_FACTOR_SHARD_SPECS_ATTR, None)
+    if specs is None:
+        return
+    setattr(dst_param, MATRIX_FACTOR_SHARD_SPECS_ATTR, dict(specs))
 
 
 def _ensure_matrix_shard_spec(param: torch.nn.Parameter) -> MatrixShardSpec:
@@ -705,6 +803,7 @@ def copy_matrix_optimizer_registration(
     if spec is not None:
         update_matrix_shard_spec(dst_param, spec)
     _copy_matrix_sidecar_owner(src_param, dst_param)
+    _copy_matrix_factor_shard_specs(src_param, dst_param)
     return copied_info
 
 
@@ -922,6 +1021,77 @@ def _grad_gram_shape(param: torch.nn.Parameter, recipe: MatrixOutputPrecondition
     )
 
 
+def _factor_shard_spec_from_storage(
+    param: torch.nn.Parameter,
+    *,
+    kind: MatrixPreconditionerKind,
+    approximation: MatrixPreconditionerApproximation,
+    matrix_axis: Literal[0, 1],
+    factor_shape: tuple[int, ...],
+    block_size: Optional[int],
+    padding_mask_required: bool,
+) -> MatrixFactorShardSpec:
+    matrix_spec = get_matrix_shard_spec(param)
+    dp_shard_axis = None
+    dp_local_start = None
+    dp_local_end = None
+    if matrix_spec is not None and matrix_spec.dp_shard_axis == matrix_axis:
+        axis_local = matrix_spec.local_shape[matrix_axis]
+        if approximation == MatrixPreconditionerApproximation.DIAG and factor_shape == (axis_local,):
+            dp_shard_axis = matrix_axis
+            dp_local_start = matrix_spec.dp_local_start
+            dp_local_end = matrix_spec.dp_local_end
+    return MatrixFactorShardSpec(
+        kind=kind,
+        approximation=approximation,
+        matrix_axis=matrix_axis,
+        logical_factor_shape=factor_shape,
+        local_factor_shape=factor_shape,
+        block_size=block_size if approximation == MatrixPreconditionerApproximation.BLOCK_DIAG else None,
+        dp_shard_axis=dp_shard_axis,
+        dp_local_start=dp_local_start,
+        dp_local_end=dp_local_end,
+        padding_mask_required=padding_mask_required,
+        checkpoint_key=f"matrix_sidecar/{_matrix_factor_key(kind)}",
+    )
+
+
+def matrix_factor_shard_spec_from_input_recipe(
+    param: torch.nn.Parameter, recipe: MatrixInputPreconditionerRecipe
+) -> MatrixFactorShardSpec:
+    feature_dim = _feature_dim(param)
+    return _factor_shard_spec_from_storage(
+        param,
+        kind=MatrixPreconditionerKind.FEATURE_GRAM,
+        approximation=recipe.approximation,
+        matrix_axis=1,
+        factor_shape=_feature_gram_shape(param, recipe),
+        block_size=recipe.block_size,
+        padding_mask_required=(
+            recipe.approximation == MatrixPreconditionerApproximation.BLOCK_DIAG
+            and feature_dim % recipe.block_size != 0
+        ),
+    )
+
+
+def matrix_factor_shard_spec_from_output_recipe(
+    param: torch.nn.Parameter, recipe: MatrixOutputPreconditionerRecipe
+) -> MatrixFactorShardSpec:
+    output_dim = _output_dim(param)
+    return _factor_shard_spec_from_storage(
+        param,
+        kind=MatrixPreconditionerKind.GRAD_GRAM,
+        approximation=recipe.approximation,
+        matrix_axis=0,
+        factor_shape=_grad_gram_shape(param, recipe),
+        block_size=recipe.block_size,
+        padding_mask_required=(
+            recipe.approximation == MatrixPreconditionerApproximation.BLOCK_DIAG
+            and output_dim % recipe.block_size != 0
+        ),
+    )
+
+
 def _validate_feature_gram_recipe(param: torch.nn.Parameter, recipe: MatrixInputPreconditionerRecipe) -> None:
     if recipe.refresh_interval < 1:
         raise ValueError("matrix-input-preconditioner-refresh-interval must be >= 1")
@@ -994,14 +1164,170 @@ def _needs_distributed_finalization() -> bool:
     )
 
 
-def _transformer_engine_feature_gram_available() -> bool:
+def _transformer_engine_extra_wgrad_available() -> bool:
     try:
         from transformer_engine.pytorch.module.extra_wgrad import (  # pylint: disable=unused-import
-            maybe_accumulate_feature_gram,
+            ExtraWgradRequest,
+            FACTOR_FEATURE_GRAM,
+            FACTOR_GRAD_GRAM,
+            FeatureGramRecipe,
+            GradGramRecipe,
+            maybe_accumulate_wgrad_factors,
         )
     except Exception:
         return False
     return True
+
+
+def _te_feature_recipe(recipe: MatrixInputPreconditionerRecipe):
+    from transformer_engine.pytorch.module.extra_wgrad import FeatureGramRecipe
+
+    if recipe.accumulation_dtype is not torch.float32:
+        raise RuntimeError("Transformer Engine FEATURE_GRAM collection requires fp32 accumulation.")
+    if recipe.refresh_interval != 1:
+        raise RuntimeError(
+            "Transformer Engine FEATURE_GRAM refresh_interval > 1 requires graph-aware "
+            "sidecar collection/skip graph variants or device-side gating before production use."
+        )
+    if recipe.ema_beta is not None:
+        raise RuntimeError(
+            "Transformer Engine FEATURE_GRAM EMA requires checkpointed sidecar state and "
+            "graph-aware device-side updates before production use."
+        )
+    if recipe.activation_dtype == "fp8_dequant":
+        raise RuntimeError(
+            "Transformer Engine FEATURE_GRAM activation_dtype=fp8_dequant is not supported "
+            "until TE extra-wgrad factor collection has an explicit FP8 dequant contract."
+        )
+    return FeatureGramRecipe(
+        approximation=recipe.approximation.value,
+        block_size=recipe.block_size,
+        source_dtype=recipe.activation_dtype,
+        accumulation_dtype=recipe.accumulation_dtype,
+    )
+
+
+def _te_grad_recipe(recipe: MatrixOutputPreconditionerRecipe):
+    from transformer_engine.pytorch.module.extra_wgrad import GradGramRecipe
+
+    if recipe.accumulation_dtype is not torch.float32:
+        raise RuntimeError("Transformer Engine GRAD_GRAM collection requires fp32 accumulation.")
+    if recipe.refresh_interval != 1:
+        raise RuntimeError(
+            "Transformer Engine GRAD_GRAM refresh_interval > 1 requires graph-aware "
+            "sidecar collection/skip graph variants or device-side gating before production use."
+        )
+    if recipe.ema_beta is not None:
+        raise RuntimeError(
+            "Transformer Engine GRAD_GRAM EMA requires checkpointed sidecar state and "
+            "graph-aware device-side updates before production use."
+        )
+    return GradGramRecipe(
+        approximation=recipe.approximation.value,
+        block_size=recipe.block_size,
+        gradient_dtype=recipe.gradient_dtype,
+        accumulation_dtype=recipe.accumulation_dtype,
+    )
+
+
+def _validate_transformer_engine_extra_wgrad_recipes(
+    input_recipe: Optional[MatrixInputPreconditionerRecipe],
+    output_recipe: Optional[MatrixOutputPreconditionerRecipe],
+    *,
+    collector: Optional[str],
+) -> None:
+    """Validate TE sidecar recipes before mutating optimizer ownership metadata."""
+
+    if collector != "transformer_engine" or (input_recipe is None and output_recipe is None):
+        return
+    if not _transformer_engine_extra_wgrad_available():
+        raise RuntimeError(
+            "Matrix sidecar collection for Transformer Engine linears requires a "
+            "Transformer Engine build exposing transformer_engine.pytorch.module.extra_wgrad "
+            "with ExtraWgradRequest and maybe_accumulate_wgrad_factors."
+        )
+    if input_recipe is not None:
+        _te_feature_recipe(input_recipe)
+    if output_recipe is not None:
+        _te_grad_recipe(output_recipe)
+
+
+def attach_transformer_engine_extra_wgrad_request(
+    weight: torch.nn.Parameter,
+    *,
+    sidecar_param: Optional[torch.nn.Parameter] = None,
+) -> None:
+    """Attach a TE extra-wgrad request to ``weight`` using Megatron sidecar buffers."""
+
+    if not _transformer_engine_extra_wgrad_available():
+        raise RuntimeError(
+            "Matrix sidecar collection for Transformer Engine linears requires a "
+            "Transformer Engine build exposing transformer_engine.pytorch.module.extra_wgrad "
+            "with ExtraWgradRequest and maybe_accumulate_wgrad_factors."
+        )
+    from transformer_engine.pytorch.module.extra_wgrad import (
+        ExtraWgradRequest,
+        FACTOR_FEATURE_GRAM,
+        FACTOR_FEATURE_SUM,
+        FACTOR_GRAD_GRAM,
+    )
+
+    if sidecar_param is None:
+        sidecar_param = get_matrix_sidecar_owner(weight)
+    flags = getattr(sidecar_param, "_extra_wgrad_factors", ExtraWgradFactor.NONE)
+    te_factors = 0
+    feature_recipe = getattr(sidecar_param, "_feature_gram_recipe", None)
+    grad_recipe = getattr(sidecar_param, "_grad_gram_recipe", None)
+    te_feature_recipe = None
+    te_grad_recipe = None
+    if flags & ExtraWgradFactor.FEATURE_GRAM:
+        te_factors |= FACTOR_FEATURE_GRAM
+        if flags & ExtraWgradFactor.FEATURE_SUM:
+            te_factors |= FACTOR_FEATURE_SUM
+        if feature_recipe is None:
+            raise RuntimeError("FEATURE_GRAM requested without a MatrixInputPreconditionerRecipe.")
+        te_feature_recipe = _te_feature_recipe(feature_recipe)
+    if flags & ExtraWgradFactor.GRAD_GRAM:
+        te_factors |= FACTOR_GRAD_GRAM
+        if grad_recipe is None:
+            raise RuntimeError("GRAD_GRAM requested without a MatrixOutputPreconditionerRecipe.")
+        te_grad_recipe = _te_grad_recipe(grad_recipe)
+    if flags & ExtraWgradFactor.FEATURE_GRAM:
+        sidecar_param._feature_gram_has_rows = True
+    if flags & ExtraWgradFactor.GRAD_GRAM:
+        sidecar_param._grad_gram_has_rows = True
+    if te_factors == 0:
+        if hasattr(weight, "_te_extra_wgrad"):
+            delattr(weight, "_te_extra_wgrad")
+        return
+    sidecar_param._te_extra_wgrad_weight = weight
+    weight._te_extra_wgrad = ExtraWgradRequest(
+        factors=te_factors,
+        feature_gram=te_feature_recipe,
+        gram_buffer=getattr(sidecar_param, "main_grad_feature_gram", None),
+        count_buffer=getattr(sidecar_param, "main_grad_feature_count", None),
+        grad_gram=te_grad_recipe,
+        grad_gram_buffer=getattr(sidecar_param, "main_grad_grad_gram", None),
+        grad_count_buffer=getattr(sidecar_param, "main_grad_grad_count", None),
+        sum_buffer=getattr(sidecar_param, "main_grad_feature_sum", None),
+        active=(
+            getattr(sidecar_param, "_feature_gram_active", True)
+            or getattr(sidecar_param, "_grad_gram_active", True)
+        ),
+    )
+
+
+def _refresh_transformer_engine_request_active(sidecar_param: torch.nn.Parameter) -> None:
+    weight = getattr(sidecar_param, "_te_extra_wgrad_weight", None)
+    if weight is None:
+        return
+    request = getattr(weight, "_te_extra_wgrad", None)
+    if request is None:
+        return
+    request.active = (
+        getattr(sidecar_param, "_feature_gram_active", False)
+        or getattr(sidecar_param, "_grad_gram_active", False)
+    )
 
 
 def _mark_feature_gram_unfinalized(param: torch.nn.Parameter) -> None:
@@ -1094,8 +1420,23 @@ def finalize_grad_gram_buffers(
             )
             torch.distributed.all_reduce(
                 param.main_grad_grad_count, op=torch.distributed.ReduceOp.SUM, group=group
-            )
+        )
         param._grad_gram_finalized = True
+
+
+def _matrix_sidecar_count_dtype(
+    param: torch.nn.Parameter,
+    recipe: Optional[
+        MatrixInputPreconditionerRecipe | MatrixOutputPreconditionerRecipe
+    ] = None,
+) -> torch.dtype:
+    if (
+        getattr(recipe, "collector", None) == "transformer_engine"
+        or getattr(param, "_matrix_sidecar_collector", None) == "transformer_engine"
+        or getattr(param, "_feature_gram_collector", None) == "transformer_engine"
+    ):
+        return torch.float32
+    return torch.float64
 
 
 def allocate_feature_gram_buffers(param: torch.nn.Parameter, recipe: MatrixInputPreconditionerRecipe) -> None:
@@ -1115,8 +1456,13 @@ def allocate_feature_gram_buffers(param: torch.nn.Parameter, recipe: MatrixInput
             device=param.device,
             dtype=recipe.accumulation_dtype,
         )
-    if not hasattr(param, "main_grad_feature_count"):
-        param.main_grad_feature_count = torch.zeros((), device=param.device, dtype=torch.float64)
+    count_dtype = _matrix_sidecar_count_dtype(param, recipe)
+    if (
+        not hasattr(param, "main_grad_feature_count")
+        or param.main_grad_feature_count.dtype != count_dtype
+        or param.main_grad_feature_count.device != param.device
+    ):
+        param.main_grad_feature_count = torch.zeros((), device=param.device, dtype=count_dtype)
     if not hasattr(param, "_feature_gram_has_rows"):
         param._feature_gram_has_rows = False
     if not hasattr(param, "_feature_gram_collected_rows"):
@@ -1128,6 +1474,7 @@ def allocate_feature_gram_buffers(param: torch.nn.Parameter, recipe: MatrixInput
             )
     param._feature_gram_recipe = recipe
     param._feature_gram_scope = recipe.scope
+    set_matrix_factor_shard_spec(param, matrix_factor_shard_spec_from_input_recipe(param, recipe))
     if not hasattr(param, "_feature_gram_generation"):
         param._feature_gram_generation = 0
     _mark_feature_gram_unfinalized(param)
@@ -1150,14 +1497,20 @@ def allocate_grad_gram_buffers(param: torch.nn.Parameter, recipe: MatrixOutputPr
             device=param.device,
             dtype=recipe.accumulation_dtype,
         )
-    if not hasattr(param, "main_grad_grad_count"):
-        param.main_grad_grad_count = torch.zeros((), device=param.device, dtype=torch.float64)
+    count_dtype = _matrix_sidecar_count_dtype(param, recipe)
+    if (
+        not hasattr(param, "main_grad_grad_count")
+        or param.main_grad_grad_count.dtype != count_dtype
+        or param.main_grad_grad_count.device != param.device
+    ):
+        param.main_grad_grad_count = torch.zeros((), device=param.device, dtype=count_dtype)
     if not hasattr(param, "_grad_gram_has_rows"):
         param._grad_gram_has_rows = False
     if not hasattr(param, "_grad_gram_collected_rows"):
         param._grad_gram_collected_rows = 0
     param._grad_gram_recipe = recipe
     param._grad_gram_scope = recipe.scope
+    set_matrix_factor_shard_spec(param, matrix_factor_shard_spec_from_output_recipe(param, recipe))
     if not hasattr(param, "_grad_gram_generation"):
         param._grad_gram_generation = 0
     _mark_grad_gram_unfinalized(param)
@@ -1185,6 +1538,9 @@ def reset_feature_gram_buffers(
         param._feature_gram_generation = getattr(param, "_feature_gram_generation", 0) + 1
         _mark_feature_gram_unfinalized(param)
     param._feature_gram_active = active
+    if getattr(param, "_feature_gram_collector", None) == "transformer_engine":
+        param._feature_gram_has_rows = active
+    _refresh_transformer_engine_request_active(param)
 
 
 def reset_grad_gram_buffers(
@@ -1202,6 +1558,9 @@ def reset_grad_gram_buffers(
         param._grad_gram_generation = getattr(param, "_grad_gram_generation", 0) + 1
         _mark_grad_gram_unfinalized(param)
     param._grad_gram_active = active
+    if getattr(param, "_feature_gram_collector", None) == "transformer_engine":
+        param._grad_gram_has_rows = active
+    _refresh_transformer_engine_request_active(param)
 
 
 def iter_matrix_update_params(modules: Iterable[torch.nn.Module]):
@@ -1227,6 +1586,20 @@ def configure_matrix_update_param(
         enabled_factors &= ~ExtraWgradFactor.FEATURE_GRAM
     if output_recipe is not None:
         enabled_factors |= ExtraWgradFactor.GRAD_GRAM
+    if (
+        enabled_factors != ExtraWgradFactor.NONE
+        and getattr(
+            param,
+            "_matrix_sidecar_collector",
+            getattr(param, "_feature_gram_collector", None),
+        )
+        == "transformer_engine"
+    ):
+        _validate_transformer_engine_extra_wgrad_recipes(
+            recipe if enabled_factors & ExtraWgradFactor.FEATURE_GRAM else None,
+            output_recipe if enabled_factors & ExtraWgradFactor.GRAD_GRAM else None,
+            collector="transformer_engine",
+        )
     param._extra_wgrad_factors = enabled_factors
     if recipe is not None:
         allocate_feature_gram_buffers(param, recipe)
@@ -1236,6 +1609,11 @@ def configure_matrix_update_param(
         reset_grad_gram_buffers(param, active=True)
     if enabled_factors != ExtraWgradFactor.NONE:
         set_matrix_sidecar_owner(param, param)
+    if (
+        enabled_factors != ExtraWgradFactor.NONE
+        and getattr(param, "_feature_gram_collector", None) == "transformer_engine"
+    ):
+        attach_transformer_engine_extra_wgrad_request(param, sidecar_param=param)
 
 
 def recipe_from_optimizer_config(config, info: LinearWeightInfo) -> MatrixInputPreconditionerRecipe:
@@ -1335,16 +1713,17 @@ def configure_model_matrix_updates(modules: Iterable[torch.nn.Module], config) -
         if config.matrix_input_preconditioner == "feature_gram":
             collector = getattr(param, "_feature_gram_collector", "unknown")
             if collector == "transformer_engine":
-                if not _transformer_engine_feature_gram_available():
+                if not _transformer_engine_extra_wgrad_available():
                     raise RuntimeError(
                         "FEATURE_GRAM collection for Transformer Engine linears requires a "
                         "Transformer Engine build that exposes "
-                        "transformer_engine.pytorch.module.extra_wgrad.maybe_accumulate_feature_gram."
+                        "transformer_engine.pytorch.module.extra_wgrad.ExtraWgradRequest and "
+                        "maybe_accumulate_wgrad_factors."
                     )
-            elif collector != "native":
+            else:
                 raise RuntimeError(
-                    f"FEATURE_GRAM collection for {collector!r} linears is not available in this "
-                    f"checkout (role={info.role!r}, tp_layout={info.tp_layout!r})."
+                    "Production FEATURE_GRAM collection requires Transformer Engine linears; "
+                    f"got collector={collector!r} (role={info.role!r}, tp_layout={info.tp_layout!r})."
                 )
             recipe = recipe_from_optimizer_config(config, info)
             if (
@@ -1357,19 +1736,21 @@ def configure_model_matrix_updates(modules: Iterable[torch.nn.Module], config) -
                     "diag/block_diag or disable the matrix optimizer for this parameter "
                     f"(role={info.role!r})."
                 )
-            if collector == "native" and recipe.activation_dtype == "fp8_dequant":
-                raise RuntimeError(
-                    "FEATURE_GRAM activation_dtype=fp8_dequant requires Transformer Engine "
-                    "collection at the wgrad site; native linears cannot dequantize FP8 sources."
-                )
             input_recipe = recipe
             factors |= ExtraWgradFactor.FEATURE_GRAM
         if config.matrix_output_preconditioner == "grad_gram":
             collector = getattr(param, "_feature_gram_collector", "unknown")
-            if collector != "native":
+            if collector == "transformer_engine":
+                if not _transformer_engine_extra_wgrad_available():
+                    raise RuntimeError(
+                        "GRAD_GRAM collection for Transformer Engine linears requires a "
+                        "Transformer Engine build that exposes GRAD_GRAM in "
+                        "transformer_engine.pytorch.module.extra_wgrad."
+                    )
+            else:
                 raise RuntimeError(
-                    f"GRAD_GRAM collection for {collector!r} linears is not available in this "
-                    f"checkout (role={info.role!r}, tp_layout={info.tp_layout!r})."
+                    "Production GRAD_GRAM collection requires Transformer Engine linears; "
+                    f"got collector={collector!r} (role={info.role!r}, tp_layout={info.tp_layout!r})."
                 )
             recipe = output_recipe_from_optimizer_config(config, info)
             if (
@@ -1384,6 +1765,11 @@ def configure_model_matrix_updates(modules: Iterable[torch.nn.Module], config) -
                 )
             output_recipe = recipe
             factors |= ExtraWgradFactor.GRAD_GRAM
+        _validate_transformer_engine_extra_wgrad_recipes(
+            input_recipe,
+            output_recipe,
+            collector=getattr(param, "_feature_gram_collector", None),
+        )
         register_matrix_optimizer_param(
             param,
             owner=MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
@@ -1611,15 +1997,20 @@ def get_feature_gram_for_optimizer(param: torch.nn.Parameter) -> torch.Tensor:
             "finalize_feature_gram_buffers before optimizer consumption."
         )
     gram = param.main_grad_feature_gram
-    if not getattr(param, "_feature_gram_has_rows", False) and (
-        param.main_grad_feature_count.is_cuda or param.main_grad_feature_count.item() <= 0.0
-    ):
+    count = param.main_grad_feature_count
+    if count.is_cuda:
+        torch._assert_async(
+            count > 0.0,
+            "FEATURE_GRAM has zero collected feature rows; ensure the wgrad path collected "
+            "main_grad_feature_gram before optimizer consumption.",
+        )
+    elif count.item() <= 0.0:
         raise RuntimeError(
             "FEATURE_GRAM has zero collected feature rows; ensure the wgrad path collected "
             "main_grad_feature_gram before optimizer consumption."
         )
     if recipe.normalization == MatrixPreconditionerNormalization.MEAN:
-        count = param.main_grad_feature_count.clamp_min(1.0).to(gram.dtype)
+        count = count.clamp_min(1.0).to(gram.dtype)
         gram = gram / count
     return _slice_pre_dp_sidecar_axis_for_optimizer(param, gram, axis=1)
 
@@ -1637,14 +2028,19 @@ def get_grad_gram_for_optimizer(param: torch.nn.Parameter) -> torch.Tensor:
             "finalize_grad_gram_buffers before optimizer consumption."
         )
     gram = param.main_grad_grad_gram
-    if not getattr(param, "_grad_gram_has_rows", False) and (
-        param.main_grad_grad_count.is_cuda or param.main_grad_grad_count.item() <= 0.0
-    ):
+    count = param.main_grad_grad_count
+    if count.is_cuda:
+        torch._assert_async(
+            count > 0.0,
+            "GRAD_GRAM has zero collected grad-output rows; ensure the wgrad path collected "
+            "main_grad_grad_gram before optimizer consumption.",
+        )
+    elif count.item() <= 0.0:
         raise RuntimeError(
             "GRAD_GRAM has zero collected grad-output rows; ensure the wgrad path collected "
             "main_grad_grad_gram before optimizer consumption."
         )
     if recipe.normalization == MatrixPreconditionerNormalization.MEAN:
-        count = param.main_grad_grad_count.clamp_min(1.0).to(gram.dtype)
+        count = count.clamp_min(1.0).to(gram.dtype)
         gram = gram / count
     return _slice_pre_dp_sidecar_axis_for_optimizer(param, gram, axis=0)

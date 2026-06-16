@@ -1,6 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +20,7 @@ from megatron.core.matrix_update import (
     MATRIX_OPTIMIZER_OWNER_FALLBACK,
     MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
     MATRIX_OPTIMIZER_OWNER_MUON,
+    MatrixFactorShardSpec,
     MatrixShardSpec,
     MatrixPreconditionerApproximation,
     MatrixPreconditionerKind,
@@ -32,8 +35,10 @@ from megatron.core.matrix_update import (
     finalize_grad_gram_buffers,
     get_feature_gram_for_optimizer,
     get_grad_gram_for_optimizer,
+    get_matrix_factor_shard_spec,
     get_matrix_optimizer_info,
     get_matrix_optimizer_state_spec,
+    get_matrix_sidecar_owner,
     get_matrix_shard_spec,
     input_preconditioner_scope_for,
     is_matrix_update_eligible,
@@ -68,6 +73,65 @@ def _param_with_info(tp_layout="column_parallel", shape=(4, 3), logical_shape=No
         has_bias=True,
     )
     return param
+
+
+def _install_fake_te_extra_wgrad(monkeypatch):
+    import megatron.core.matrix_update as matrix_update_module
+
+    transformer_engine_pkg = types.ModuleType("transformer_engine")
+    pytorch_pkg = types.ModuleType("transformer_engine.pytorch")
+    module_pkg = types.ModuleType("transformer_engine.pytorch.module")
+    extra_wgrad_module = types.ModuleType("transformer_engine.pytorch.module.extra_wgrad")
+
+    class FakeExtraWgradRequest:
+        def __init__(self, **kwargs):
+            factors = kwargs.get("factors", 0)
+            if factors & 1:
+                assert kwargs["count_buffer"].dtype is torch.float32
+            if factors & 4:
+                assert kwargs["grad_count_buffer"].dtype is torch.float32
+            self.kwargs = kwargs
+
+    class FakeFeatureGramRecipe:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeGradGramRecipe:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    extra_wgrad_module.ExtraWgradRequest = FakeExtraWgradRequest
+    extra_wgrad_module.FeatureGramRecipe = FakeFeatureGramRecipe
+    extra_wgrad_module.GradGramRecipe = FakeGradGramRecipe
+    extra_wgrad_module.FACTOR_FEATURE_GRAM = 1
+    extra_wgrad_module.FACTOR_FEATURE_SUM = 2
+    extra_wgrad_module.FACTOR_GRAD_GRAM = 4
+    extra_wgrad_module.maybe_accumulate_wgrad_factors = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "transformer_engine", transformer_engine_pkg)
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", pytorch_pkg)
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.module", module_pkg)
+    monkeypatch.setitem(
+        sys.modules,
+        "transformer_engine.pytorch.module.extra_wgrad",
+        extra_wgrad_module,
+    )
+    monkeypatch.setattr(
+        matrix_update_module,
+        "_transformer_engine_extra_wgrad_available",
+        lambda: True,
+    )
+
+
+def _mark_te_collector(param, monkeypatch):
+    import megatron.core.matrix_update as matrix_update_module
+
+    param._feature_gram_collector = "transformer_engine"
+    _install_fake_te_extra_wgrad(monkeypatch)
+    monkeypatch.setattr(
+        matrix_update_module,
+        "attach_transformer_engine_extra_wgrad_request",
+        lambda weight, sidecar_param=None: None,
+    )
 
 
 def _spec_from_info(param):
@@ -112,6 +176,42 @@ def _output_recipe(
         ema_beta=None,
         min_samples_per_feature=None,
     )
+
+
+def test_feature_gram_configuration_records_factor_shard_spec():
+    param = _param_with_info(shape=(4, 3), logical_shape=(4, 3))
+    recipe = _recipe(approximation=MatrixPreconditionerApproximation.DIAG)
+
+    configure_matrix_update_param(param, recipe=recipe)
+
+    factor_spec = get_matrix_factor_shard_spec(param, MatrixPreconditionerKind.FEATURE_GRAM)
+    assert isinstance(factor_spec, MatrixFactorShardSpec)
+    assert factor_spec.kind == MatrixPreconditionerKind.FEATURE_GRAM
+    assert factor_spec.approximation == MatrixPreconditionerApproximation.DIAG
+    assert factor_spec.matrix_axis == 1
+    assert factor_spec.logical_factor_shape == (3,)
+    assert factor_spec.local_factor_shape == (3,)
+    assert factor_spec.checkpoint_key == "matrix_sidecar/feature_gram"
+
+
+def test_grad_gram_configuration_records_factor_shard_spec():
+    param = _param_with_info(shape=(4, 3), logical_shape=(4, 3))
+    recipe = _output_recipe(approximation=MatrixPreconditionerApproximation.BLOCK_DIAG)
+    recipe.block_size = 3
+    recipe.ridge = 1e-6
+
+    configure_matrix_update_param(param, output_recipe=recipe)
+
+    factor_spec = get_matrix_factor_shard_spec(param, MatrixPreconditionerKind.GRAD_GRAM)
+    assert isinstance(factor_spec, MatrixFactorShardSpec)
+    assert factor_spec.kind == MatrixPreconditionerKind.GRAD_GRAM
+    assert factor_spec.approximation == MatrixPreconditionerApproximation.BLOCK_DIAG
+    assert factor_spec.matrix_axis == 0
+    assert factor_spec.logical_factor_shape == (2, 3, 3)
+    assert factor_spec.local_factor_shape == (2, 3, 3)
+    assert factor_spec.block_size == 3
+    assert factor_spec.padding_mask_required
+    assert factor_spec.checkpoint_key == "matrix_sidecar/grad_gram"
 
 
 def test_full_feature_gram_accumulates_raw_sum():
@@ -611,6 +711,48 @@ def test_matrix_shard_spec_direct_constructor_rejects_column_range_shape_mismatc
         )
 
 
+def test_fsdp_small_gram_muon_ignores_padded_column_shard_coords(monkeypatch):
+    import megatron.core.optimizer.matrix_optimizer as matrix_optimizer_module
+
+    spec = MatrixShardSpec(
+        logical_shape=(3, 8),
+        local_shape=(3, 2),
+        tp_layout="none",
+        dp_shard_axis=1,
+        dp_local_start=6,
+        dp_local_end=8,
+        pre_dp_local_shape=(3, 8),
+    )
+    physical_local = torch.arange(9, dtype=torch.float32).reshape(3, 3)
+    captured = {}
+
+    def fake_small_gram(local_matrix, **kwargs):
+        captured["local_matrix"] = local_matrix.clone()
+        captured["tp_layout"] = kwargs["tp_layout"]
+        captured["logical_shape"] = kwargs["logical_shape"]
+        return local_matrix + 100.0
+
+    monkeypatch.setattr(
+        matrix_optimizer_module,
+        "tp_small_gram_newton_schulz_allreduce",
+        fake_small_gram,
+    )
+
+    update = matrix_optimizer_module._fsdp_small_gram_newton_schulz_allreduce(
+        physical_local,
+        spec,
+        group=object(),
+        config=SimpleNamespace(muon_num_ns_steps=5, muon_coefficient_type="quintic"),
+    )
+
+    torch.testing.assert_close(captured["local_matrix"], physical_local[:, :2])
+    assert captured["tp_layout"] == "row_parallel"
+    assert captured["logical_shape"] == spec.logical_shape
+    expected = torch.zeros_like(physical_local)
+    expected[:, :2] = physical_local[:, :2] + 100.0
+    torch.testing.assert_close(update, expected)
+
+
 def test_layerwise_buffer_routing_marks_matrix_optimizer_owned_params():
     module = torch.nn.Module()
     module.weight = _param_with_info()
@@ -714,6 +856,88 @@ def test_matrix_function_muon_metadata_counts_as_muon_managed_for_scaling():
     )
 
     assert is_muon_managed_matrix_parameter(param, optimizer_type="muon")
+
+
+def test_matrix_function_optimizer_sidecar_state_loads_by_stable_identity_when_reordered():
+    param_a = _param_with_info()
+    param_b = _param_with_info()
+    param_a._matrix_optimizer_param_name = "layers.0.weight"
+    param_b._matrix_optimizer_param_name = "layers.1.weight"
+    configure_matrix_update_param(
+        param_a,
+        recipe=_recipe(approximation=MatrixPreconditionerApproximation.DIAG),
+    )
+    configure_matrix_update_param(
+        param_b,
+        recipe=_recipe(approximation=MatrixPreconditionerApproximation.DIAG),
+    )
+    param_a.main_grad_feature_gram.fill_(1.0)
+    param_b.main_grad_feature_gram.fill_(2.0)
+    optimizer = MatrixFunctionOptimizer(
+        [{"params": [param_a, param_b]}],
+        lr=0.1,
+        update_rule=lambda grad, feature_gram, grad_gram, param: -grad,
+    )
+    state_dict = optimizer.state_dict()
+
+    reloaded_a = _param_with_info()
+    reloaded_b = _param_with_info()
+    reloaded_a._matrix_optimizer_param_name = "layers.0.weight"
+    reloaded_b._matrix_optimizer_param_name = "layers.1.weight"
+    configure_matrix_update_param(
+        reloaded_a,
+        recipe=_recipe(approximation=MatrixPreconditionerApproximation.DIAG),
+    )
+    configure_matrix_update_param(
+        reloaded_b,
+        recipe=_recipe(approximation=MatrixPreconditionerApproximation.DIAG),
+    )
+    reloaded_optimizer = MatrixFunctionOptimizer(
+        [{"params": [reloaded_b, reloaded_a]}],
+        lr=0.1,
+        update_rule=lambda grad, feature_gram, grad_gram, param: -grad,
+    )
+
+    reloaded_optimizer.load_state_dict(state_dict)
+
+    torch.testing.assert_close(
+        reloaded_a.main_grad_feature_gram,
+        torch.ones_like(reloaded_a.main_grad_feature_gram),
+    )
+    torch.testing.assert_close(
+        reloaded_b.main_grad_feature_gram,
+        torch.full_like(reloaded_b.main_grad_feature_gram, 2.0),
+    )
+
+
+def test_matrix_function_optimizer_sidecar_state_rejects_identity_mismatch():
+    param = _param_with_info()
+    param._matrix_optimizer_param_name = "layers.0.weight"
+    configure_matrix_update_param(
+        param,
+        recipe=_recipe(approximation=MatrixPreconditionerApproximation.DIAG),
+    )
+    optimizer = MatrixFunctionOptimizer(
+        [param],
+        lr=0.1,
+        update_rule=lambda grad, feature_gram, grad_gram, param: -grad,
+    )
+    state_dict = optimizer.state_dict()
+
+    reloaded = _param_with_info()
+    reloaded._matrix_optimizer_param_name = "layers.1.weight"
+    configure_matrix_update_param(
+        reloaded,
+        recipe=_recipe(approximation=MatrixPreconditionerApproximation.DIAG),
+    )
+    reloaded_optimizer = MatrixFunctionOptimizer(
+        [reloaded],
+        lr=0.1,
+        update_rule=lambda grad, feature_gram, grad_gram, param: -grad,
+    )
+
+    with pytest.raises(RuntimeError, match="identity"):
+        reloaded_optimizer.load_state_dict(state_dict)
 
 
 def test_matrix_function_optimizer_materializes_momentum_buffer_for_muon_rule():
@@ -1028,8 +1252,9 @@ def test_matrix_optimizer_megatron_fsdp_splits_child_optimizers_by_owner(monkeyp
         ]
         return [{"params": params}]
 
-    def fake_fully_shard_optimizer(optimizer):
+    def fake_fully_shard_optimizer(optimizer, **kwargs):
         optimizer.fully_sharded = True
+        optimizer.fully_shard_kwargs = kwargs
         return optimizer
 
     def fake_fallback_optimizer(**kwargs):
@@ -1103,6 +1328,54 @@ def test_matrix_optimizer_megatron_fsdp_splits_child_optimizers_by_owner(monkeyp
     assert all(child.optimizer.fully_sharded for child in optimizer.chained_optimizers)
     assert optimizer.chained_optimizers[0].config is config
     assert optimizer.chained_optimizers[0].optimizer.optimizers[1].config.matrix_optimizer == "none"
+
+
+def test_matrix_fsdp_optimizer_step_value_uses_param_group_step():
+    import megatron.core.optimizer.matrix_optimizer as matrix_optimizer_module
+
+    param = torch.nn.Parameter(torch.ones(2))
+    optimizer = torch.optim.SGD([param], lr=0.1)
+    fake_wrapper = SimpleNamespace(optimizer=optimizer)
+
+    optimizer.param_groups[0]["step"] = torch.tensor(7.0)
+    assert (
+        matrix_optimizer_module.MegatronFSDPOptimizer._optimizer_state_step_value(fake_wrapper)
+        == 7.0
+    )
+
+    optimizer.state[param]["step"] = torch.tensor(11.0)
+    assert (
+        matrix_optimizer_module.MegatronFSDPOptimizer._optimizer_state_step_value(fake_wrapper)
+        == 11.0
+    )
+
+
+def test_chained_optimizer_restores_te_style_group_step_without_live_param_step():
+    import megatron.core.optimizer.matrix_optimizer as matrix_optimizer_module
+
+    class GroupStepOptimizer(torch.optim.Optimizer):
+        name_to_dtype_map = {"exp_avg": torch.float32}
+
+        def __init__(self, params):
+            super().__init__(params, defaults={})
+
+        def step(self, closure=None):
+            return None
+
+    param = torch.nn.Parameter(torch.ones(2))
+    child = GroupStepOptimizer([param])
+    optimizer = matrix_optimizer_module._ChainedTorchOptimizer([child])
+    state_dict = optimizer.state_dict()
+    state_dict["state"][0] = {
+        "exp_avg": torch.ones_like(param),
+        "step": torch.tensor(4.0),
+    }
+
+    optimizer.load_state_dict(state_dict)
+
+    assert child.param_groups[0]["step"] == 4
+    assert "step" not in child.state[param]
+    assert "step" not in optimizer.state[param]
 
 
 def test_matrix_optimizer_split_rejects_expert_parallel_fallback(monkeypatch):
@@ -2057,6 +2330,84 @@ def test_matrix_function_optimizer_state_dict_does_not_serialize_update_rule():
     assert "update_rule" not in state_dict["param_groups"][0]
 
 
+def test_matrix_function_optimizer_state_dict_round_trips_sidecar_buffers():
+    param = _param_with_info()
+    configure_matrix_update_param(
+        param,
+        recipe=_recipe(approximation=MatrixPreconditionerApproximation.DIAG),
+        output_recipe=_output_recipe(approximation=MatrixPreconditionerApproximation.DIAG),
+    )
+    param.main_grad_feature_gram.copy_(torch.tensor([1.0, 2.0, 3.0]))
+    param.main_grad_feature_count.fill_(7.0)
+    param._feature_gram_finalized = True
+    param._feature_gram_has_rows = True
+    param._feature_gram_collected_rows = 7
+    param._feature_gram_generation = 2
+    param.main_grad_grad_gram.copy_(torch.tensor([4.0, 5.0, 6.0, 7.0]))
+    param.main_grad_grad_count.fill_(9.0)
+    param._grad_gram_finalized = True
+    param._grad_gram_has_rows = True
+    param._grad_gram_collected_rows = 9
+    param._grad_gram_generation = 3
+
+    def update_rule(grad, feature_gram, grad_gram, model_param):
+        return -grad
+
+    opt = MatrixFunctionOptimizer([param], lr=0.1, update_rule=update_rule)
+    state_dict = opt.state_dict()
+
+    assert "matrix_sidecar_state" in state_dict
+    reloaded_param = _param_with_info()
+    configure_matrix_update_param(
+        reloaded_param,
+        recipe=_recipe(approximation=MatrixPreconditionerApproximation.DIAG),
+        output_recipe=_output_recipe(approximation=MatrixPreconditionerApproximation.DIAG),
+    )
+    reloaded = MatrixFunctionOptimizer([reloaded_param], lr=0.1, update_rule=update_rule)
+    reloaded.load_state_dict(state_dict)
+
+    torch.testing.assert_close(
+        reloaded_param.main_grad_feature_gram, param.main_grad_feature_gram
+    )
+    torch.testing.assert_close(
+        reloaded_param.main_grad_feature_count, param.main_grad_feature_count
+    )
+    assert reloaded_param._feature_gram_finalized
+    assert reloaded_param._feature_gram_has_rows
+    assert reloaded_param._feature_gram_collected_rows == 7
+    assert reloaded_param._feature_gram_generation == 2
+    torch.testing.assert_close(reloaded_param.main_grad_grad_gram, param.main_grad_grad_gram)
+    torch.testing.assert_close(reloaded_param.main_grad_grad_count, param.main_grad_grad_count)
+    assert reloaded_param._grad_gram_finalized
+    assert reloaded_param._grad_gram_has_rows
+    assert reloaded_param._grad_gram_collected_rows == 9
+    assert reloaded_param._grad_gram_generation == 3
+
+
+def test_matrix_function_optimizer_load_rejects_missing_sidecar_state():
+    param = _param_with_info()
+    configure_matrix_update_param(
+        param,
+        recipe=_recipe(approximation=MatrixPreconditionerApproximation.DIAG),
+    )
+
+    def update_rule(grad, feature_gram, grad_gram, model_param):
+        return -grad
+
+    opt = MatrixFunctionOptimizer([param], lr=0.1, update_rule=update_rule)
+    state_dict = opt.state_dict()
+    state_dict.pop("matrix_sidecar_state")
+    reloaded_param = _param_with_info()
+    configure_matrix_update_param(
+        reloaded_param,
+        recipe=_recipe(approximation=MatrixPreconditionerApproximation.DIAG),
+    )
+    reloaded = MatrixFunctionOptimizer([reloaded_param], lr=0.1, update_rule=update_rule)
+
+    with pytest.raises(RuntimeError, match="missing matrix_sidecar_state"):
+        reloaded.load_state_dict(state_dict)
+
+
 def test_matrix_function_optimizer_applies_decoupled_weight_decay():
     param = _param_with_info()
     param.data.fill_(1.0)
@@ -2492,14 +2843,14 @@ def test_matrix_optimizer_info_owner_family_invariants():
         )
 
 
-def test_configure_model_matrix_updates_rejects_native_fp8_dequant_source():
+def test_configure_model_matrix_updates_rejects_non_te_feature_gram_collector():
     module = torch.nn.Module()
     module.weight = _param_with_info()
     config = OptimizerConfig(
         matrix_optimizer="muon", matrix_input_preconditioner="feature_gram", matrix_input_preconditioner_activation_dtype="fp8_dequant"
     )
 
-    with pytest.raises(RuntimeError, match="native linears cannot dequantize FP8"):
+    with pytest.raises(RuntimeError, match="Production FEATURE_GRAM collection requires Transformer Engine"):
         configure_model_matrix_updates([module], config)
 
     assert get_matrix_optimizer_info(module.weight) is None
@@ -2507,20 +2858,38 @@ def test_configure_model_matrix_updates_rejects_native_fp8_dequant_source():
     assert not getattr(module.weight, "is_managed_by_layer_wise_optimizer", False)
 
 
-def test_configure_model_matrix_updates_rejects_row_parallel_full_gram():
+def test_configure_model_matrix_updates_rejects_non_te_grad_gram_collector():
+    module = torch.nn.Module()
+    module.weight = _param_with_info()
+    config = OptimizerConfig(
+        matrix_optimizer="muon",
+        matrix_output_preconditioner="grad_gram",
+    )
+
+    with pytest.raises(RuntimeError, match="Production GRAD_GRAM collection requires Transformer Engine"):
+        configure_model_matrix_updates([module], config)
+
+    assert get_matrix_optimizer_info(module.weight) is None
+    assert get_matrix_shard_spec(module.weight) is None
+    assert not getattr(module.weight, "is_managed_by_layer_wise_optimizer", False)
+
+
+def test_configure_model_matrix_updates_rejects_row_parallel_full_gram(monkeypatch):
     module = torch.nn.Module()
     module.weight = _param_with_info(
         tp_layout="row_parallel", shape=(4, 2), logical_shape=(4, 4)
     )
+    _mark_te_collector(module.weight, monkeypatch)
     config = OptimizerConfig(matrix_optimizer="muon", matrix_input_preconditioner="feature_gram", matrix_input_preconditioner_approximation="full")
 
     with pytest.raises(RuntimeError, match="row-parallel"):
         configure_model_matrix_updates([module], config)
 
 
-def test_configure_model_matrix_updates_allows_unsharded_column_parallel_full_grad_gram():
+def test_configure_model_matrix_updates_allows_unsharded_column_parallel_full_grad_gram(monkeypatch):
     module = torch.nn.Module()
     module.weight = _param_with_info(tp_layout="column_parallel")
+    _mark_te_collector(module.weight, monkeypatch)
     config = OptimizerConfig(
         matrix_optimizer="muon",
         matrix_output_preconditioner="grad_gram",
@@ -2530,11 +2899,60 @@ def test_configure_model_matrix_updates_allows_unsharded_column_parallel_full_gr
     configure_model_matrix_updates([module], config)
 
 
-def test_configure_model_matrix_updates_rejects_sharded_column_parallel_full_grad_gram():
+def test_configure_model_matrix_updates_rejects_te_recipe_before_registration(monkeypatch):
+    module = torch.nn.Module()
+    module.weight = _param_with_info()
+    _mark_te_collector(module.weight, monkeypatch)
+    config = OptimizerConfig(
+        matrix_optimizer="muon",
+        matrix_input_preconditioner="feature_gram",
+        matrix_input_preconditioner_refresh_interval=2,
+    )
+
+    with pytest.raises(RuntimeError, match="refresh_interval"):
+        configure_model_matrix_updates([module], config)
+
+    assert get_matrix_optimizer_info(module.weight) is None
+    assert get_matrix_shard_spec(module.weight) is None
+    assert not getattr(module.weight, "is_managed_by_layer_wise_optimizer", False)
+    assert not hasattr(module.weight, "_extra_wgrad_factors")
+    assert not hasattr(module.weight, "_te_extra_wgrad")
+
+
+def test_fsdp_sidecars_allocate_te_count_buffers_on_persistent_owner(monkeypatch):
+    import megatron.core.optimizer.matrix_optimizer as matrix_optimizer_module
+
+    _install_fake_te_extra_wgrad(monkeypatch)
+    param = _param_with_info()
+    orig_param = _param_with_info()
+    orig_param._feature_gram_collector = "transformer_engine"
+    param.orig_param = orig_param
+    param._megatron_fsdp_model = object()
+    config = OptimizerConfig(
+        matrix_optimizer="muon",
+        use_megatron_fsdp=True,
+        matrix_input_preconditioner="feature_gram",
+        matrix_input_preconditioner_approximation="diag",
+        matrix_output_preconditioner="grad_gram",
+        matrix_output_preconditioner_approximation="diag",
+    )
+
+    matrix_optimizer_module._configure_fsdp_sidecars(param, config)
+
+    assert param._matrix_sidecar_collector == "transformer_engine"
+    assert param.main_grad_feature_count.dtype is torch.float32
+    assert param.main_grad_grad_count.dtype is torch.float32
+    assert get_matrix_sidecar_owner(orig_param) is param
+    assert orig_param._te_extra_wgrad.kwargs["count_buffer"] is param.main_grad_feature_count
+    assert orig_param._te_extra_wgrad.kwargs["grad_count_buffer"] is param.main_grad_grad_count
+
+
+def test_configure_model_matrix_updates_rejects_sharded_column_parallel_full_grad_gram(monkeypatch):
     module = torch.nn.Module()
     module.weight = _param_with_info(
         tp_layout="column_parallel", shape=(2, 3), logical_shape=(4, 3)
     )
+    _mark_te_collector(module.weight, monkeypatch)
     config = OptimizerConfig(
         matrix_optimizer="muon",
         matrix_output_preconditioner="grad_gram",
@@ -2581,7 +2999,7 @@ def test_configure_model_matrix_updates_rejects_grouped_expert_weights():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_native_column_parallel_linear_backward_collects_feature_gram():
+def test_reference_native_column_parallel_linear_backward_collects_grams():
     from megatron.core.tensor_parallel.layers import ColumnParallelLinear
     from megatron.core.transformer.transformer_config import TransformerConfig
     from megatron.core.utils import init_method_normal
@@ -2686,7 +3104,7 @@ def test_wrap_model_chunks_with_fsdp_preregisters_matrix_metadata():
 @pytest.mark.parametrize("matrix_optimizer", ["sgd", "muon"])
 @pytest.mark.parametrize("input_preconditioner", ["none", "feature_gram"])
 def test_first_sweep_matrix_optimizer_modes_configure_owned_matrix_params(
-    matrix_optimizer, input_preconditioner
+    matrix_optimizer, input_preconditioner, monkeypatch
 ):
     module = torch.nn.Module()
     module.weight = _param_with_info(shape=(4, 3), logical_shape=(4, 3))
@@ -2696,6 +3114,7 @@ def test_first_sweep_matrix_optimizer_modes_configure_owned_matrix_params(
         matrix_input_preconditioner=input_preconditioner,
     )
     if input_preconditioner == "feature_gram":
+        _mark_te_collector(module.weight, monkeypatch)
         config_kwargs.update(
             matrix_input_preconditioner_approximation="diag",
             matrix_input_preconditioner_ridge=1e-4,

@@ -30,9 +30,8 @@ from megatron.core.matrix_update import (
     get_feature_gram_for_optimizer,
     get_grad_gram_for_optimizer,
     get_matrix_shard_spec,
-    maybe_accumulate_feature_gram,
-    maybe_accumulate_grad_gram,
     register_matrix_optimizer_param,
+    set_linear_weight_info,
     update_matrix_shard_spec,
 )
 from megatron.core.optimizer.matrix_function_optimizer import MatrixFunctionOptimizer
@@ -48,6 +47,36 @@ class _ToyMatrixModel(torch.nn.Module):
     def __init__(self, device, in_features=3, out_features=4, bias=False):
         super().__init__()
         self.linear = torch.nn.Linear(in_features, out_features, bias=bias, device=device)
+
+    def forward(self, x):
+        return self.linear(x)
+
+
+class _ToyTEMatrixModel(torch.nn.Module):
+    def __init__(self, device, in_features=3, out_features=4, bias=False):
+        super().__init__()
+        te_pytorch = pytest.importorskip("transformer_engine.pytorch")
+        pytest.importorskip("transformer_engine.pytorch.module.extra_wgrad")
+        self.linear = te_pytorch.Linear(
+            in_features,
+            out_features,
+            fuse_wgrad_accumulation=True,
+            bias=bias,
+            return_bias=False,
+            params_dtype=torch.float32,
+            parallel_mode=None,
+            device=device,
+        )
+        set_linear_weight_info(
+            self.linear.weight,
+            logical_shape=(out_features, in_features),
+            tp_layout="none",
+            sequence_parallel=False,
+            expert_parallel=False,
+            has_bias=bias,
+        )
+        self.linear.weight._feature_gram_collector = "transformer_engine"
+        self.linear.weight.main_grad = torch.zeros_like(self.linear.weight)
 
     def forward(self, x):
         return self.linear(x)
@@ -102,13 +131,27 @@ def _state_tensor_to_local(tensor):
     return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
 
-def _build_fsdp_toy_matrix_model(setup, *, in_features=3, out_features=4, bias=False):
+def _build_fsdp_toy_matrix_model(
+    setup,
+    *,
+    in_features=3,
+    out_features=4,
+    bias=False,
+    transformer_engine=False,
+):
     device_mesh = init_device_mesh(
         "cuda", mesh_shape=(setup["world_size"], 1), mesh_dim_names=("dp_shard", "tp")
     )
-    toy_model = _ToyMatrixModel(
-        setup["device"], in_features=in_features, out_features=out_features, bias=bias
-    )
+    if transformer_engine:
+        toy_model = _ToyTEMatrixModel(
+            setup["device"], in_features=in_features, out_features=out_features, bias=bias
+        )
+        fsdp_unit_modules = [type(toy_model.linear)]
+    else:
+        toy_model = _ToyMatrixModel(
+            setup["device"], in_features=in_features, out_features=out_features, bias=bias
+        )
+        fsdp_unit_modules = [torch.nn.Linear]
     register_matrix_optimizer_param(
         toy_model.linear.weight,
         owner=MATRIX_OPTIMIZER_OWNER_MATRIX_FUNCTION,
@@ -129,7 +172,7 @@ def _build_fsdp_toy_matrix_model(setup, *, in_features=3, out_features=4, bias=F
         dp_shard_dim="dp_shard",
         tp_dim="tp",
         zero_dp_strategy="optim_grads_params",
-        fsdp_unit_modules=[torch.nn.Linear],
+        fsdp_unit_modules=fsdp_unit_modules,
         disable_bucketing=True,
     )
 
@@ -464,7 +507,7 @@ def test_public_matrix_optimizer_builder_steps_megatron_fsdp_diag_sidecars(
     if setup["world_size"] < 2:
         pytest.skip("Matrix-sharded Megatron-FSDP smoke requires at least 2 ranks.")
 
-    mfsdp_model = _build_fsdp_toy_matrix_model(setup)
+    mfsdp_model = _build_fsdp_toy_matrix_model(setup, transformer_engine=True)
     matrix_param = next(mfsdp_model.parameters())
     matrix_spec = get_matrix_shard_spec(matrix_param)
     assert matrix_spec is not None
@@ -502,12 +545,12 @@ def test_public_matrix_optimizer_builder_steps_megatron_fsdp_diag_sidecars(
     loss.backward()
 
     collection_param = getattr(matrix_param, "orig_param", matrix_param)
+    assert getattr(collection_param, "_feature_gram_collector", None) == "transformer_engine"
+    assert getattr(collection_param, "_te_extra_wgrad", None) is not None
     if input_preconditioner == "feature_gram":
-        maybe_accumulate_feature_gram(collection_param, x)
         assert matrix_param.main_grad_feature_count.item() > 0
         assert tuple(matrix_param.main_grad_feature_gram.shape) == (matrix_spec.local_shape[1],)
     if output_preconditioner == "grad_gram":
-        maybe_accumulate_grad_gram(collection_param, output.detach() - y)
         assert matrix_param.main_grad_grad_count.item() > 0
 
     update_successful, _, _ = optimizer.step()
@@ -522,6 +565,35 @@ def test_public_matrix_optimizer_builder_steps_megatron_fsdp_diag_sidecars(
         grad_gram = get_grad_gram_for_optimizer(matrix_param)
         assert tuple(grad_gram.shape) == (matrix_spec.local_shape[0],)
     optimizer.zero_grad()
+    dist.barrier()
+
+
+@pytest.mark.distributed
+def test_public_matrix_optimizer_builder_rejects_non_te_fsdp_sidecars(distributed_cuda_setup):
+    setup = distributed_cuda_setup
+    if setup["world_size"] < 2:
+        pytest.skip("Matrix-sharded Megatron-FSDP smoke requires at least 2 ranks.")
+
+    mfsdp_model = _build_fsdp_toy_matrix_model(setup, transformer_engine=False)
+    config = OptimizerConfig(
+        lr=0.01,
+        weight_decay=0.0,
+        clip_grad=0.0,
+        matrix_optimizer="muon",
+        matrix_input_preconditioner="feature_gram",
+        matrix_input_preconditioner_ridge=1.0e-3,
+        use_distributed_optimizer=True,
+        use_layer_wise_distributed_optimizer=True,
+        use_megatron_fsdp=True,
+    )
+
+    with pytest.raises(RuntimeError, match="require Transformer Engine collection"):
+        get_megatron_matrix_optimizer(
+            config,
+            [mfsdp_model],
+            pg_collection=_world_process_groups(),
+            use_gloo_process_groups=False,
+        )
     dist.barrier()
 
 

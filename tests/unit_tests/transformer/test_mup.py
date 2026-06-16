@@ -318,7 +318,7 @@ class TestMuPConfigValidation:
                 experimental_attention_variant='gated_delta_net',
                 linear_attention_freq=1,
             )
-        with pytest.raises(NotImplementedError, match='MoE depth transfer'):
+        with pytest.raises(NotImplementedError, match='MoE needs a separate'):
             TransformerConfig(
                 hidden_size=1024,
                 num_layers=12,
@@ -334,7 +334,7 @@ class TestMuPConfigValidation:
                 scaling_recipe='depth_mup',
                 is_hybrid_model=True,
             )
-        with pytest.raises(NotImplementedError, match='MTP depth transfer'):
+        with pytest.raises(NotImplementedError, match='MTP needs a separate'):
             TransformerConfig(
                 hidden_size=1024,
                 num_layers=12,
@@ -343,13 +343,23 @@ class TestMuPConfigValidation:
                 mtp_num_layers=1,
             )
 
-    def test_depth_mup_rejects_matrix_optimizer(self):
-        with pytest.raises(ValueError, match="matrix_optimizer"):
+    def test_depth_mup_accepts_matrix_optimizer_policy(self):
+        for matrix_optimizer in ('sgd', 'muon'):
             validate_depth_mup_optimizer_support(
                 SimpleNamespace(
                     scaling_recipe='depth_mup',
                     optimizer='adam',
-                    matrix_optimizer='muon',
+                    matrix_optimizer=matrix_optimizer,
+                    weight_decay=0.0,
+                    decoupled_weight_decay=True,
+                )
+            )
+        with pytest.raises(ValueError, match="matrix optimizer policy"):
+            validate_depth_mup_optimizer_support(
+                SimpleNamespace(
+                    scaling_recipe='depth_mup',
+                    optimizer='adam',
+                    matrix_optimizer='adaptive_muon',
                     weight_decay=0.0,
                     decoupled_weight_decay=True,
                 )
@@ -1418,12 +1428,80 @@ class TestMuPConfigIntegration:
         )
         submodules = TransformerLayerSubmodules(cross_attention=DummyCrossAttention)
 
-        with pytest.raises(NotImplementedError, match='Cross-attention is out of scope for v1'):
+        with pytest.raises(NotImplementedError, match='Cross-attention needs a separate'):
             TransformerLayer(config=config, submodules=submodules)
 
 
 class TestMuPOptimizerTypeHandling:
     """Tests for MuP optimizer-specific override behavior."""
+
+    def test_depth_mup_matrix_policy_is_not_top_level_sgd_support(self):
+        config_args = SimpleNamespace(
+            hidden_size=1024,
+            num_layers=12,
+            num_attention_heads=16,
+            scaling_recipe='depth_mup',
+            scaling_base_hidden_size=256,
+            scaling_base_num_layers=6,
+            scaling_base_head_dim=None,
+            scaling_residual_branch_depth_power=None,
+            scaling_hidden_lr_depth_power=None,
+            scaling_block_out_proj_init_depth_power=None,
+            use_mup=False,
+            mup_width_mult=1.0,
+            mup_base_hidden_size=None,
+            mup_embedding_mult=1.0,
+            mup_output_mult=1.0,
+            mup_base_head_dim=None,
+            mup_attn_scale_power=1.0,
+        )
+        with pytest.raises(ValueError, match="top-level optimizer"):
+            build_training_scaling_policy(config_args, optimizer_type='sgd')
+        build_training_scaling_policy(
+            config_args, optimizer_type='sgd', matrix_optimizer_policy=True
+        )
+        build_training_scaling_policy(
+            config_args, optimizer_type='muon', matrix_optimizer_policy=True
+        )
+
+    def test_depth_mup_matrix_optimizer_overrides_build_for_supported_families(self):
+        config_args = SimpleNamespace(
+            hidden_size=1024,
+            num_layers=12,
+            num_attention_heads=16,
+            scaling_recipe='depth_mup',
+            scaling_base_hidden_size=256,
+            scaling_base_num_layers=6,
+            scaling_base_head_dim=None,
+            scaling_residual_branch_depth_power=None,
+            scaling_hidden_lr_depth_power=None,
+            scaling_block_out_proj_init_depth_power=None,
+            use_mup=False,
+            mup_width_mult=1.0,
+            mup_base_hidden_size=None,
+            mup_embedding_mult=1.0,
+            mup_output_mult=1.0,
+            mup_base_head_dim=None,
+            mup_attn_scale_power=1.0,
+        )
+        fallback_scaling_policy = build_training_scaling_policy(
+            config_args, optimizer_type='adam'
+        )
+        for matrix_optimizer in ('sgd', 'muon'):
+            optimizer_config = OptimizerConfig(
+                optimizer='adam',
+                matrix_optimizer=matrix_optimizer,
+                lr=1e-3,
+                min_lr=1e-5,
+                weight_decay=0.0,
+                decoupled_weight_decay=True,
+            )
+            overrides = get_matrix_optimizer_config_overrides(
+                optimizer_config,
+                fallback_config_overrides={},
+                scaling_policy=fallback_scaling_policy,
+            )
+            assert overrides is not None
 
     def _depth_mup_adamw_overrides(self, *, apply_wd_to_qk_layernorm=False):
         config_args = SimpleNamespace(

@@ -340,7 +340,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if config.scaling_recipe == 'depth_mup' and uses_cross_attention:
             raise NotImplementedError(
                 "scaling_recipe='depth_mup' currently supports dense GPT-style residual "
-                "self-attention-only Transformer blocks. Cross-attention is out of scope for v1."
+                "self-attention-only Transformer blocks. Cross-attention needs a separate "
+                "depth-transfer contract."
             )
 
         self.submodules_config = submodules

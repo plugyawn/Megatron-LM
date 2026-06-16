@@ -32,16 +32,70 @@ def test_matrix_optimizer_megatron_fsdp_no_sidecar_allowed():
     validate_matrix_optimizer_fsdp_support(args)
 
 
-def test_matrix_optimizer_megatron_fsdp_sidecar_rejected_until_buffer_routing():
+def test_matrix_optimizer_megatron_fsdp_diag_sidecar_allowed():
     args = SimpleNamespace(
         matrix_optimizer="muon",
         matrix_input_preconditioner="feature_gram",
+        matrix_input_preconditioner_approximation="diag",
+        matrix_input_preconditioner_refresh_interval=1,
+        matrix_input_preconditioner_ema_beta=None,
+        matrix_input_preconditioner_activation_dtype="bf16_saved",
         matrix_output_preconditioner="none",
+        matrix_tp_update_mode="small_gram_ns",
         use_megatron_fsdp=True,
         use_torch_fsdp2=False,
     )
 
-    with pytest.raises(ValueError, match="no-sidecar matrix updates only"):
+    validate_matrix_optimizer_fsdp_support(args)
+
+
+def test_matrix_optimizer_megatron_fsdp_full_sidecar_rejected():
+    args = SimpleNamespace(
+        matrix_optimizer="muon",
+        matrix_input_preconditioner="feature_gram",
+        matrix_input_preconditioner_approximation="full",
+        matrix_input_preconditioner_refresh_interval=1,
+        matrix_input_preconditioner_ema_beta=None,
+        matrix_input_preconditioner_activation_dtype="bf16_saved",
+        matrix_output_preconditioner="none",
+        matrix_tp_update_mode="small_gram_ns",
+        use_megatron_fsdp=True,
+        use_torch_fsdp2=False,
+    )
+
+    with pytest.raises(ValueError, match="FEATURE_GRAM diag sidecars only"):
+        validate_matrix_optimizer_fsdp_support(args)
+
+
+def test_matrix_optimizer_megatron_fsdp_fp8_dequant_sidecar_rejected():
+    args = SimpleNamespace(
+        matrix_optimizer="muon",
+        matrix_input_preconditioner="feature_gram",
+        matrix_input_preconditioner_approximation="diag",
+        matrix_input_preconditioner_refresh_interval=1,
+        matrix_input_preconditioner_ema_beta=None,
+        matrix_input_preconditioner_activation_dtype="fp8_dequant",
+        matrix_output_preconditioner="none",
+        matrix_tp_update_mode="small_gram_ns",
+        use_megatron_fsdp=True,
+        use_torch_fsdp2=False,
+    )
+
+    with pytest.raises(ValueError, match="activation_dtype=fp8_dequant"):
+        validate_matrix_optimizer_fsdp_support(args)
+
+
+def test_matrix_optimizer_megatron_fsdp_block_local_rejected():
+    args = SimpleNamespace(
+        matrix_optimizer="muon",
+        matrix_input_preconditioner="none",
+        matrix_output_preconditioner="none",
+        matrix_tp_update_mode="block_local",
+        use_megatron_fsdp=True,
+        use_torch_fsdp2=False,
+    )
+
+    with pytest.raises(ValueError, match="matrix-tp-update-mode=block_local"):
         validate_matrix_optimizer_fsdp_support(args)
 
 

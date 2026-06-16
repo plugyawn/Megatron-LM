@@ -390,6 +390,7 @@ def get_matrix_optimizer_config_overrides(
     matrix_scaling_policy = TrainingScalingPolicy(
         context=scaling_policy.context,
         optimizer_type=config.matrix_optimizer,
+        matrix_optimizer_policy=True,
     )
     matrix_config_overrides = get_standard_config_overrides(
         config=config, scaling_policy=matrix_scaling_policy

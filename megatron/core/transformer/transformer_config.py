@@ -2004,27 +2004,30 @@ class TransformerConfig(ModelParallelConfig):
             if self.is_hybrid_model:
                 raise NotImplementedError(
                     "scaling_recipe='depth_mup' currently supports dense GPT-style residual "
-                    "Transformer blocks only. Hybrid/Mamba layer patterns are out of scope for v1."
+                    "Transformer blocks only. Hybrid/Mamba layer patterns need a separate "
+                    "depth-transfer contract."
                 )
             if self.mtp_num_layers is not None and self.mtp_num_layers > 0:
                 raise NotImplementedError(
                     "scaling_recipe='depth_mup' currently supports standard next-token "
-                    "training only. MTP depth transfer is out of scope for v1."
+                    "training only. MTP needs a separate depth-transfer contract."
                 )
             if self.multi_latent_attention:
                 raise NotImplementedError(
                     "scaling_recipe='depth_mup' currently supports dense GPT-style residual "
-                    "self-attention only. multi_latent_attention is out of scope for v1."
+                    "self-attention only. multi_latent_attention needs a separate "
+                    "depth-transfer contract."
                 )
             if self.experimental_attention_variant is not None:
                 raise NotImplementedError(
                     "scaling_recipe='depth_mup' currently supports dense GPT-style residual "
-                    "self-attention only. experimental attention variants are out of scope for v1."
+                    "self-attention only. experimental attention variants need a separate "
+                    "depth-transfer contract."
                 )
             if self.num_moe_experts is not None:
                 raise NotImplementedError(
                     "scaling_recipe='depth_mup' currently supports dense GPT-style residual "
-                    "Transformer blocks only. MoE depth transfer is out of scope for v1."
+                    "Transformer blocks only. MoE needs a separate depth-transfer contract."
                 )
 
         # MuP (Maximal Update Parameterization) configuration

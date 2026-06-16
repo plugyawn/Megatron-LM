@@ -46,6 +46,17 @@ MatrixInplaceUpdateRuleFn = Callable[
     bool,
 ]
 
+_MATRIX_SIDECAR_IDENTITY_ATTRS = (
+    "_matrix_optimizer_param_name",
+    "megatron_fsdp_param_name",
+    "_megatron_fsdp_param_name",
+    "_mcore_matrix_param_name",
+    "_mcore_param_name",
+    "_fsdp_param_name",
+    "_param_name",
+    "param_name",
+)
+
 
 def default_matrix_apply_plan(
     param: torch.nn.Parameter, *, tp_update_mode: TPUpdateMode
@@ -157,13 +168,18 @@ class MatrixFunctionOptimizer(torch.optim.Optimizer):
     def state_dict(self):
         state_dict = super().state_dict()
         state_dict["matrix_step"] = self._matrix_step
+        sidecar_state = self._matrix_sidecar_state_dict()
+        if sidecar_state is not None:
+            state_dict["matrix_sidecar_state"] = sidecar_state
         return state_dict
 
     def load_state_dict(self, state_dict):
         matrix_step = state_dict.get("matrix_step", 0)
+        sidecar_state = state_dict.get("matrix_sidecar_state")
         super().load_state_dict(state_dict)
         self._matrix_step = int(matrix_step)
         self._refresh_matrix_state_specs()
+        self._load_matrix_sidecar_state(sidecar_state)
 
     def _model_param_for_factor(self, param: torch.nn.Parameter) -> torch.nn.Parameter:
         return getattr(param, "_matrix_update_model_param", param)
@@ -178,6 +194,238 @@ class MatrixFunctionOptimizer(torch.optim.Optimizer):
                     factor_params.append(factor_param)
                     seen.add(id(factor_param))
         return factor_params
+
+    def _matrix_sidecar_param_identity(
+        self, param: torch.nn.Parameter, *, index: int
+    ) -> str:
+        model_param = self._model_param_for_factor(param)
+        for candidate in (model_param, param):
+            for attr in _MATRIX_SIDECAR_IDENTITY_ATTRS:
+                value = getattr(candidate, attr, None)
+                if isinstance(value, str) and value:
+                    return value
+        return f"index:{index}"
+
+    def _matrix_sidecar_state_dict(self) -> Optional[dict]:
+        params_state = {}
+        params_by_identity = {}
+        for index, param in enumerate(self._factor_params()):
+            param_state = {}
+            if hasattr(param, "_feature_gram_recipe"):
+                param_state.update(
+                    {
+                        "feature_gram": param.main_grad_feature_gram.detach().clone(),
+                        "feature_count": param.main_grad_feature_count.detach().clone(),
+                        "feature_finalized": bool(
+                            getattr(param, "_feature_gram_finalized", False)
+                        ),
+                        "feature_has_rows": bool(getattr(param, "_feature_gram_has_rows", False)),
+                        "feature_collected_rows": int(
+                            getattr(param, "_feature_gram_collected_rows", 0)
+                        ),
+                        "feature_generation": int(
+                            getattr(param, "_feature_gram_generation", 0)
+                        ),
+                    }
+                )
+                if hasattr(param, "main_grad_feature_sum"):
+                    param_state["feature_sum"] = param.main_grad_feature_sum.detach().clone()
+            if hasattr(param, "_grad_gram_recipe"):
+                param_state.update(
+                    {
+                        "grad_gram": param.main_grad_grad_gram.detach().clone(),
+                        "grad_count": param.main_grad_grad_count.detach().clone(),
+                        "grad_finalized": bool(getattr(param, "_grad_gram_finalized", False)),
+                        "grad_has_rows": bool(getattr(param, "_grad_gram_has_rows", False)),
+                        "grad_collected_rows": int(
+                            getattr(param, "_grad_gram_collected_rows", 0)
+                        ),
+                        "grad_generation": int(getattr(param, "_grad_gram_generation", 0)),
+                    }
+                )
+            if param_state:
+                identity = self._matrix_sidecar_param_identity(param, index=index)
+                if identity in params_by_identity:
+                    raise RuntimeError(
+                        "Matrix optimizer sidecar checkpoint identities must be unique; "
+                        f"duplicate identity {identity!r}."
+                    )
+                param_state["param_identity"] = identity
+                params_state[str(index)] = param_state
+                params_by_identity[identity] = param_state
+        if not params_state:
+            return None
+        return {"version": 1, "params": params_state, "params_by_identity": params_by_identity}
+
+    def _restore_sidecar_tensor(
+        self,
+        param: torch.nn.Parameter,
+        *,
+        checkpoint_state: dict,
+        checkpoint_name: str,
+        param_attr: str,
+    ) -> None:
+        if checkpoint_name not in checkpoint_state:
+            raise RuntimeError(
+                f"Matrix optimizer sidecar checkpoint is missing {checkpoint_name!r}."
+            )
+        if not hasattr(param, param_attr):
+            raise RuntimeError(
+                f"Matrix optimizer sidecar checkpoint contains {checkpoint_name!r}, "
+                f"but the current parameter has no {param_attr!r} buffer."
+            )
+        source = checkpoint_state[checkpoint_name]
+        target = getattr(param, param_attr)
+        if not isinstance(source, torch.Tensor):
+            raise RuntimeError(
+                f"Matrix optimizer sidecar checkpoint field {checkpoint_name!r} must be a tensor."
+            )
+        if tuple(source.shape) != tuple(target.shape):
+            raise RuntimeError(
+                f"Matrix optimizer sidecar checkpoint field {checkpoint_name!r} shape "
+                f"does not match current sidecar buffer: checkpoint={tuple(source.shape)}, "
+                f"current={tuple(target.shape)}."
+            )
+        target.copy_(source.to(device=target.device, dtype=target.dtype))
+
+    def _load_matrix_sidecar_state(self, sidecar_state: Optional[dict]) -> None:
+        factor_params = self._factor_params()
+        current_has_sidecars = any(
+            hasattr(param, "_feature_gram_recipe") or hasattr(param, "_grad_gram_recipe")
+            for param in factor_params
+        )
+        if sidecar_state is None:
+            if current_has_sidecars:
+                raise RuntimeError(
+                    "Matrix optimizer checkpoint is missing matrix_sidecar_state for "
+                    "sidecar-enabled matrix parameters."
+                )
+            return
+        if not isinstance(sidecar_state, dict) or sidecar_state.get("version") != 1:
+            raise RuntimeError(
+                "Matrix optimizer sidecar checkpoint metadata must be a dict with version=1."
+            )
+        params_state = sidecar_state.get("params")
+        if not isinstance(params_state, dict):
+            raise RuntimeError("Matrix optimizer sidecar checkpoint is missing params.")
+        params_by_identity = sidecar_state.get("params_by_identity", None)
+        if params_by_identity is not None and not isinstance(params_by_identity, dict):
+            raise RuntimeError(
+                "Matrix optimizer sidecar checkpoint field params_by_identity must be a dict."
+            )
+        for index, param in enumerate(factor_params):
+            current_identity = self._matrix_sidecar_param_identity(param, index=index)
+            checkpoint_state = None
+            if params_by_identity is not None:
+                checkpoint_state = params_by_identity.get(current_identity)
+            if checkpoint_state is None:
+                checkpoint_state = params_state.get(str(index))
+            param_has_sidecar = hasattr(param, "_feature_gram_recipe") or hasattr(
+                param, "_grad_gram_recipe"
+            )
+            if checkpoint_state is None:
+                if param_has_sidecar:
+                    raise RuntimeError(
+                        "Matrix optimizer sidecar checkpoint is missing state for "
+                        f"factor parameter index {index} ({current_identity!r})."
+                    )
+                continue
+            if not isinstance(checkpoint_state, dict):
+                raise RuntimeError(
+                    f"Matrix optimizer sidecar checkpoint entry {index} must be a dict."
+                )
+            checkpoint_identity = checkpoint_state.get("param_identity")
+            if checkpoint_identity is not None and checkpoint_identity != current_identity:
+                raise RuntimeError(
+                    "Matrix optimizer sidecar checkpoint identity does not match current "
+                    f"factor parameter index {index}: checkpoint={checkpoint_identity!r}, "
+                    f"current={current_identity!r}."
+                )
+            allowed_keys = {"param_identity"}
+            if hasattr(param, "_feature_gram_recipe"):
+                allowed_keys.update(
+                    {
+                        "feature_gram",
+                        "feature_count",
+                        "feature_finalized",
+                        "feature_has_rows",
+                        "feature_collected_rows",
+                        "feature_generation",
+                    }
+                )
+                if hasattr(param, "main_grad_feature_sum"):
+                    allowed_keys.add("feature_sum")
+            if hasattr(param, "_grad_gram_recipe"):
+                allowed_keys.update(
+                    {
+                        "grad_gram",
+                        "grad_count",
+                        "grad_finalized",
+                        "grad_has_rows",
+                        "grad_collected_rows",
+                        "grad_generation",
+                    }
+                )
+            unexpected_keys = sorted(set(checkpoint_state) - allowed_keys)
+            if unexpected_keys:
+                raise RuntimeError(
+                    "Matrix optimizer sidecar checkpoint contains fields that do not "
+                    f"match the current sidecar configuration for factor parameter "
+                    f"index {index}: {unexpected_keys}."
+                )
+            if hasattr(param, "_feature_gram_recipe"):
+                self._restore_sidecar_tensor(
+                    param,
+                    checkpoint_state=checkpoint_state,
+                    checkpoint_name="feature_gram",
+                    param_attr="main_grad_feature_gram",
+                )
+                self._restore_sidecar_tensor(
+                    param,
+                    checkpoint_state=checkpoint_state,
+                    checkpoint_name="feature_count",
+                    param_attr="main_grad_feature_count",
+                )
+                if hasattr(param, "main_grad_feature_sum"):
+                    self._restore_sidecar_tensor(
+                        param,
+                        checkpoint_state=checkpoint_state,
+                        checkpoint_name="feature_sum",
+                        param_attr="main_grad_feature_sum",
+                    )
+                param._feature_gram_finalized = bool(
+                    checkpoint_state.get("feature_finalized", False)
+                )
+                param._feature_gram_has_rows = bool(
+                    checkpoint_state.get("feature_has_rows", False)
+                )
+                param._feature_gram_collected_rows = int(
+                    checkpoint_state.get("feature_collected_rows", 0)
+                )
+                param._feature_gram_generation = int(
+                    checkpoint_state.get("feature_generation", 0)
+                )
+            if hasattr(param, "_grad_gram_recipe"):
+                self._restore_sidecar_tensor(
+                    param,
+                    checkpoint_state=checkpoint_state,
+                    checkpoint_name="grad_gram",
+                    param_attr="main_grad_grad_gram",
+                )
+                self._restore_sidecar_tensor(
+                    param,
+                    checkpoint_state=checkpoint_state,
+                    checkpoint_name="grad_count",
+                    param_attr="main_grad_grad_count",
+                )
+                param._grad_gram_finalized = bool(
+                    checkpoint_state.get("grad_finalized", False)
+                )
+                param._grad_gram_has_rows = bool(checkpoint_state.get("grad_has_rows", False))
+                param._grad_gram_collected_rows = int(
+                    checkpoint_state.get("grad_collected_rows", 0)
+                )
+                param._grad_gram_generation = int(checkpoint_state.get("grad_generation", 0))
 
     def _matrix_shard_spec_for_state(
         self, param: torch.nn.Parameter

@@ -32,6 +32,7 @@ from megatron.core.matrix_update import (
     MatrixPreconditionerKind,
     MatrixPreconditionerNormalization,
     MatrixPreconditionerScope,
+    attach_transformer_engine_extra_wgrad_request,
     configure_matrix_update_param,
     configure_model_matrix_updates,
     get_matrix_optimizer_info,
@@ -262,17 +263,27 @@ class MegatronFSDPOptimizer(MegatronOptimizer):
         return sorted(local_keys)
 
     def _optimizer_state_step_value(self) -> Optional[float]:
+        def scalar_step_value(step) -> Optional[float]:
+            if torch.is_tensor(step) and step.numel() == 1:
+                return float(step.detach().cpu().item())
+            if isinstance(step, (int, float)):
+                return float(step)
+            return None
+
         local_step = None
         for param_state in self.optimizer.state.values():
             if not isinstance(param_state, dict) or "step" not in param_state:
                 continue
-            step = param_state["step"]
-            if torch.is_tensor(step) and step.numel() == 1:
-                local_step = float(step.detach().cpu().item())
+            local_step = scalar_step_value(param_state["step"])
+            if local_step is not None:
                 break
-            if isinstance(step, (int, float)):
-                local_step = float(step)
-                break
+        if local_step is None:
+            for group in self.optimizer.param_groups:
+                if "step" not in group:
+                    continue
+                local_step = scalar_step_value(group["step"])
+                if local_step is not None:
+                    break
         if torch.distributed.is_initialized():
             gathered_steps = [None] * torch.distributed.get_world_size()
             torch.distributed.all_gather_object(gathered_steps, local_step)
@@ -463,12 +474,13 @@ class MegatronFSDPOptimizer(MegatronOptimizer):
         step_value = self._optimizer_state_step_value()
         packed_state = {}
         for param_idx, param_state in state_dict.get("state", {}).items():
+            packed_param_state = dict(param_state) if isinstance(param_state, dict) else param_state
             if isinstance(param_idx, int) and param_idx in index_to_name:
-                packed_state[index_to_name[param_idx]] = param_state
+                packed_state[index_to_name[param_idx]] = packed_param_state
             elif isinstance(param_idx, str) and param_idx.isdigit() and int(param_idx) in index_to_name:
-                packed_state[index_to_name[int(param_idx)]] = param_state
+                packed_state[index_to_name[int(param_idx)]] = packed_param_state
             else:
-                packed_state[param_idx] = param_state
+                packed_state[param_idx] = packed_param_state
         if is_loading:
             self._add_load_state_placeholders(packed_state)
         else:
@@ -543,6 +555,38 @@ class _ChainedTorchOptimizer(torch.optim.Optimizer):
                     if param in self.state:
                         optimizer.state[param] = self.state[param]
 
+    def _restore_child_param_group_step(self, optimizer: torch.optim.Optimizer) -> None:
+        """Convert per-param checkpoint step into TE-style group step when required."""
+        name_to_dtype_map = getattr(optimizer, "name_to_dtype_map", None)
+        if not isinstance(name_to_dtype_map, dict) or "step" in name_to_dtype_map:
+            return
+
+        steps = []
+        for param_state in getattr(optimizer, "state", {}).values():
+            if not isinstance(param_state, dict) or "step" not in param_state:
+                continue
+            step = param_state.pop("step")
+            if torch.is_tensor(step) and step.numel() == 1:
+                steps.append(int(step.detach().cpu().item()))
+            elif isinstance(step, (int, float)):
+                steps.append(int(step))
+            else:
+                raise ValueError(
+                    "Cannot convert non-scalar per-parameter optimizer step "
+                    "to TE-style param-group step."
+                )
+        if not steps:
+            return
+        if len(set(steps)) != 1:
+            raise ValueError(
+                "Cannot restore TE-style param-group step from inconsistent "
+                f"per-parameter checkpoint steps: {steps}."
+            )
+        step = steps[0]
+        for param_group in optimizer.param_groups:
+            if len(param_group.get("params", [])) > 0:
+                param_group["step"] = step
+
     def step(self, *args, **kwargs):
         loss = None
         for optimizer in self.optimizers:
@@ -584,6 +628,8 @@ class _ChainedTorchOptimizer(torch.optim.Optimizer):
     def load_state_dict(self, state_dict):
         super().load_state_dict(state_dict)
         self._sync_children_from_self()
+        for optimizer in self.optimizers:
+            self._restore_child_param_group_step(optimizer)
         child_extra_states = state_dict.get("_child_optimizer_extra_state")
         if child_extra_states is None:
             child_extra_states = [{} for _ in self.optimizers]
@@ -610,6 +656,10 @@ class _ChainedTorchOptimizer(torch.optim.Optimizer):
             if not child_extra_state:
                 continue
             child_state_dict = optimizer.state_dict()
+            child_state_dict = {
+                "state": child_state_dict["state"],
+                "param_groups": child_state_dict["param_groups"],
+            }
             child_state_dict.update(child_extra_state)
             optimizer.load_state_dict(child_state_dict)
         self._refresh_state_from_children()
@@ -686,6 +736,57 @@ def _fsdp_small_gram_process_group(matrix_shard_spec, pg_collection: ProcessGrou
     return process_group
 
 
+def _fsdp_unpad_local_matrix_shard(
+    local_matrix: torch.Tensor,
+    matrix_shard_spec,
+) -> tuple[torch.Tensor, tuple[int, int]]:
+    """Return the semantic local matrix shard and the physical local shape.
+
+    Megatron-FSDP may pad the physical local DTensor shard along the matrix DP
+    shard axis. Muon must operate only on the semantic matrix coordinates, but
+    the returned update must later be padded back to the physical local shape so
+    the optimizer update matches the local DTensor parameter.
+    """
+
+    local_shape = tuple(local_matrix.shape)
+    semantic_shape = tuple(matrix_shard_spec.local_shape)
+    if local_shape == semantic_shape:
+        return local_matrix, local_shape
+
+    if len(local_shape) != 2 or len(semantic_shape) != 2:
+        raise RuntimeError(
+            "Matrix FSDP Muon requires 2D local and semantic matrix shard shapes, got "
+            f"local_matrix={local_shape}, spec.local_shape={semantic_shape}."
+        )
+    if local_shape[0] < semantic_shape[0] or local_shape[1] < semantic_shape[1]:
+        raise RuntimeError(
+            "Matrix FSDP Muon physical local shard is smaller than MatrixShardSpec: "
+            f"local_matrix={local_shape}, spec.local_shape={semantic_shape}."
+        )
+    if matrix_shard_spec.dp_shard_axis == 0 and local_shape[1] != semantic_shape[1]:
+        raise RuntimeError(
+            "Matrix FSDP Muon row-sharded padding may only occur on the row axis: "
+            f"local_matrix={local_shape}, spec.local_shape={semantic_shape}."
+        )
+    if matrix_shard_spec.dp_shard_axis == 1 and local_shape[0] != semantic_shape[0]:
+        raise RuntimeError(
+            "Matrix FSDP Muon column-sharded padding may only occur on the column axis: "
+            f"local_matrix={local_shape}, spec.local_shape={semantic_shape}."
+        )
+    return local_matrix[: semantic_shape[0], : semantic_shape[1]], local_shape
+
+
+def _fsdp_restore_padded_local_update(
+    local_update: torch.Tensor,
+    physical_shape: tuple[int, int],
+) -> torch.Tensor:
+    if tuple(local_update.shape) == physical_shape:
+        return local_update
+    padded_update = local_update.new_zeros(physical_shape)
+    padded_update[: local_update.shape[0], : local_update.shape[1]].copy_(local_update)
+    return padded_update
+
+
 def _fsdp_small_gram_newton_schulz_allreduce(
     local_matrix: torch.Tensor,
     matrix_shard_spec,
@@ -706,12 +807,10 @@ def _fsdp_small_gram_newton_schulz_allreduce(
             "Matrix FSDP Muon requires a 2D local matrix shard, got "
             f"{tuple(local_matrix_for_update.shape)}."
         )
-    if tuple(local_matrix_for_update.shape) != tuple(matrix_shard_spec.local_shape):
-        raise RuntimeError(
-            "Matrix FSDP Muon local shard shape does not match MatrixShardSpec: "
-            f"local_matrix={tuple(local_matrix_for_update.shape)}, "
-            f"spec.local_shape={matrix_shard_spec.local_shape}."
-        )
+    local_matrix_for_update, physical_shape = _fsdp_unpad_local_matrix_shard(
+        local_matrix_for_update,
+        matrix_shard_spec,
+    )
     tp_layout = _fsdp_small_gram_tp_layout(matrix_shard_spec)
     local_update = tp_small_gram_newton_schulz_allreduce(
         local_matrix_for_update,
@@ -722,6 +821,7 @@ def _fsdp_small_gram_newton_schulz_allreduce(
         coefficient_type=config.muon_coefficient_type,
         use_syrk=False,
     )
+    local_update = _fsdp_restore_padded_local_update(local_update, physical_shape)
     if dtensor_template is not None:
         return DTensor.from_local(
             local_update,
@@ -1020,28 +1120,42 @@ def _configured_fsdp_matrix_params(
                     "Megatron-FSDP matrix optimizer parameter is missing MatrixShardSpec "
                     "metadata after FSDP wrapping."
                 )
-            _configure_fsdp_diag_sidecars(param, config)
+            _configure_fsdp_sidecars(param, config)
             configured.append(param)
     return configured
 
 
 def _validate_fsdp_matrix_sidecar_config(config: OptimizerConfig) -> None:
-    """Allow only transient diagonal sidecars under Megatron-FSDP v1."""
+    """Fail closed for Megatron-FSDP sidecar surfaces without full contracts."""
 
+    if config.matrix_tp_update_mode == "block_local":
+        raise RuntimeError(
+            "Megatron-FSDP matrix optimizers do not support matrix_tp_update_mode=block_local. "
+            "Megatron-FSDP matrix updates use MatrixShardSpec-driven small-Gram semantics."
+        )
     if config.matrix_input_preconditioner == "feature_gram":
         if config.matrix_input_preconditioner_approximation != "diag":
             raise RuntimeError(
-                "Megatron-FSDP FEATURE_GRAM sidecars support diag approximation only; "
-                "full and block_diag require explicit sidecar sharding/checkpoint contracts."
+                "Megatron-FSDP FEATURE_GRAM full/block_diag sidecars require MatrixFactorShardSpec "
+                "routing, distributed solve/apply, and checkpoint contracts before production use."
             )
         if config.matrix_input_preconditioner_refresh_interval != 1:
             raise RuntimeError(
-                "Megatron-FSDP FEATURE_GRAM sidecars require refresh_interval=1; cached "
-                "sidecar checkpoint/resume semantics are not implemented yet."
+                "Megatron-FSDP FEATURE_GRAM refresh_interval > 1 requires graph-aware "
+                "sidecar state refresh, checkpoint persistence, and resume validation "
+                "before enabling this configuration."
             )
         if config.matrix_input_preconditioner_ema_beta is not None:
             raise RuntimeError(
-                "Megatron-FSDP FEATURE_GRAM sidecars do not support EMA state yet."
+                "Megatron-FSDP FEATURE_GRAM EMA requires persistent sidecar state, "
+                "graph-aware updates, and checkpoint/resume validation before enabling "
+                "this configuration."
+            )
+        if config.matrix_input_preconditioner_activation_dtype == "fp8_dequant":
+            raise RuntimeError(
+                "Megatron-FSDP FEATURE_GRAM activation_dtype=fp8_dequant requires an "
+                "explicit Transformer Engine FP8 dequant sidecar collection contract "
+                "before production use."
             )
     elif config.matrix_input_preconditioner != "none":
         raise RuntimeError("Megatron-FSDP matrix input sidecar must be none or feature_gram.")
@@ -1049,17 +1163,20 @@ def _validate_fsdp_matrix_sidecar_config(config: OptimizerConfig) -> None:
     if config.matrix_output_preconditioner == "grad_gram":
         if config.matrix_output_preconditioner_approximation != "diag":
             raise RuntimeError(
-                "Megatron-FSDP GRAD_GRAM sidecars support diag approximation only; "
-                "full and block_diag require explicit sidecar sharding/checkpoint contracts."
+                "Megatron-FSDP GRAD_GRAM full/block_diag sidecars require MatrixFactorShardSpec "
+                "routing, distributed solve/apply, and checkpoint contracts before production use."
             )
         if config.matrix_output_preconditioner_refresh_interval != 1:
             raise RuntimeError(
-                "Megatron-FSDP GRAD_GRAM sidecars require refresh_interval=1; cached "
-                "sidecar checkpoint/resume semantics are not implemented yet."
+                "Megatron-FSDP GRAD_GRAM refresh_interval > 1 requires graph-aware "
+                "sidecar state refresh, checkpoint persistence, and resume validation "
+                "before enabling this configuration."
             )
         if config.matrix_output_preconditioner_ema_beta is not None:
             raise RuntimeError(
-                "Megatron-FSDP GRAD_GRAM sidecars do not support EMA state yet."
+                "Megatron-FSDP GRAD_GRAM EMA requires persistent sidecar state, "
+                "graph-aware updates, and checkpoint/resume validation before enabling "
+                "this configuration."
             )
     elif config.matrix_output_preconditioner != "none":
         raise RuntimeError("Megatron-FSDP matrix output sidecar must be none or grad_gram.")
@@ -1099,7 +1216,7 @@ def _fsdp_output_diag_recipe(config: OptimizerConfig) -> MatrixOutputPreconditio
     )
 
 
-def _configure_fsdp_diag_sidecars(param: torch.nn.Parameter, config: OptimizerConfig) -> None:
+def _configure_fsdp_sidecars(param: torch.nn.Parameter, config: OptimizerConfig) -> None:
     input_recipe = None
     output_recipe = None
     factors = ExtraWgradFactor.NONE
@@ -1111,6 +1228,15 @@ def _configure_fsdp_diag_sidecars(param: torch.nn.Parameter, config: OptimizerCo
         factors |= ExtraWgradFactor.GRAD_GRAM
     if factors == ExtraWgradFactor.NONE:
         return
+    orig_param = getattr(param, "orig_param", None)
+    collector_param = orig_param if orig_param is not None else param
+    collector = getattr(collector_param, "_feature_gram_collector", "unknown")
+    if collector != "transformer_engine":
+        raise RuntimeError(
+            "Megatron-FSDP matrix sidecars require Transformer Engine collection; "
+            f"got collector={collector!r}."
+        )
+    param._matrix_sidecar_collector = collector
     configure_matrix_update_param(
         param,
         recipe=input_recipe,
@@ -1118,9 +1244,10 @@ def _configure_fsdp_diag_sidecars(param: torch.nn.Parameter, config: OptimizerCo
         factors=factors,
     )
     set_matrix_sidecar_owner(param, param)
-    orig_param = getattr(param, "orig_param", None)
     if orig_param is not None:
         set_matrix_sidecar_owner(orig_param, param)
+        if getattr(orig_param, "_feature_gram_collector", None) == "transformer_engine":
+            attach_transformer_engine_extra_wgrad_request(orig_param, sidecar_param=param)
 
 
 def _megatron_fsdp_owner_for_optimizer_param(param: torch.nn.Parameter) -> object:
@@ -1191,7 +1318,10 @@ def get_megatron_matrix_optimizer(
             "gather/apply/scatter views exist."
         )
     if config.fp16:
-        raise RuntimeError("Matrix optimizers support fp32/bf16 paths in this checkout; fp16 is unsupported.")
+        raise RuntimeError(
+            "Matrix optimizers require fp32 or bf16 parameters; fp16 needs a separate "
+            "precision and update-stability contract before it can be enabled."
+        )
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
@@ -1229,6 +1359,40 @@ def get_megatron_matrix_optimizer(
         logging.INFO,
         f"Setting up {config.matrix_optimizer} for {len(configured_matrix_params)} matrix parameters.",
     )
+    if feature_gram_params or grad_gram_params:
+        sidecar_params_by_id = OrderedDict(
+            (id(param), param) for param in feature_gram_params + grad_gram_params
+        )
+        collector_counts = defaultdict(int)
+        te_request_count = 0
+        for param in sidecar_params_by_id.values():
+            collector_weight = getattr(param, "_te_extra_wgrad_weight", None)
+            collector_param = collector_weight if collector_weight is not None else param
+            collector = getattr(collector_param, "_feature_gram_collector", "unknown")
+            collector_counts[collector] += 1
+            if getattr(collector_param, "_te_extra_wgrad", None) is not None:
+                te_request_count += 1
+        collector_summary = ", ".join(
+            f"{name}:{count}" for name, count in sorted(collector_counts.items())
+        )
+        log_single_rank(
+            logger,
+            logging.INFO,
+            "Matrix sidecar collection configured: "
+            f"feature_gram_params={len(feature_gram_params)}, "
+            f"grad_gram_params={len(grad_gram_params)}, "
+            f"collector_impls={collector_summary}, "
+            f"te_extra_wgrad_requests={te_request_count}.",
+        )
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            print(
+                "Matrix sidecar collection configured: "
+                f"feature_gram_params={len(feature_gram_params)}, "
+                f"grad_gram_params={len(grad_gram_params)}, "
+                f"collector_impls={collector_summary}, "
+                f"te_extra_wgrad_requests={te_request_count}.",
+                flush=True,
+            )
 
     matrix_param_ids = {id(param) for param in configured_matrix_params}
     def is_matrix_param(name: str, param: torch.nn.Parameter) -> bool:

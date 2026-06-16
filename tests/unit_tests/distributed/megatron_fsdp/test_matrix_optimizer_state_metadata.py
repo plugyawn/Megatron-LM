@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
 import importlib
 import os
 from types import SimpleNamespace
@@ -29,11 +30,15 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer impo
 )
 from megatron.core.matrix_update import (
     MATRIX_OPTIMIZER_OWNER_MUON,
+    MatrixFactorShardSpec,
     MatrixOptimizerStateSpec,
+    MatrixPreconditionerApproximation,
+    MatrixPreconditionerKind,
     MatrixShardSpec,
     get_matrix_optimizer_info,
     get_matrix_shard_spec,
     register_matrix_optimizer_param,
+    set_matrix_factor_shard_spec,
     update_matrix_optimizer_state_spec,
     update_matrix_shard_spec,
 )
@@ -223,6 +228,20 @@ def _fake_dtensor_state(shape=(2, 3)):
     return state
 
 
+def _set_feature_factor_spec(param):
+    set_matrix_factor_shard_spec(
+        param,
+        MatrixFactorShardSpec(
+            kind=MatrixPreconditionerKind.FEATURE_GRAM,
+            approximation=MatrixPreconditionerApproximation.DIAG,
+            matrix_axis=1,
+            logical_factor_shape=(param.shape[1],),
+            local_factor_shape=(param.shape[1],),
+            checkpoint_key="matrix_sidecar/feature_gram",
+        ),
+    )
+
+
 def _metadata_for_param(param, **overrides):
     matrix_shard_spec = fully_shard_module.get_matrix_shard_spec(param)
     metadata = {
@@ -238,6 +257,9 @@ def _metadata_for_param(param, **overrides):
         ),
         "matrix_shard_spec": fully_shard_module._matrix_shard_spec_to_checkpoint_dict(
             matrix_shard_spec
+        ),
+        "factor_shard_specs": fully_shard_module._matrix_factor_shard_specs_to_checkpoint_dict(
+            param
         ),
         "same_shard_state_layout": fully_shard_module.MATRIX_OPTIMIZER_SAME_SHARD_STATE_LAYOUT,
         "declared_same_shard_state_names": ["master_param", "momentum_buffer"],
@@ -277,6 +299,7 @@ def test_matrix_optimizer_checkpoint_metadata_round_trip_contract(monkeypatch):
     assert metadata["0"]["matrix_shard_spec"]["pre_dp_local_shape"] is None
     assert metadata["0"]["matrix_shard_spec"]["dp_shard_layout"] == "row_contiguous_flat_buffer"
     assert metadata["0"]["matrix_shard_spec"]["small_gram_side"] == "right"
+    assert metadata["0"]["factor_shard_specs"] == {}
 
     load_state_dict = {
         "state": {0: {"momentum_buffer": _fake_dtensor_state()}},
@@ -286,6 +309,64 @@ def test_matrix_optimizer_checkpoint_metadata_round_trip_contract(monkeypatch):
     fully_shard_module._validate_matrix_optimizer_checkpoint_metadata(
         optimizer, _fake_mfsdp_model(), load_state_dict
     )
+
+
+def test_matrix_optimizer_checkpoint_metadata_records_factor_shard_specs(monkeypatch):
+    monkeypatch.setattr(fully_shard_module, "DTensor", _FakeDTensor)
+    param = _matrix_param()
+    _set_feature_factor_spec(param)
+    optimizer = torch.optim.SGD([param], lr=0.1)
+    optimizer.state[param]["momentum_buffer"] = _fake_dtensor_state()
+    state_dict = {"state": {}, "param_groups": []}
+
+    fully_shard_module._add_matrix_optimizer_checkpoint_metadata(
+        optimizer, _fake_mfsdp_model(), state_dict
+    )
+
+    metadata_block = state_dict[fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_KEY]
+    factor_specs = metadata_block["params"]["0"]["factor_shard_specs"]
+    assert sorted(factor_specs) == ["feature_gram"]
+    feature_spec = factor_specs["feature_gram"]
+    assert feature_spec["kind"] == "feature_gram"
+    assert feature_spec["approximation"] == "diag"
+    assert feature_spec["matrix_axis"] == 1
+    assert feature_spec["logical_factor_shape"] == [3]
+    assert feature_spec["local_factor_shape"] == [3]
+    assert feature_spec["checkpoint_key"] == "matrix_sidecar/feature_gram"
+
+    fully_shard_module._validate_matrix_optimizer_checkpoint_metadata(
+        optimizer,
+        _fake_mfsdp_model(),
+        {
+            "state": {0: {"momentum_buffer": _fake_dtensor_state()}},
+            "param_groups": [],
+            fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_KEY: metadata_block,
+        },
+    )
+
+
+def test_matrix_optimizer_checkpoint_rejects_factor_shard_spec_mismatch(monkeypatch):
+    monkeypatch.setattr(fully_shard_module, "DTensor", _FakeDTensor)
+    param = _matrix_param()
+    _set_feature_factor_spec(param)
+    optimizer = torch.optim.SGD([param], lr=0.1)
+    metadata = _metadata_for_param(param)
+    bad_metadata = copy.deepcopy(metadata)
+    bad_metadata["factor_shard_specs"]["feature_gram"]["local_factor_shape"] = [2]
+
+    with pytest.raises(RuntimeError, match="factor-shard metadata does not match"):
+        fully_shard_module._validate_matrix_optimizer_checkpoint_metadata(
+            optimizer,
+            _fake_mfsdp_model(),
+            {
+                "state": {0: {"momentum_buffer": _fake_dtensor_state()}},
+                "param_groups": [],
+                fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_KEY: {
+                    "version": fully_shard_module.MATRIX_OPTIMIZER_STATE_METADATA_VERSION,
+                    "params": {"0": bad_metadata},
+                },
+            },
+        )
 
 
 def test_matrix_optimizer_checkpoint_rejects_missing_metadata_for_no_state_param():

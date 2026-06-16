@@ -682,45 +682,67 @@ class OptimizerConfig:
                 "--use-distributed-optimizer to use a local matrix optimizer path."
             )
         if self.matrix_optimizer != "none" and self.use_megatron_fsdp:
+            if self.matrix_tp_update_mode == "block_local":
+                raise ValueError(
+                    "Megatron-FSDP matrix optimizers do not support "
+                    "matrix_tp_update_mode=block_local. Megatron-FSDP matrix "
+                    "updates use MatrixShardSpec-driven small-Gram semantics."
+                )
             if self.matrix_input_preconditioner == "feature_gram":
                 if self.matrix_input_preconditioner_approximation != "diag":
                     raise ValueError(
-                        "Megatron-FSDP FEATURE_GRAM sidecars support diag approximation only; "
-                        "full and block_diag require explicit sidecar routing and checkpoint "
-                        "contracts."
+                        "Megatron-FSDP FEATURE_GRAM full/block_diag sidecars require "
+                        "MatrixFactorShardSpec routing, distributed solve/apply, and "
+                        "checkpoint contracts before enabling this configuration."
                     )
                 if self.matrix_input_preconditioner_refresh_interval != 1:
                     raise ValueError(
-                        "Megatron-FSDP FEATURE_GRAM sidecars require refresh_interval=1."
+                        "Megatron-FSDP FEATURE_GRAM refresh_interval > 1 requires "
+                        "graph-aware sidecar state refresh, checkpoint persistence, "
+                        "and resume validation before enabling this configuration."
                     )
                 if self.matrix_input_preconditioner_ema_beta is not None:
                     raise ValueError(
-                        "Megatron-FSDP FEATURE_GRAM sidecars do not support EMA state yet."
+                        "Megatron-FSDP FEATURE_GRAM EMA requires persistent sidecar "
+                        "state, graph-aware updates, and checkpoint/resume validation "
+                        "before enabling this configuration."
+                    )
+                if self.matrix_input_preconditioner_activation_dtype == "fp8_dequant":
+                    raise ValueError(
+                        "Megatron-FSDP FEATURE_GRAM activation_dtype=fp8_dequant "
+                        "requires an explicit Transformer Engine FP8 dequant sidecar "
+                        "collection contract before enabling this configuration."
                     )
             if self.matrix_output_preconditioner == "grad_gram":
                 if self.matrix_output_preconditioner_approximation != "diag":
                     raise ValueError(
-                        "Megatron-FSDP GRAD_GRAM sidecars support diag approximation only; "
-                        "full and block_diag require explicit sidecar routing and checkpoint "
-                        "contracts."
+                        "Megatron-FSDP GRAD_GRAM full/block_diag sidecars require "
+                        "MatrixFactorShardSpec routing, distributed solve/apply, and "
+                        "checkpoint contracts before enabling this configuration."
                     )
                 if self.matrix_output_preconditioner_refresh_interval != 1:
                     raise ValueError(
-                        "Megatron-FSDP GRAD_GRAM sidecars require refresh_interval=1."
+                        "Megatron-FSDP GRAD_GRAM refresh_interval > 1 requires "
+                        "graph-aware sidecar state refresh, checkpoint persistence, "
+                        "and resume validation before enabling this configuration."
                     )
                 if self.matrix_output_preconditioner_ema_beta is not None:
                     raise ValueError(
-                        "Megatron-FSDP GRAD_GRAM sidecars do not support EMA state yet."
+                        "Megatron-FSDP GRAD_GRAM EMA requires persistent sidecar "
+                        "state, graph-aware updates, and checkpoint/resume validation "
+                        "before enabling this configuration."
                     )
         if self.matrix_input_preconditioner == "feature_gram" and self.matrix_input_preconditioner_ema_beta is not None:
             raise ValueError(
                 "matrix_input_preconditioner_ema_beta requires persistent input preconditioner state; "
-                "use None in this checkout."
+                "enable it only after sidecar state ownership, graph-aware updates, and "
+                "checkpoint/resume validation are implemented."
             )
         if self.matrix_output_preconditioner == "grad_gram" and self.matrix_output_preconditioner_ema_beta is not None:
             raise ValueError(
                 "matrix_output_preconditioner_ema_beta requires persistent output preconditioner state; "
-                "use None in this checkout."
+                "enable it only after sidecar state ownership, graph-aware updates, and "
+                "checkpoint/resume validation are implemented."
             )
         if self.matrix_optimizer != "none" and self.matrix_bias_mode == "augmented_feature_sum":
             raise ValueError(
