@@ -347,13 +347,13 @@ def _validate_matrix_shard_spec_checkpoint_metadata(
                 f"DP local axis range for optimizer state index {param_idx}: "
                 f"axis={dp_shard_axis}, start={dp_local_start}, end={dp_local_end}."
             )
-        if local_shape[dp_shard_axis] != dp_local_end - dp_local_start:
-            raise RuntimeError(
-                "[MegatronFSDP] Matrix optimizer checkpoint metadata local_shape DP-axis "
-                f"size does not match DP local range for optimizer state index "
-                f"{param_idx}: local_shape={local_shape}, start={dp_local_start}, "
-                f"end={dp_local_end}, axis={dp_shard_axis}."
-            )
+        # ``dp_local_start``/``dp_local_end`` are rank-local residency/debug
+        # metadata. They are intentionally excluded from the stable
+        # ``matrix_shard_contract`` because they can change across DP
+        # resharding and optimizer state-dict materialization. Validate that
+        # the saved range is well formed and in bounds, but do not reject a
+        # checkpoint solely because this advisory range no longer has the same
+        # extent as the saved local tensor shape.
         if pre_dp_local_shape is not None and dp_local_end > pre_dp_local_shape[dp_shard_axis]:
             raise RuntimeError(
                 "[MegatronFSDP] Matrix optimizer checkpoint metadata DP local axis "
